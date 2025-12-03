@@ -89,6 +89,9 @@ type (
 	// SegmentData encapsulates information about a specific media segment.
 	SegmentData = domain.SegmentData
 
+	// SegmentStatus represents the processing state of a segment.
+	SegmentStatus = domain.SegmentStatus
+
 	// Job represents a transcoding task for a range of segments.
 	Job = domain.Job
 )
