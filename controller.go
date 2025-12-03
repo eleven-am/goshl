@@ -85,6 +85,12 @@ type (
 
 	// StreamType identifies the type of media stream (video or audio).
 	StreamType = domain.StreamType
+
+	// SegmentData encapsulates information about a specific media segment.
+	SegmentData = domain.SegmentData
+
+	// Job represents a transcoding task for a range of segments.
+	Job = domain.Job
 )
 
 const (
