@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.4] - 2025-12-13
+
+- Add animated GIF preview generation from sprite sheets
+
+
 ## [0.0.3] - 2025-12-04
 
 - Add SegmentStatus type to controller for segment processing state
