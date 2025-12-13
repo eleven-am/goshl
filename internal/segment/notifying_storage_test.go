@@ -60,6 +60,15 @@ func (s *stubStorage) ReadSubtitleVTT(ctx context.Context, mediaID string, lang 
 func (s *stubStorage) SubtitleVTTExists(ctx context.Context, mediaID string, lang string) (bool, error) {
 	return false, nil
 }
+func (s *stubStorage) WritePreview(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 type stubPubSub struct {
 	publishes []struct {
@@ -140,5 +149,64 @@ func TestNotifyingStorageReturnsErrorWhenPublishFails(t *testing.T) {
 	err := n.WriteSegment(context.Background(), domain.SegmentData{}, nil)
 	if err == nil || !strings.Contains(err.Error(), "pubsub") {
 		t.Fatalf("expected publish error, got %v", err)
+	}
+}
+
+func TestNotifyingStoragePassthroughMethods(t *testing.T) {
+	storage := &stubStorage{}
+	pubsub := &stubPubSub{}
+	n := NewNotifyingStorage(storage, pubsub)
+	ctx := context.Background()
+
+	if _, err := n.MetadataExists(ctx, "src"); err != nil {
+		t.Fatalf("MetadataExists: %v", err)
+	}
+	if _, err := n.GetMetadata(ctx, "src"); err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if err := n.SetMetadata(ctx, "src", []byte("data")); err != nil {
+		t.Fatalf("SetMetadata: %v", err)
+	}
+	if _, err := n.ReadSegment(ctx, domain.SegmentData{}); err != nil {
+		t.Fatalf("ReadSegment: %v", err)
+	}
+	if _, err := n.SegmentExists(ctx, domain.SegmentData{}); err != nil {
+		t.Fatalf("SegmentExists: %v", err)
+	}
+	if err := n.WriteSprite(ctx, "src", 0, []byte("data")); err != nil {
+		t.Fatalf("WriteSprite: %v", err)
+	}
+	if _, err := n.ReadSprite(ctx, "src", 0); err != nil {
+		t.Fatalf("ReadSprite: %v", err)
+	}
+	if _, err := n.SpriteExists(ctx, "src", 0); err != nil {
+		t.Fatalf("SpriteExists: %v", err)
+	}
+	if err := n.WriteSpriteVTT(ctx, "src", []byte("data")); err != nil {
+		t.Fatalf("WriteSpriteVTT: %v", err)
+	}
+	if _, err := n.ReadSpriteVTT(ctx, "src"); err != nil {
+		t.Fatalf("ReadSpriteVTT: %v", err)
+	}
+	if _, err := n.SpriteVTTExists(ctx, "src"); err != nil {
+		t.Fatalf("SpriteVTTExists: %v", err)
+	}
+	if err := n.WriteSubtitleVTT(ctx, "src", "en", []byte("data")); err != nil {
+		t.Fatalf("WriteSubtitleVTT: %v", err)
+	}
+	if _, err := n.ReadSubtitleVTT(ctx, "src", "en"); err != nil {
+		t.Fatalf("ReadSubtitleVTT: %v", err)
+	}
+	if _, err := n.SubtitleVTTExists(ctx, "src", "en"); err != nil {
+		t.Fatalf("SubtitleVTTExists: %v", err)
+	}
+	if err := n.WritePreview(ctx, "src", []byte("data")); err != nil {
+		t.Fatalf("WritePreview: %v", err)
+	}
+	if _, err := n.ReadPreview(ctx, "src"); err != nil {
+		t.Fatalf("ReadPreview: %v", err)
+	}
+	if _, err := n.PreviewExists(ctx, "src"); err != nil {
+		t.Fatalf("PreviewExists: %v", err)
 	}
 }

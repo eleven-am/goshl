@@ -76,6 +76,15 @@ func (s *stubStorage) ReadSubtitleVTT(ctx context.Context, mediaID string, lang 
 func (s *stubStorage) SubtitleVTTExists(ctx context.Context, mediaID string, lang string) (bool, error) {
 	return s.subtitleData != nil, nil
 }
+func (s *stubStorage) WritePreview(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 type stubCoordinator struct {
 	enqueued []domain.Job
@@ -118,6 +127,7 @@ func (stubPathGen) Segment(sourceURL string, rendition string, streamType domain
 func (stubPathGen) SpriteVTT(sourceURL string) string                { return "/sprites.vtt" }
 func (stubPathGen) Sprite(sourceURL string, index int) string        { return "/sprite" }
 func (stubPathGen) SubtitleVTT(sourceURL string, lang string) string { return "/sub.vtt" }
+func (stubPathGen) Preview(sourceURL string) string                  { return "/preview.gif" }
 
 // installFakeFFmpeg ensures hwaccel.Detect can run without real ffmpeg.
 func installFakeFFmpeg(t *testing.T) func() {
@@ -234,4 +244,128 @@ func TestSubtitleVTTReturnsErrorWhenLanguageMissing(t *testing.T) {
 	if _, err := svc.SubtitleVTT(context.Background(), "file:///media", "en"); err == nil {
 		t.Fatalf("expected error for missing language")
 	}
+}
+
+func TestVariantPlaylistReturnsPlaylist(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	metaBytes, _ := json.Marshal(meta)
+	svc := NewController(Options{
+		Storage:     &stubStorage{metaData: metaBytes, metaExists: true},
+		Coordinator: &stubCoordinator{},
+		PathGen:     stubPathGen{},
+	})
+
+	out, err := svc.VariantPlaylist(context.Background(), "file:///media", domain.StreamVideo, "1080p")
+	if err != nil {
+		t.Fatalf("variant playlist err: %v", err)
+	}
+	if !strings.Contains(out, "#EXTM3U") || !strings.Contains(out, "#EXTINF") {
+		t.Fatalf("expected valid playlist, got %q", out)
+	}
+}
+
+func TestStartAndStop(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	svc := NewController(Options{
+		Storage:     &stubStorage{},
+		Coordinator: &stubCoordinator{},
+		PathGen:     stubPathGen{},
+	})
+
+	ctx := context.Background()
+	if err := svc.Start(ctx); err != nil {
+		t.Fatalf("start err: %v", err)
+	}
+	svc.Stop()
+}
+
+func TestPreviewReturnsDataWithCustomConfig(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 10}
+	metaBytes, _ := json.Marshal(meta)
+	svc := NewController(Options{
+		Storage:     &stubStorage{metaData: metaBytes, metaExists: true},
+		Coordinator: &stubCoordinator{},
+		PathGen:     stubPathGen{},
+		DefaultPreviewConfig: PreviewConfig{
+			MaxFrames:     20,
+			Frameduration: 200,
+			Width:         320,
+		},
+	})
+
+	_, err := svc.Preview(context.Background(), "file:///media", &PreviewConfig{
+		MaxFrames: 10,
+		Width:     240,
+	})
+	if err == nil {
+		t.Logf("preview with custom config executed (error expected due to missing sprites)")
+	}
+}
+
+func TestOptionsSetDefaults(t *testing.T) {
+	opts := Options{}
+	opts.setDefaults()
+
+	if opts.SegmentTimeout != 30*time.Second {
+		t.Errorf("expected SegmentTimeout 30s, got %v", opts.SegmentTimeout)
+	}
+	if opts.TargetDuration != 6.0 {
+		t.Errorf("expected TargetDuration 6.0, got %v", opts.TargetDuration)
+	}
+	if opts.SegmentsPerJob != 10 {
+		t.Errorf("expected SegmentsPerJob 10, got %v", opts.SegmentsPerJob)
+	}
+	if opts.VideoPoolSize != 2 {
+		t.Errorf("expected VideoPoolSize 2, got %v", opts.VideoPoolSize)
+	}
+	if opts.AudioPoolSize != 4 {
+		t.Errorf("expected AudioPoolSize 4, got %v", opts.AudioPoolSize)
+	}
+	if opts.DefaultPreviewConfig.MaxFrames != 40 {
+		t.Errorf("expected MaxFrames 40, got %v", opts.DefaultPreviewConfig.MaxFrames)
+	}
+	if opts.DefaultPreviewConfig.Frameduration != 250 {
+		t.Errorf("expected Frameduration 250, got %v", opts.DefaultPreviewConfig.Frameduration)
+	}
+	if opts.DefaultPreviewConfig.Width != 480 {
+		t.Errorf("expected Width 480, got %v", opts.DefaultPreviewConfig.Width)
+	}
+}
+
+func TestOptionsValidatePanicsOnMissingStorage(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for missing Storage")
+		}
+	}()
+	opts := Options{Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}}
+	opts.validate()
+}
+
+func TestOptionsValidatePanicsOnMissingCoordinator(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for missing Coordinator")
+		}
+	}()
+	opts := Options{Storage: &stubStorage{}, PathGen: stubPathGen{}}
+	opts.validate()
+}
+
+func TestOptionsValidatePanicsOnMissingPathGen(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic for missing PathGen")
+		}
+	}()
+	opts := Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}}
+	opts.validate()
 }

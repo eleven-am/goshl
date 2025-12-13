@@ -52,3 +52,9 @@ type SubtitleStream struct {
 	Language string
 	Forced   bool
 }
+
+type PreviewConfig struct {
+	MaxFrames     int
+	Frameduration int
+	Width         int
+}

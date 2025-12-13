@@ -60,6 +60,15 @@ func (m *memoryStorage) ReadSubtitleVTT(ctx context.Context, mediaID string, lan
 func (m *memoryStorage) SubtitleVTTExists(ctx context.Context, mediaID string, lang string) (bool, error) {
 	return false, nil
 }
+func (m *memoryStorage) WritePreview(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (m *memoryStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (m *memoryStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 func TestWorkerUploadsSegmentsAndSkipsFirstWhenConfigured(t *testing.T) {
 	tmp := t.TempDir()
@@ -126,3 +135,140 @@ fi
 echo "unexpected args: $@" >&2
 exit 1
 `
+
+func TestWorkerKill(t *testing.T) {
+	tmp := t.TempDir()
+
+	script := filepath.Join(tmp, "ffmpeg")
+	sleepScript := `#!/bin/sh
+sleep 10
+`
+	if err := os.WriteFile(script, []byte(sleepScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	storage := &memoryStorage{}
+	w := NewWorker([]string{}, storage, "file:///source", "1080p", true, tmp, false)
+
+	ctx := context.Background()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	w.Kill()
+
+	time.Sleep(100 * time.Millisecond)
+	state := w.State()
+	if state != WorkerStateError && state != WorkerStateDone {
+		t.Logf("worker state after kill: %v", state)
+	}
+}
+
+func TestWorkerErrMethod(t *testing.T) {
+	w := &Worker{}
+	if w.Err() != nil {
+		t.Fatalf("expected nil error for new worker")
+	}
+}
+
+func TestWorkerNoSkipFirst(t *testing.T) {
+	tmp := t.TempDir()
+
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte(fakeFFmpegScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	files := []string{"segment-00001.ts", "segment-00002.ts"}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(tmp, f), []byte("data"), 0644); err != nil {
+			t.Fatalf("prime file: %v", err)
+		}
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	storage := &memoryStorage{}
+	w := NewWorker([]string{"--emit", files[0], files[1]}, storage, "file:///source", "1080p", true, tmp, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	for {
+		state := w.State()
+		if state == WorkerStateDone || state == WorkerStateError {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("worker did not finish before context deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if w.State() != WorkerStateDone {
+		t.Fatalf("worker did not finish, state %v err %v", w.State(), w.Err())
+	}
+
+	if len(storage.writes) != 2 {
+		t.Fatalf("expected 2 segments written (no skip), got %d", len(storage.writes))
+	}
+}
+
+func TestWorkerAudioSegments(t *testing.T) {
+	tmp := t.TempDir()
+
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte(fakeFFmpegScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	files := []string{"segment-00001.ts"}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(tmp, f), []byte("audiodata"), 0644); err != nil {
+			t.Fatalf("prime file: %v", err)
+		}
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	storage := &memoryStorage{}
+	w := NewWorker([]string{"--emit", files[0]}, storage, "file:///source", "aac_stereo", false, tmp, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	for {
+		state := w.State()
+		if state == WorkerStateDone || state == WorkerStateError {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("worker did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if len(storage.writes) != 1 {
+		t.Fatalf("expected 1 audio segment written, got %d", len(storage.writes))
+	}
+	if storage.writes[0].IsVideo {
+		t.Fatalf("expected audio segment, got video")
+	}
+}

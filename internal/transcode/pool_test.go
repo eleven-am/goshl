@@ -96,3 +96,140 @@ func TestPublishErrorSendsRange(t *testing.T) {
 type assertErr string
 
 func (e assertErr) Error() string { return string(e) }
+
+func TestNewPool(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := NewPool(coord, 2, domain.StreamVideo, nil, nil, nil)
+
+	if pool.size != 2 {
+		t.Fatalf("expected size 2, got %d", pool.size)
+	}
+	if pool.streamType != domain.StreamVideo {
+		t.Fatalf("expected video stream type")
+	}
+}
+
+func TestPoolStartAndStop(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
+
+	ctx := context.Background()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("start error: %v", err)
+	}
+
+	pool.Stop()
+}
+
+func TestPoolStartTwiceReturnsError(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
+
+	ctx := context.Background()
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("first start error: %v", err)
+	}
+
+	if err := pool.Start(ctx); err == nil {
+		t.Fatalf("expected error on second start")
+	}
+
+	pool.Stop()
+}
+
+func TestPoolStopWithoutStart(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
+	pool.Stop()
+}
+
+func TestFindNearestKeyframeEmptySlice(t *testing.T) {
+	got := findNearestKeyframe([]float64{}, 5.0)
+	if got != 0 {
+		t.Fatalf("expected 0 for empty keyframes, got %v", got)
+	}
+}
+
+func TestExtractSegmentsEmptyKeyframes(t *testing.T) {
+	p := &Pool{}
+	segments := p.extractSegments([]float64{}, 10, 0, 5)
+	if len(segments) != 0 {
+		t.Fatalf("expected 0 segments for empty keyframes, got %d", len(segments))
+	}
+}
+
+func TestFindAudioRenditionNotFound(t *testing.T) {
+	p := &Pool{}
+	meta := &domain.Metadata{Audios: []domain.AudioStream{{Codec: "ac3", Channels: 6, Bitrate: 640_000}}}
+	if p.findAudioRendition(meta, "nonexistent") != nil {
+		t.Fatalf("should return nil for missing audio rendition")
+	}
+}
+
+func TestExtractSegmentsSingleKeyframe(t *testing.T) {
+	p := &Pool{}
+	keyframes := []float64{0}
+	segments := p.extractSegments(keyframes, 10, 0, 0)
+
+	if len(segments) != 1 {
+		t.Fatalf("expected 1 segment, got %d", len(segments))
+	}
+	if segments[0].End != 10 {
+		t.Fatalf("expected end at duration, got %v", segments[0].End)
+	}
+}
+
+func TestExtractSegmentsOutOfRange(t *testing.T) {
+	p := &Pool{}
+	keyframes := []float64{0, 6, 12}
+	segments := p.extractSegments(keyframes, 15, 10, 15)
+
+	if len(segments) != 0 {
+		t.Fatalf("expected 0 segments for out-of-range indices, got %d", len(segments))
+	}
+}
+
+func TestFindNearestKeyframeExactMatch(t *testing.T) {
+	keyframes := []float64{0, 5, 10, 15}
+	got := findNearestKeyframe(keyframes, 10.5)
+	if got != 10 {
+		t.Fatalf("expected 10 for target 10.5, got %v", got)
+	}
+}
+
+func TestFindNearestKeyframeBetweenKeys(t *testing.T) {
+	keyframes := []float64{0, 5, 10, 15}
+	got := findNearestKeyframe(keyframes, 7)
+	if got != 5 {
+		t.Fatalf("expected 5 for target 7, got %v", got)
+	}
+}
+
+func TestFindNearestKeyframeTargetPastAll(t *testing.T) {
+	keyframes := []float64{0, 5, 10}
+	got := findNearestKeyframe(keyframes, 20)
+	if got != 10 {
+		t.Fatalf("expected 10 for target past all, got %v", got)
+	}
+}
+
+func TestExtractSegmentsMultipleKeyframeGroups(t *testing.T) {
+	p := &Pool{}
+	keyframes := []float64{0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20}
+	segments := p.extractSegments(keyframes, 25, 0, 2)
+
+	if len(segments) < 2 {
+		t.Fatalf("expected at least 2 segments, got %d", len(segments))
+	}
+}
+
+func TestWorkerSetError(t *testing.T) {
+	w := &Worker{}
+	w.setError(assertErr("test error"))
+	if w.Err() == nil || w.Err().Error() != "test error" {
+		t.Fatalf("expected error to be set, got %v", w.Err())
+	}
+	if w.State() != WorkerStateError {
+		t.Fatalf("expected error state, got %v", w.State())
+	}
+}

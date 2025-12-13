@@ -44,4 +44,5 @@ type PathGenerator interface {
 	SpriteVTT(sourceURL string) string
 	Sprite(sourceURL string, index int) string
 	SubtitleVTT(sourceURL string, lang string) string
+	Preview(sourceURL string) string
 }

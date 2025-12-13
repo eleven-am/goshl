@@ -92,3 +92,15 @@ func (s *NotifyingStorage) ReadSubtitleVTT(ctx context.Context, sourceURL string
 func (s *NotifyingStorage) SubtitleVTTExists(ctx context.Context, sourceURL string, lang string) (bool, error) {
 	return s.storage.SubtitleVTTExists(ctx, sourceURL, lang)
 }
+
+func (s *NotifyingStorage) WritePreview(ctx context.Context, sourceURL string, data []byte) error {
+	return s.storage.WritePreview(ctx, sourceURL, data)
+}
+
+func (s *NotifyingStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte, error) {
+	return s.storage.ReadPreview(ctx, sourceURL)
+}
+
+func (s *NotifyingStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
+	return s.storage.PreviewExists(ctx, sourceURL)
+}

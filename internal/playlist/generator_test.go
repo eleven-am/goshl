@@ -29,6 +29,9 @@ func (staticPathGen) Sprite(mediaID string, index int) string {
 func (staticPathGen) SubtitleVTT(mediaID string, lang string) string {
 	return "/" + mediaID + "/subtitles/" + lang + ".vtt"
 }
+func (staticPathGen) Preview(mediaID string) string {
+	return "/" + mediaID + "/preview.gif"
+}
 
 func TestGenerator_MasterIncludesAudioGroupsAndVariants(t *testing.T) {
 	gen := NewGenerator(staticPathGen{})

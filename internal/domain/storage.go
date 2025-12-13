@@ -22,4 +22,8 @@ type Storage interface {
 	WriteSubtitleVTT(ctx context.Context, sourceURL string, lang string, data []byte) error
 	ReadSubtitleVTT(ctx context.Context, sourceURL string, lang string) ([]byte, error)
 	SubtitleVTTExists(ctx context.Context, sourceURL string, lang string) (bool, error)
+
+	WritePreview(ctx context.Context, sourceURL string, data []byte) error
+	ReadPreview(ctx context.Context, sourceURL string) ([]byte, error)
+	PreviewExists(ctx context.Context, sourceURL string) (bool, error)
 }

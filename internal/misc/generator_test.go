@@ -1,8 +1,12 @@
 package misc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"strings"
 	"testing"
 
@@ -13,14 +17,18 @@ type stubStorage struct {
 	spriteVTTExists bool
 	spriteExists    bool
 	subtitleExists  bool
+	previewExists   bool
 
 	existsErr error
 
 	wroteSprites   int
 	wroteSpriteVTT int
 	wroteSubtitle  int
+	wrotePreview   int
 
 	spriteVTTData []byte
+	spriteData    map[int][]byte
+	previewData   []byte
 }
 
 func (s *stubStorage) MetadataExists(ctx context.Context, sourceURL string) (bool, error) {
@@ -44,14 +52,25 @@ func (s *stubStorage) SegmentExists(ctx context.Context, info domain.SegmentData
 
 func (s *stubStorage) WriteSprite(ctx context.Context, mediaID string, index int, data []byte) error {
 	s.wroteSprites++
+	if s.spriteData == nil {
+		s.spriteData = make(map[int][]byte)
+	}
+	s.spriteData[index] = data
 	return nil
 }
 func (s *stubStorage) ReadSprite(ctx context.Context, mediaID string, index int) ([]byte, error) {
+	if s.spriteData != nil {
+		return s.spriteData[index], nil
+	}
 	return nil, nil
 }
 func (s *stubStorage) SpriteExists(ctx context.Context, mediaID string, index int) (bool, error) {
 	if s.existsErr != nil {
 		return false, s.existsErr
+	}
+	if s.spriteData != nil {
+		_, ok := s.spriteData[index]
+		return ok, nil
 	}
 	return s.spriteExists, nil
 }
@@ -83,6 +102,20 @@ func (s *stubStorage) SubtitleVTTExists(ctx context.Context, mediaID string, lan
 		return false, s.existsErr
 	}
 	return s.subtitleExists, nil
+}
+func (s *stubStorage) WritePreview(ctx context.Context, sourceURL string, data []byte) error {
+	s.wrotePreview++
+	s.previewData = data
+	return nil
+}
+func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte, error) {
+	return s.previewData, nil
+}
+func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
+	if s.existsErr != nil {
+		return false, s.existsErr
+	}
+	return s.previewExists, nil
 }
 
 func TestGenerateVTTProducesContinuousEntries(t *testing.T) {
@@ -130,5 +163,234 @@ func TestGetSpriteVTTPropagatesExistenceError(t *testing.T) {
 func TestFormatVTTTime(t *testing.T) {
 	if got := formatVTTTime(3661.789); got != "01:01:01.789" {
 		t.Fatalf("unexpected time format: %s", got)
+	}
+}
+
+func createTestSpriteImage(width, height int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: uint8(x % 256), G: uint8(y % 256), B: 128, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80})
+	return buf.Bytes()
+}
+
+func TestGetPreviewReturnsCachedData(t *testing.T) {
+	storage := &stubStorage{previewExists: true, previewData: []byte("cached-gif")}
+	g := NewGenerator(storage)
+
+	data, err := g.GetPreview(context.Background(), "file:///media", 10, "http://sprites/%d.jpg", domain.PreviewConfig{
+		MaxFrames:     10,
+		Frameduration: 100,
+		Width:         100,
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if string(data) != "cached-gif" {
+		t.Fatalf("expected cached data, got %s", data)
+	}
+	if storage.wrotePreview != 0 {
+		t.Fatalf("should not generate preview when cached")
+	}
+}
+
+func TestGetPreviewPropagatesExistenceError(t *testing.T) {
+	storage := &stubStorage{existsErr: errors.New("boom")}
+	g := NewGenerator(storage)
+
+	_, err := g.GetPreview(context.Background(), "file:///media", 10, "pattern", domain.PreviewConfig{})
+	if err == nil || !strings.Contains(err.Error(), "check preview") {
+		t.Fatalf("expected propagated error, got %v", err)
+	}
+}
+
+func TestGeneratePreviewFromSprites(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	spriteImg := createTestSpriteImage(20, 20)
+	storage := &stubStorage{
+		spriteData:      map[int][]byte{0: spriteImg},
+		spriteVTTExists: true,
+		spriteVTTData:   []byte("WEBVTT"),
+	}
+	g.storage = storage
+
+	config := domain.PreviewConfig{
+		MaxFrames:     4,
+		Frameduration: 100,
+		Width:         20,
+	}
+
+	preview, err := g.generatePreview(context.Background(), "file:///media", 4, config)
+	if err != nil {
+		t.Fatalf("generatePreview error: %v", err)
+	}
+
+	if len(preview) == 0 {
+		t.Fatalf("expected non-empty preview data")
+	}
+
+	if !bytes.HasPrefix(preview, []byte("GIF")) {
+		t.Fatalf("expected GIF format, got prefix: %v", preview[:min(10, len(preview))])
+	}
+}
+
+func TestGeneratePreviewSamplesFrames(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        3,
+		rows:        3,
+		storage:     nil,
+	}
+
+	spriteImg := createTestSpriteImage(30, 30)
+	storage := &stubStorage{
+		spriteData:      map[int][]byte{0: spriteImg},
+		spriteVTTExists: true,
+		spriteVTTData:   []byte("WEBVTT"),
+	}
+	g.storage = storage
+
+	config := domain.PreviewConfig{
+		MaxFrames:     3,
+		Frameduration: 100,
+		Width:         10,
+	}
+
+	preview, err := g.generatePreview(context.Background(), "file:///media", 9, config)
+	if err != nil {
+		t.Fatalf("generatePreview error: %v", err)
+	}
+
+	if len(preview) == 0 {
+		t.Fatalf("expected non-empty preview data")
+	}
+}
+
+func TestGeneratePreviewNoFramesError(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	storage := &stubStorage{
+		spriteData: map[int][]byte{},
+	}
+	g.storage = storage
+
+	config := domain.PreviewConfig{
+		MaxFrames:     4,
+		Frameduration: 100,
+		Width:         20,
+	}
+
+	_, err := g.generatePreview(context.Background(), "file:///media", 0, config)
+	if err == nil || !strings.Contains(err.Error(), "no frames") {
+		t.Fatalf("expected no frames error, got %v", err)
+	}
+}
+
+func TestGetSpriteExistenceError(t *testing.T) {
+	storage := &stubStorage{existsErr: errors.New("sprite err")}
+	g := NewGenerator(storage)
+
+	_, err := g.GetSprite(context.Background(), "file:///media", 10, "pattern", 0)
+	if err == nil || !strings.Contains(err.Error(), "check sprite") {
+		t.Fatalf("expected propagated error, got %v", err)
+	}
+}
+
+func TestGetSpriteReturnsCachedData(t *testing.T) {
+	spriteImg := createTestSpriteImage(20, 20)
+	storage := &stubStorage{
+		spriteData:      map[int][]byte{0: spriteImg},
+		spriteVTTExists: true,
+		spriteVTTData:   []byte("WEBVTT"),
+	}
+	g := NewGenerator(storage)
+
+	data, err := g.GetSprite(context.Background(), "file:///media", 10, "http://sprites/%d.jpg", 0)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("expected non-empty sprite data")
+	}
+}
+
+func TestGeneratePreviewMultipleSprites(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	spriteImg1 := createTestSpriteImage(20, 20)
+	spriteImg2 := createTestSpriteImage(20, 20)
+	storage := &stubStorage{
+		spriteData: map[int][]byte{0: spriteImg1, 1: spriteImg2},
+	}
+	g.storage = storage
+
+	config := domain.PreviewConfig{
+		MaxFrames:     8,
+		Frameduration: 100,
+		Width:         20,
+	}
+
+	preview, err := g.generatePreview(context.Background(), "file:///media", 8, config)
+	if err != nil {
+		t.Fatalf("generatePreview error: %v", err)
+	}
+
+	if len(preview) == 0 {
+		t.Fatalf("expected non-empty preview data")
+	}
+}
+
+func TestGeneratePreviewReadSpriteError(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	storage := &stubStorage{
+		spriteData: map[int][]byte{},
+	}
+	g.storage = storage
+
+	config := domain.PreviewConfig{
+		MaxFrames:     4,
+		Frameduration: 100,
+		Width:         20,
+	}
+
+	_, err := g.generatePreview(context.Background(), "file:///media", 4, config)
+	if err == nil {
+		t.Fatalf("expected error for missing sprite")
 	}
 }

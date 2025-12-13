@@ -4,11 +4,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/color/palette"
+	"image/draw"
+	"image/gif"
+	"image/jpeg"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 
+	"github.com/disintegration/imaging"
 	"github.com/eleven-am/goshl/internal/domain"
 )
 
@@ -195,4 +201,115 @@ func formatVTTTime(seconds float64) string {
 	millis := int((seconds - float64(int(seconds))) * 1000)
 
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, secs, millis)
+}
+
+func (g *Generator) GetPreview(ctx context.Context, sourceURL string, duration float64, urlPattern string, config domain.PreviewConfig) ([]byte, error) {
+	exists, err := g.storage.PreviewExists(ctx, sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("check preview: %w", err)
+	}
+
+	if exists {
+		return g.storage.ReadPreview(ctx, sourceURL)
+	}
+
+	if err := g.generateSprites(ctx, sourceURL, duration, urlPattern); err != nil {
+		return nil, err
+	}
+
+	preview, err := g.generatePreview(ctx, sourceURL, duration, config)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := g.storage.WritePreview(ctx, sourceURL, preview); err != nil {
+		return nil, fmt.Errorf("write preview: %w", err)
+	}
+
+	return preview, nil
+}
+
+func (g *Generator) generatePreview(ctx context.Context, sourceURL string, duration float64, config domain.PreviewConfig) ([]byte, error) {
+	thumbsPerSprite := g.cols * g.rows
+	totalThumbs := int(math.Ceil(duration / g.interval))
+	numSprites := int(math.Ceil(float64(totalThumbs) / float64(thumbsPerSprite)))
+
+	var allFrames []image.Image
+
+	for spriteIdx := 0; spriteIdx < numSprites; spriteIdx++ {
+		spriteData, err := g.storage.ReadSprite(ctx, sourceURL, spriteIdx)
+		if err != nil {
+			return nil, fmt.Errorf("read sprite %d: %w", spriteIdx, err)
+		}
+
+		spriteImg, err := jpeg.Decode(bytes.NewReader(spriteData))
+		if err != nil {
+			return nil, fmt.Errorf("decode sprite %d: %w", spriteIdx, err)
+		}
+
+		framesInThisSprite := thumbsPerSprite
+		remainingThumbs := totalThumbs - (spriteIdx * thumbsPerSprite)
+		if remainingThumbs < thumbsPerSprite {
+			framesInThisSprite = remainingThumbs
+		}
+
+		for i := 0; i < framesInThisSprite; i++ {
+			row := i / g.cols
+			col := i % g.cols
+			x := col * g.thumbWidth
+			y := row * g.thumbHeight
+
+			rect := image.Rect(x, y, x+g.thumbWidth, y+g.thumbHeight)
+			frame := imaging.Crop(spriteImg, rect)
+			allFrames = append(allFrames, frame)
+		}
+	}
+
+	if len(allFrames) == 0 {
+		return nil, fmt.Errorf("no frames extracted from sprites")
+	}
+
+	var sampledFrames []image.Image
+	if len(allFrames) <= config.MaxFrames {
+		sampledFrames = allFrames
+	} else {
+		step := float64(len(allFrames)) / float64(config.MaxFrames)
+		for i := 0; i < config.MaxFrames; i++ {
+			idx := int(float64(i) * step)
+			if idx >= len(allFrames) {
+				idx = len(allFrames) - 1
+			}
+			sampledFrames = append(sampledFrames, allFrames[idx])
+		}
+	}
+
+	aspectRatio := float64(g.thumbHeight) / float64(g.thumbWidth)
+	targetHeight := int(float64(config.Width) * aspectRatio)
+
+	var resizedFrames []*image.Paletted
+	for _, frame := range sampledFrames {
+		resized := imaging.Resize(frame, config.Width, targetHeight, imaging.Lanczos)
+
+		bounds := resized.Bounds()
+		palettedImg := image.NewPaletted(bounds, palette.Plan9)
+		draw.FloydSteinberg.Draw(palettedImg, bounds, resized, image.Point{})
+		resizedFrames = append(resizedFrames, palettedImg)
+	}
+
+	delays := make([]int, len(resizedFrames))
+	for i := range delays {
+		delays[i] = config.Frameduration / 10
+	}
+
+	animatedGIF := &gif.GIF{
+		Image: resizedFrames,
+		Delay: delays,
+	}
+
+	var buf bytes.Buffer
+	if err := gif.EncodeAll(&buf, animatedGIF); err != nil {
+		return nil, fmt.Errorf("encode gif: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
