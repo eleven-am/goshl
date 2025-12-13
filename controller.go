@@ -100,6 +100,18 @@ type (
 
 	// ThumbnailConfig configures thumbnail generation parameters.
 	ThumbnailConfig = domain.ThumbnailConfig
+
+	// Metadata contains probed information about a media source.
+	Metadata = domain.Metadata
+
+	// VideoStream contains video stream information.
+	VideoStream = domain.VideoStream
+
+	// AudioStream contains audio stream information.
+	AudioStream = domain.AudioStream
+
+	// SubtitleStream contains subtitle stream information.
+	SubtitleStream = domain.SubtitleStream
 )
 
 const (
@@ -504,6 +516,10 @@ func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *Th
 	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
 
 	return c.miscGen.GetThumbnail(ctx, sourceURL, meta.Duration, urlPattern, cfg)
+}
+
+func (c *Controller) Metadata(ctx context.Context, sourceURL string) (*Metadata, error) {
+	return c.getMetadata(ctx, sourceURL)
 }
 
 func (c *Controller) enqueueSegment(ctx context.Context, sourceURL string, streamType StreamType, renditionName string, index int) error {
