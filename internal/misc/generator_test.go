@@ -18,17 +18,20 @@ type stubStorage struct {
 	spriteExists    bool
 	subtitleExists  bool
 	previewExists   bool
+	thumbnailExists bool
 
 	existsErr error
 
-	wroteSprites   int
-	wroteSpriteVTT int
-	wroteSubtitle  int
-	wrotePreview   int
+	wroteSprites    int
+	wroteSpriteVTT  int
+	wroteSubtitle   int
+	wrotePreview    int
+	wroteThumbnail  int
 
 	spriteVTTData []byte
 	spriteData    map[int][]byte
 	previewData   []byte
+	thumbnailData []byte
 }
 
 func (s *stubStorage) MetadataExists(ctx context.Context, sourceURL string) (bool, error) {
@@ -116,6 +119,20 @@ func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool
 		return false, s.existsErr
 	}
 	return s.previewExists, nil
+}
+func (s *stubStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
+	s.wroteThumbnail++
+	s.thumbnailData = data
+	return nil
+}
+func (s *stubStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
+	return s.thumbnailData, nil
+}
+func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
+	if s.existsErr != nil {
+		return false, s.existsErr
+	}
+	return s.thumbnailExists, nil
 }
 
 func TestGenerateVTTProducesContinuousEntries(t *testing.T) {
@@ -390,6 +407,122 @@ func TestGeneratePreviewReadSpriteError(t *testing.T) {
 	}
 
 	_, err := g.generatePreview(context.Background(), "file:///media", 4, config)
+	if err == nil {
+		t.Fatalf("expected error for missing sprite")
+	}
+}
+
+func TestGetThumbnailReturnsCachedData(t *testing.T) {
+	storage := &stubStorage{
+		thumbnailExists: true,
+		thumbnailData:   []byte("cached-thumbnail"),
+	}
+	g := NewGenerator(storage)
+
+	data, err := g.GetThumbnail(context.Background(), "file:///media", 60, "http://sprites/%d.jpg", domain.ThumbnailConfig{Position: 0.1, Width: 480})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "cached-thumbnail" {
+		t.Fatalf("expected cached data, got %s", data)
+	}
+}
+
+func TestGetThumbnailExistsCheckError(t *testing.T) {
+	storage := &stubStorage{
+		existsErr: errors.New("exists error"),
+	}
+	g := NewGenerator(storage)
+
+	_, err := g.GetThumbnail(context.Background(), "file:///media", 60, "http://sprites/%d.jpg", domain.ThumbnailConfig{Position: 0.1, Width: 480})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestGenerateThumbnailSuccess(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	spriteImg := createTestSpriteImage(20, 20)
+	storage := &stubStorage{
+		spriteData: map[int][]byte{0: spriteImg},
+	}
+	g.storage = storage
+
+	config := domain.ThumbnailConfig{
+		Position: 0.1,
+		Width:    20,
+	}
+
+	thumbnail, err := g.generateThumbnail(context.Background(), "file:///media", 4, config)
+	if err != nil {
+		t.Fatalf("generateThumbnail error: %v", err)
+	}
+
+	if len(thumbnail) == 0 {
+		t.Fatalf("expected non-empty thumbnail data")
+	}
+}
+
+func TestGenerateThumbnailPositionClamping(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	spriteImg := createTestSpriteImage(20, 20)
+	storage := &stubStorage{
+		spriteData: map[int][]byte{0: spriteImg},
+	}
+	g.storage = storage
+
+	config := domain.ThumbnailConfig{
+		Position: 2.0,
+		Width:    20,
+	}
+
+	thumbnail, err := g.generateThumbnail(context.Background(), "file:///media", 4, config)
+	if err != nil {
+		t.Fatalf("generateThumbnail error: %v", err)
+	}
+
+	if len(thumbnail) == 0 {
+		t.Fatalf("expected non-empty thumbnail data")
+	}
+}
+
+func TestGenerateThumbnailReadSpriteError(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	storage := &stubStorage{
+		spriteData: map[int][]byte{},
+	}
+	g.storage = storage
+
+	config := domain.ThumbnailConfig{
+		Position: 0.1,
+		Width:    20,
+	}
+
+	_, err := g.generateThumbnail(context.Background(), "file:///media", 4, config)
 	if err == nil {
 		t.Fatalf("expected error for missing sprite")
 	}

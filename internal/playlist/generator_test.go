@@ -32,6 +32,9 @@ func (staticPathGen) SubtitleVTT(mediaID string, lang string) string {
 func (staticPathGen) Preview(mediaID string) string {
 	return "/" + mediaID + "/preview.gif"
 }
+func (staticPathGen) Thumbnail(mediaID string) string {
+	return "/" + mediaID + "/thumbnail.jpg"
+}
 
 func TestGenerator_MasterIncludesAudioGroupsAndVariants(t *testing.T) {
 	gen := NewGenerator(staticPathGen{})

@@ -58,3 +58,8 @@ type PreviewConfig struct {
 	Frameduration int
 	Width         int
 }
+
+type ThumbnailConfig struct {
+	Position float64
+	Width    int
+}

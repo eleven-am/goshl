@@ -69,6 +69,15 @@ func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte
 func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
 	return false, nil
 }
+func (s *stubStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (s *stubStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 type stubPubSub struct {
 	publishes []struct {
@@ -208,5 +217,14 @@ func TestNotifyingStoragePassthroughMethods(t *testing.T) {
 	}
 	if _, err := n.PreviewExists(ctx, "src"); err != nil {
 		t.Fatalf("PreviewExists: %v", err)
+	}
+	if err := n.WriteThumbnail(ctx, "src", []byte("data")); err != nil {
+		t.Fatalf("WriteThumbnail: %v", err)
+	}
+	if _, err := n.ReadThumbnail(ctx, "src"); err != nil {
+		t.Fatalf("ReadThumbnail: %v", err)
+	}
+	if _, err := n.ThumbnailExists(ctx, "src"); err != nil {
+		t.Fatalf("ThumbnailExists: %v", err)
 	}
 }

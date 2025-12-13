@@ -97,6 +97,9 @@ type (
 
 	// PreviewConfig configures animated preview generation parameters.
 	PreviewConfig = domain.PreviewConfig
+
+	// ThumbnailConfig configures thumbnail generation parameters.
+	ThumbnailConfig = domain.ThumbnailConfig
 )
 
 const (
@@ -148,6 +151,10 @@ type Options struct {
 	// DefaultPreviewConfig sets default parameters for animated preview generation.
 	// Defaults: MaxFrames=40, Frameduration=250ms, Width=480.
 	DefaultPreviewConfig PreviewConfig
+
+	// DefaultThumbnailConfig sets default parameters for thumbnail generation.
+	// Defaults: Position=0.1 (10% into video), Width=480.
+	DefaultThumbnailConfig ThumbnailConfig
 }
 
 func (o *Options) setDefaults() {
@@ -174,6 +181,12 @@ func (o *Options) setDefaults() {
 	}
 	if o.DefaultPreviewConfig.Width == 0 {
 		o.DefaultPreviewConfig.Width = 480
+	}
+	if o.DefaultThumbnailConfig.Position == 0 {
+		o.DefaultThumbnailConfig.Position = 0.1
+	}
+	if o.DefaultThumbnailConfig.Width == 0 {
+		o.DefaultThumbnailConfig.Width = 480
 	}
 }
 
@@ -469,6 +482,28 @@ func (c *Controller) Preview(ctx context.Context, sourceURL string, config *Prev
 	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
 
 	return c.miscGen.GetPreview(ctx, sourceURL, meta.Duration, urlPattern, cfg)
+}
+
+func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *ThumbnailConfig) ([]byte, error) {
+	meta, err := c.getMetadata(ctx, sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("get metadata: %w", err)
+	}
+
+	cfg := c.opts.DefaultThumbnailConfig
+	if config != nil {
+		if config.Position > 0 {
+			cfg.Position = config.Position
+		}
+		if config.Width > 0 {
+			cfg.Width = config.Width
+		}
+	}
+
+	urlPattern := c.opts.PathGen.Sprite(sourceURL, 0)
+	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
+
+	return c.miscGen.GetThumbnail(ctx, sourceURL, meta.Duration, urlPattern, cfg)
 }
 
 func (c *Controller) enqueueSegment(ctx context.Context, sourceURL string, streamType StreamType, renditionName string, index int) error {

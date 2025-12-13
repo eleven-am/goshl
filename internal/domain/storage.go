@@ -26,4 +26,8 @@ type Storage interface {
 	WritePreview(ctx context.Context, sourceURL string, data []byte) error
 	ReadPreview(ctx context.Context, sourceURL string) ([]byte, error)
 	PreviewExists(ctx context.Context, sourceURL string) (bool, error)
+
+	WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error
+	ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error)
+	ThumbnailExists(ctx context.Context, sourceURL string) (bool, error)
 }

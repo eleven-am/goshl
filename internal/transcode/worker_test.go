@@ -69,6 +69,15 @@ func (m *memoryStorage) ReadPreview(ctx context.Context, sourceURL string) ([]by
 func (m *memoryStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
 	return false, nil
 }
+func (m *memoryStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (m *memoryStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (m *memoryStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 func TestWorkerUploadsSegmentsAndSkipsFirstWhenConfigured(t *testing.T) {
 	tmp := t.TempDir()

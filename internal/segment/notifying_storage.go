@@ -104,3 +104,15 @@ func (s *NotifyingStorage) ReadPreview(ctx context.Context, sourceURL string) ([
 func (s *NotifyingStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
 	return s.storage.PreviewExists(ctx, sourceURL)
 }
+
+func (s *NotifyingStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
+	return s.storage.WriteThumbnail(ctx, sourceURL, data)
+}
+
+func (s *NotifyingStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
+	return s.storage.ReadThumbnail(ctx, sourceURL)
+}
+
+func (s *NotifyingStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
+	return s.storage.ThumbnailExists(ctx, sourceURL)
+}

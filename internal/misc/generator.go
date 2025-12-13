@@ -313,3 +313,77 @@ func (g *Generator) generatePreview(ctx context.Context, sourceURL string, durat
 
 	return buf.Bytes(), nil
 }
+
+func (g *Generator) GetThumbnail(ctx context.Context, sourceURL string, duration float64, urlPattern string, config domain.ThumbnailConfig) ([]byte, error) {
+	exists, err := g.storage.ThumbnailExists(ctx, sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("check thumbnail: %w", err)
+	}
+
+	if exists {
+		return g.storage.ReadThumbnail(ctx, sourceURL)
+	}
+
+	if err := g.generateSprites(ctx, sourceURL, duration, urlPattern); err != nil {
+		return nil, err
+	}
+
+	thumbnail, err := g.generateThumbnail(ctx, sourceURL, duration, config)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := g.storage.WriteThumbnail(ctx, sourceURL, thumbnail); err != nil {
+		return nil, fmt.Errorf("write thumbnail: %w", err)
+	}
+
+	return thumbnail, nil
+}
+
+func (g *Generator) generateThumbnail(ctx context.Context, sourceURL string, duration float64, config domain.ThumbnailConfig) ([]byte, error) {
+	timestamp := duration * config.Position
+	if timestamp < 0 {
+		timestamp = 0
+	}
+	if timestamp >= duration {
+		timestamp = duration - g.interval
+		if timestamp < 0 {
+			timestamp = 0
+		}
+	}
+
+	frameIndex := int(timestamp / g.interval)
+
+	thumbsPerSprite := g.cols * g.rows
+	spriteIdx := frameIndex / thumbsPerSprite
+	frameInSprite := frameIndex % thumbsPerSprite
+
+	spriteData, err := g.storage.ReadSprite(ctx, sourceURL, spriteIdx)
+	if err != nil {
+		return nil, fmt.Errorf("read sprite %d: %w", spriteIdx, err)
+	}
+
+	spriteImg, err := jpeg.Decode(bytes.NewReader(spriteData))
+	if err != nil {
+		return nil, fmt.Errorf("decode sprite %d: %w", spriteIdx, err)
+	}
+
+	row := frameInSprite / g.cols
+	col := frameInSprite % g.cols
+	x := col * g.thumbWidth
+	y := row * g.thumbHeight
+
+	rect := image.Rect(x, y, x+g.thumbWidth, y+g.thumbHeight)
+	frame := imaging.Crop(spriteImg, rect)
+
+	aspectRatio := float64(g.thumbHeight) / float64(g.thumbWidth)
+	targetHeight := int(float64(config.Width) * aspectRatio)
+	resized := imaging.Resize(frame, config.Width, targetHeight, imaging.Lanczos)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 85}); err != nil {
+		return nil, fmt.Errorf("encode jpeg: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}

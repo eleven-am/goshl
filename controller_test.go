@@ -85,6 +85,15 @@ func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte
 func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
 	return false, nil
 }
+func (s *stubStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (s *stubStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 type stubCoordinator struct {
 	enqueued []domain.Job
@@ -128,6 +137,7 @@ func (stubPathGen) SpriteVTT(sourceURL string) string                { return "/
 func (stubPathGen) Sprite(sourceURL string, index int) string        { return "/sprite" }
 func (stubPathGen) SubtitleVTT(sourceURL string, lang string) string { return "/sub.vtt" }
 func (stubPathGen) Preview(sourceURL string) string                  { return "/preview.gif" }
+func (stubPathGen) Thumbnail(sourceURL string) string                { return "/thumbnail.jpg" }
 
 // installFakeFFmpeg ensures hwaccel.Detect can run without real ffmpeg.
 func installFakeFFmpeg(t *testing.T) func() {

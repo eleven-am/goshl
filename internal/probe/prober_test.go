@@ -80,6 +80,15 @@ func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte
 func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
 	return false, nil
 }
+func (s *stubStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
+	return nil
+}
+func (s *stubStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
+	return nil, nil
+}
+func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
+	return false, nil
+}
 
 func TestProbe_UsesCacheAndSkipsFFProbe(t *testing.T) {
 	cached := &domain.Metadata{Duration: 5}
