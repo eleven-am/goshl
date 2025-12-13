@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.7] - 2025-12-14
+
+- Implement distributed locking for segment and metadata retrieval
+
+
 ## [0.0.6] - 2025-12-13
 
 - Add public Metadata method to Controller
