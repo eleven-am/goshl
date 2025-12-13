@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.6] - 2025-12-13
+
+- Add public Metadata method to Controller
+
+
 ## [0.0.5] - 2025-12-13
 
 - Add thumbnail generation from sprite sheets
