@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.5] - 2025-12-13
+
+- Add thumbnail generation from sprite sheets
+
+
 ## [0.0.4] - 2025-12-13
 
 - Add animated GIF preview generation from sprite sheets
