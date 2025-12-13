@@ -5,8 +5,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/google/uuid"
 )
 
 type stubStorage struct {
@@ -105,6 +107,12 @@ func (p *stubPubSub) NotifySegment(ctx context.Context, info domain.SegmentData,
 }
 func (p *stubPubSub) WaitSegment(ctx context.Context, info domain.SegmentData) (<-chan domain.SegmentStatus, error) {
 	return nil, nil
+}
+func (p *stubPubSub) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	return uuid.New().String(), nil
+}
+func (p *stubPubSub) ReleaseLock(ctx context.Context, key string, token string) error {
+	return nil
 }
 func (p *stubPubSub) Close() {}
 

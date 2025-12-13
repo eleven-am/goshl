@@ -10,18 +10,22 @@ import (
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/google/uuid"
 )
 
 type stubStorage struct {
-	metaData     []byte
-	metaExists   bool
-	segments     map[int][]byte
-	segmentCalls int
-	subtitleData []byte
-	spriteVTT    []byte
+	metaData           []byte
+	metaExists         bool
+	segments           map[int][]byte
+	segmentCalls       int
+	subtitleData       []byte
+	spriteVTT          []byte
+	metaExistsCalls    int
+	segmentExistsCalls int
 }
 
 func (s *stubStorage) MetadataExists(ctx context.Context, sourceURL string) (bool, error) {
+	s.metaExistsCalls++
 	return s.metaExists, nil
 }
 func (s *stubStorage) GetMetadata(ctx context.Context, sourceURL string) ([]byte, error) {
@@ -44,6 +48,7 @@ func (s *stubStorage) ReadSegment(ctx context.Context, info domain.SegmentData) 
 	return s.segments[info.Index], nil
 }
 func (s *stubStorage) SegmentExists(ctx context.Context, info domain.SegmentData) (bool, error) {
+	s.segmentExistsCalls++
 	_, ok := s.segments[info.Index]
 	return ok, nil
 }
@@ -96,9 +101,13 @@ func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bo
 }
 
 type stubCoordinator struct {
-	enqueued []domain.Job
-	subCh    chan domain.Job
-	waitCh   chan domain.SegmentStatus
+	enqueued      []domain.Job
+	subCh         chan domain.Job
+	waitCh        chan domain.SegmentStatus
+	lockErr       error
+	lockCalls     []string
+	releaseCalls  []string
+	onAcquireLock func(key string)
 }
 
 func (c *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
@@ -121,6 +130,20 @@ func (c *stubCoordinator) WaitSegment(ctx context.Context, info domain.SegmentDa
 		c.waitCh = make(chan domain.SegmentStatus, 1)
 	}
 	return c.waitCh, nil
+}
+func (c *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	c.lockCalls = append(c.lockCalls, key)
+	if c.onAcquireLock != nil {
+		c.onAcquireLock(key)
+	}
+	if c.lockErr != nil {
+		return "", c.lockErr
+	}
+	return uuid.New().String(), nil
+}
+func (c *stubCoordinator) ReleaseLock(ctx context.Context, key string, token string) error {
+	c.releaseCalls = append(c.releaseCalls, key)
+	return nil
 }
 func (c *stubCoordinator) Close() {}
 
@@ -378,4 +401,230 @@ func TestOptionsValidatePanicsOnMissingPathGen(t *testing.T) {
 	}()
 	opts := Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}}
 	opts.validate()
+}
+
+func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+	}()
+
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+
+	if len(coord.lockCalls) != 1 {
+		t.Fatalf("expected 1 lock call, got %d", len(coord.lockCalls))
+	}
+	if !strings.Contains(coord.lockCalls[0], "segment:") {
+		t.Fatalf("expected segment lock key, got %q", coord.lockCalls[0])
+	}
+	if len(coord.releaseCalls) != 1 {
+		t.Fatalf("expected 1 release call, got %d", len(coord.releaseCalls))
+	}
+}
+
+func TestSegmentWaitsWhenLockHeld(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{lockErr: domain.ErrLockHeld}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+	}()
+
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+
+	if len(coord.lockCalls) != 1 {
+		t.Fatalf("expected 1 lock attempt, got %d", len(coord.lockCalls))
+	}
+	if len(coord.releaseCalls) != 0 {
+		t.Fatalf("expected 0 release calls when lock not acquired, got %d", len(coord.releaseCalls))
+	}
+	if len(coord.enqueued) != 0 {
+		t.Fatalf("expected no enqueue when lock held, got %d", len(coord.enqueued))
+	}
+}
+
+func TestSegmentDoubleCheckReturnsExistingAfterLock(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+
+	lockAcquired := false
+	coord := &stubCoordinator{
+		onAcquireLock: func(key string) {
+			lockAcquired = true
+			store.segments[1] = []byte("appeared")
+		},
+	}
+
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	data, err := svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !lockAcquired {
+		t.Fatalf("lock should have been acquired")
+	}
+	if string(data) != "appeared" {
+		t.Fatalf("expected segment data from double-check, got %q", data)
+	}
+	if len(coord.enqueued) != 0 {
+		t.Fatalf("should not enqueue when segment exists after double-check, got %d", len(coord.enqueued))
+	}
+	if store.segmentExistsCalls != 2 {
+		t.Fatalf("expected 2 segment exists calls (initial + double-check), got %d", store.segmentExistsCalls)
+	}
+}
+
+func TestMetadataAcquiresLockWhenNotCached(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	store := &stubStorage{metaExists: false}
+	coord := &stubCoordinator{}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	_, _ = svc.Metadata(context.Background(), "file:///nonexistent")
+
+	if len(coord.lockCalls) != 1 {
+		t.Fatalf("expected 1 lock call for metadata, got %d", len(coord.lockCalls))
+	}
+	if !strings.Contains(coord.lockCalls[0], "metadata:") {
+		t.Fatalf("expected metadata lock key, got %q", coord.lockCalls[0])
+	}
+}
+
+func TestMetadataSkipsLockWhenCached(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 10}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true}
+	coord := &stubCoordinator{}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	_, err := svc.Metadata(context.Background(), "file:///media")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(coord.lockCalls) != 0 {
+		t.Fatalf("expected no lock calls when metadata cached, got %d", len(coord.lockCalls))
+	}
+}
+
+func TestDeterministicJobIDs(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 60, Keyframes: []float64{0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+	}()
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+	firstJobID := coord.enqueued[0].ID
+
+	coord.enqueued = nil
+	coord.waitCh = make(chan domain.SegmentStatus, 1)
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+	}()
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+	secondJobID := coord.enqueued[0].ID
+
+	if firstJobID != secondJobID {
+		t.Fatalf("job IDs should be deterministic, got %q and %q", firstJobID, secondJobID)
+	}
+
+	coord.enqueued = nil
+	coord.waitCh = make(chan domain.SegmentStatus, 1)
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+	}()
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "720p", 1)
+	differentRenditionID := coord.enqueued[0].ID
+
+	if firstJobID == differentRenditionID {
+		t.Fatalf("different renditions should have different job IDs")
+	}
+}
+
+func TestSegmentSkipsLockWhenAlreadyExists(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{3: []byte("cached")}}
+	coord := &stubCoordinator{}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	data, err := svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "cached" {
+		t.Fatalf("expected cached data, got %q", data)
+	}
+
+	if len(coord.lockCalls) != 0 {
+		t.Fatalf("expected no lock calls when segment exists, got %d", len(coord.lockCalls))
+	}
 }

@@ -3,8 +3,10 @@ package transcode
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/google/uuid"
 )
 
 type stubCoordinator struct {
@@ -30,6 +32,12 @@ func (s *stubCoordinator) WaitSegment(ctx context.Context, info domain.SegmentDa
 	ch := make(chan domain.SegmentStatus)
 	close(ch)
 	return ch, nil
+}
+func (s *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	return uuid.New().String(), nil
+}
+func (s *stubCoordinator) ReleaseLock(ctx context.Context, key string, token string) error {
+	return nil
 }
 func (s *stubCoordinator) Close() {}
 

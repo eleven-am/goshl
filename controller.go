@@ -50,6 +50,8 @@ package goshl
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -63,8 +65,6 @@ import (
 	"github.com/eleven-am/goshl/internal/rendition"
 	"github.com/eleven-am/goshl/internal/segment"
 	"github.com/eleven-am/goshl/internal/transcode"
-
-	"github.com/google/uuid"
 )
 
 type (
@@ -120,6 +120,11 @@ const (
 
 	// StreamAudio represents an audio stream.
 	StreamAudio = domain.StreamAudio
+)
+
+var (
+	// ErrLockHeld is returned by Coordinator.AcquireLock when the lock is held by another instance.
+	ErrLockHeld = domain.ErrLockHeld
 )
 
 // Options configures the Controller behavior and dependencies.
@@ -345,10 +350,12 @@ func (c *Controller) VariantPlaylist(ctx context.Context, sourceURL string, stre
 // Segment returns a transcoded media segment.
 //
 // If the segment exists in storage, it returns immediately. Otherwise, it:
-//  1. Subscribes to segment readiness notifications via Coordinator
-//  2. Enqueues a transcoding job covering this segment and nearby segments
-//  3. Waits for the worker to complete transcoding (up to SegmentTimeout)
-//  4. Returns the transcoded segment data
+//  1. Acquires a distributed lock to prevent duplicate transcoding
+//  2. Double-checks segment existence after acquiring lock
+//  3. Subscribes to segment readiness notifications via Coordinator
+//  4. Enqueues a transcoding job covering this segment and nearby segments
+//  5. Waits for the worker to complete transcoding (up to SegmentTimeout)
+//  6. Returns the transcoded segment data
 //
 // Parameters:
 //   - sourceURL: The media source URL
@@ -375,6 +382,26 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		return c.opts.Storage.ReadSegment(ctx, info)
 	}
 
+	lockKey := fmt.Sprintf("segment:%s:%s:%d", sourceURL, renditionName, index)
+	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.SegmentTimeout+time.Minute)
+
+	if lockErr != nil {
+		statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
+		if err != nil {
+			return nil, fmt.Errorf("wait segment: %w", err)
+		}
+		return c.waitForSegment(ctx, info, statusCh)
+	}
+	defer c.opts.Coordinator.ReleaseLock(ctx, lockKey, token)
+
+	exists, err = c.opts.Storage.SegmentExists(ctx, info)
+	if err != nil {
+		return nil, fmt.Errorf("check segment: %w", err)
+	}
+	if exists {
+		return c.opts.Storage.ReadSegment(ctx, info)
+	}
+
 	statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
 	if err != nil {
 		return nil, fmt.Errorf("wait segment: %w", err)
@@ -384,11 +411,15 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		return nil, fmt.Errorf("enqueue: %w", err)
 	}
 
+	return c.waitForSegment(ctx, info, statusCh)
+}
+
+func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-time.After(c.opts.SegmentTimeout):
-		return nil, fmt.Errorf("timeout waiting for segment %d", index)
+		return nil, fmt.Errorf("timeout waiting for segment %d", info.Index)
 	case status := <-statusCh:
 		if status.State == domain.SegmentStateError {
 			return nil, fmt.Errorf("segment error: %s", status.Error)
@@ -526,8 +557,10 @@ func (c *Controller) enqueueSegment(ctx context.Context, sourceURL string, strea
 	startIdx := (index / c.opts.SegmentsPerJob) * c.opts.SegmentsPerJob
 	endIdx := startIdx + c.opts.SegmentsPerJob - 1
 
+	jobID := deterministicJobID(sourceURL, renditionName, streamType, startIdx, endIdx)
+
 	job := domain.Job{
-		ID:         uuid.New().String(),
+		ID:         jobID,
 		SourceURL:  sourceURL,
 		Rendition:  renditionName,
 		StreamType: streamType,
@@ -538,22 +571,72 @@ func (c *Controller) enqueueSegment(ctx context.Context, sourceURL string, strea
 	return c.opts.Coordinator.Enqueue(ctx, job)
 }
 
+func deterministicJobID(sourceURL, rendition string, streamType StreamType, startIdx, endIdx int) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s:%s:%s:%d:%d", sourceURL, rendition, streamType, startIdx, endIdx)
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
 func (c *Controller) getMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
 	exists, err := c.opts.Storage.MetadataExists(ctx, sourceURL)
 	if err != nil {
 		return nil, err
 	}
 	if exists {
-		data, err := c.opts.Storage.GetMetadata(ctx, sourceURL)
-		if err != nil {
-			return nil, err
-		}
-		var meta domain.Metadata
-		if err := json.Unmarshal(data, &meta); err != nil {
-			return nil, err
-		}
-		return &meta, nil
+		return c.readCachedMetadata(ctx, sourceURL)
+	}
+
+	lockKey := fmt.Sprintf("metadata:%s", sourceURL)
+	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, 2*time.Minute)
+
+	if lockErr != nil {
+		return c.waitForMetadata(ctx, sourceURL, 2*time.Minute)
+	}
+	defer c.opts.Coordinator.ReleaseLock(ctx, lockKey, token)
+
+	exists, err = c.opts.Storage.MetadataExists(ctx, sourceURL)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return c.readCachedMetadata(ctx, sourceURL)
 	}
 
 	return c.prober.Probe(ctx, sourceURL)
+}
+
+func (c *Controller) readCachedMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
+	data, err := c.opts.Storage.GetMetadata(ctx, sourceURL)
+	if err != nil {
+		return nil, err
+	}
+	var meta domain.Metadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func (c *Controller) waitForMetadata(ctx context.Context, sourceURL string, timeout time.Duration) (*domain.Metadata, error) {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("timeout waiting for metadata")
+			}
+			exists, err := c.opts.Storage.MetadataExists(ctx, sourceURL)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				return c.readCachedMetadata(ctx, sourceURL)
+			}
+		}
+	}
 }
