@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.8] - 2025-12-14
+
+
+
+
 ## [0.0.7] - 2025-12-14
 
 - Implement distributed locking for segment and metadata retrieval
