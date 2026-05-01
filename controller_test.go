@@ -3,9 +3,12 @@ package goshl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,10 +104,12 @@ func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bo
 }
 
 type stubCoordinator struct {
+	mu            sync.Mutex
 	enqueued      []domain.Job
 	subCh         chan domain.Job
 	waitCh        chan domain.SegmentStatus
 	lockErr       error
+	subErrByType  map[domain.StreamType]error
 	lockCalls     []string
 	releaseCalls  []string
 	onAcquireLock func(key string)
@@ -115,6 +120,9 @@ func (c *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
 	return nil
 }
 func (c *stubCoordinator) Subscribe(ctx context.Context, streamType domain.StreamType) (<-chan domain.Job, error) {
+	if c.subErrByType != nil && c.subErrByType[streamType] != nil {
+		return nil, c.subErrByType[streamType]
+	}
 	if c.subCh == nil {
 		c.subCh = make(chan domain.Job)
 		close(c.subCh)
@@ -126,10 +134,18 @@ func (c *stubCoordinator) NotifySegment(ctx context.Context, info domain.Segment
 	return nil
 }
 func (c *stubCoordinator) WaitSegment(ctx context.Context, info domain.SegmentData) (<-chan domain.SegmentStatus, error) {
+	return c.waitSegmentChan(), nil
+}
+func (c *stubCoordinator) waitSegmentChan() chan domain.SegmentStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.waitCh == nil {
 		c.waitCh = make(chan domain.SegmentStatus, 1)
 	}
-	return c.waitCh, nil
+	return c.waitCh
+}
+func (c *stubCoordinator) sendWaitStatus(status domain.SegmentStatus) {
+	c.waitSegmentChan() <- status
 }
 func (c *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	c.lockCalls = append(c.lockCalls, key)
@@ -156,8 +172,10 @@ func (stubPathGen) VariantPlaylist(sourceURL string, rendition string, streamTyp
 func (stubPathGen) Segment(sourceURL string, rendition string, streamType domain.StreamType, index int) string {
 	return "/segment"
 }
-func (stubPathGen) SpriteVTT(sourceURL string) string                { return "/sprites.vtt" }
-func (stubPathGen) Sprite(sourceURL string, index int) string        { return "/sprite" }
+func (stubPathGen) SpriteVTT(sourceURL string) string { return "/sprites.vtt" }
+func (stubPathGen) Sprite(sourceURL string, index int) string {
+	return "/sprite-" + strconv.Itoa(index) + ".jpg"
+}
 func (stubPathGen) SubtitleVTT(sourceURL string, lang string) string { return "/sub.vtt" }
 func (stubPathGen) Preview(sourceURL string) string                  { return "/preview.gif" }
 func (stubPathGen) Thumbnail(sourceURL string) string                { return "/thumbnail.jpg" }
@@ -203,6 +221,39 @@ func TestMasterPlaylistUsesCachedMetadata(t *testing.T) {
 	}
 }
 
+func TestMasterPlaylistIncludesAllAudioTracks(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{
+		Video: domain.VideoStream{Width: 1920, Height: 1080, Bitrate: 5_000_000},
+		Audios: []domain.AudioStream{
+			{Codec: "aac", Channels: 2, Bitrate: 128_000, Language: "eng"},
+			{Codec: "ac3", Channels: 6, Bitrate: 640_000, Language: "spa"},
+		},
+	}
+	metaBytes, _ := json.Marshal(meta)
+	svc := NewController(Options{
+		Storage:     &stubStorage{metaData: metaBytes, metaExists: true},
+		Coordinator: &stubCoordinator{},
+		PathGen:     stubPathGen{},
+	})
+
+	out, err := svc.MasterPlaylist(context.Background(), "file:///media")
+	if err != nil {
+		t.Fatalf("master playlist err: %v", err)
+	}
+
+	for _, want := range []string{"audio0_aac_stereo", "audio1_aac_stereo", "audio1_aac_surround", "audio1_ac3_passthrough"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected audio rendition %q in playlist: %s", want, out)
+		}
+	}
+	if strings.Count(out, "DEFAULT=YES") != 1 {
+		t.Fatalf("expected exactly one default audio rendition: %s", out)
+	}
+}
+
 func TestSegmentReturnsCachedData(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
@@ -242,7 +293,7 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 	// simulate worker ready
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	}()
 
 	data, err := svc.Segment(context.Background(), "file:///media", domain.StreamAudio, "aac_stereo", 1)
@@ -315,6 +366,44 @@ func TestStartAndStop(t *testing.T) {
 		t.Fatalf("start err: %v", err)
 	}
 	svc.Stop()
+}
+
+func TestStartStopsVideoPoolWhenAudioPoolFails(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	coord := &stubCoordinator{
+		subErrByType: map[domain.StreamType]error{
+			domain.StreamAudio: errors.New("audio subscribe failed"),
+		},
+	}
+	svc := NewController(Options{
+		Storage:     &stubStorage{},
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	if err := svc.Start(context.Background()); err == nil {
+		t.Fatalf("expected audio pool start failure")
+	}
+
+	delete(coord.subErrByType, domain.StreamAudio)
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("expected controller to restart after partial start failure: %v", err)
+	}
+	svc.Stop()
+}
+
+func TestSpriteURLUsesPathGeneratorForEachIndex(t *testing.T) {
+	svc := NewController(Options{
+		Storage:     &stubStorage{},
+		Coordinator: &stubCoordinator{},
+		PathGen:     stubPathGen{},
+	})
+
+	if got := svc.spriteURL("file:///media")(12); got != "/sprite-12.jpg" {
+		t.Fatalf("expected direct path generator result, got %q", got)
+	}
 }
 
 func TestPreviewReturnsDataWithCustomConfig(t *testing.T) {
@@ -419,7 +508,7 @@ func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	}()
 
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
@@ -451,7 +540,7 @@ func TestSegmentWaitsWhenLockHeld(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
-		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	}()
 
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
@@ -570,7 +659,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 
 	go func() {
 		time.Sleep(5 * time.Millisecond)
-		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	}()
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 	firstJobID := coord.enqueued[0].ID
@@ -579,7 +668,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 	coord.waitCh = make(chan domain.SegmentStatus, 1)
 	go func() {
 		time.Sleep(5 * time.Millisecond)
-		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	}()
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 	secondJobID := coord.enqueued[0].ID
@@ -592,7 +681,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 	coord.waitCh = make(chan domain.SegmentStatus, 1)
 	go func() {
 		time.Sleep(5 * time.Millisecond)
-		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	}()
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "720p", 1)
 	differentRenditionID := coord.enqueued[0].ID

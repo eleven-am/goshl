@@ -2,6 +2,7 @@ package transcode
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -11,17 +12,23 @@ import (
 
 type stubCoordinator struct {
 	publishes []domain.SegmentStatus
+	subErr    error
+	acks      []string
 }
 
 func (s *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
 	return nil
 }
 func (s *stubCoordinator) Subscribe(ctx context.Context, streamType domain.StreamType) (<-chan domain.Job, error) {
+	if s.subErr != nil {
+		return nil, s.subErr
+	}
 	ch := make(chan domain.Job)
 	close(ch)
 	return ch, nil
 }
 func (s *stubCoordinator) Ack(ctx context.Context, jobID string) error {
+	s.acks = append(s.acks, jobID)
 	return nil
 }
 func (s *stubCoordinator) NotifySegment(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
@@ -67,7 +74,7 @@ func TestFindNearestKeyframePrefersPreviousWhenVeryClose(t *testing.T) {
 
 func TestFindVideoAndAudioRenditions(t *testing.T) {
 	p := &Pool{}
-	meta := &domain.Metadata{Video: domain.VideoStream{Width: 1920, Height: 1080, Bitrate: 5_000_000}, Audios: []domain.AudioStream{{Codec: "ac3", Channels: 6, Bitrate: 640_000}}}
+	meta := &domain.Metadata{Video: domain.VideoStream{Width: 1920, Height: 1080, Bitrate: 5_000_000}, Audios: []domain.AudioStream{{Codec: "aac", Channels: 2, Bitrate: 128_000}, {Codec: "ac3", Channels: 6, Bitrate: 640_000}}}
 
 	if p.findVideoRendition(meta, "720p") == nil {
 		t.Fatalf("expected to find 720p rendition")
@@ -76,8 +83,12 @@ func TestFindVideoAndAudioRenditions(t *testing.T) {
 		t.Fatalf("should return nil for missing video rendition")
 	}
 
-	if p.findAudioRendition(meta, "aac_stereo") == nil {
-		t.Fatalf("expected stereo audio rendition")
+	audio := p.findAudioRendition(meta, "audio1_aac_surround")
+	if audio == nil {
+		t.Fatalf("expected surround audio rendition")
+	}
+	if audio.StreamIndex != 1 {
+		t.Fatalf("expected stream index 1, got %#v", audio)
 	}
 	if p.findAudioRendition(&domain.Metadata{}, "aac_stereo") != nil {
 		t.Fatalf("should return nil when no audio present")
@@ -107,7 +118,7 @@ func (e assertErr) Error() string { return string(e) }
 
 func TestNewPool(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 2, domain.StreamVideo, nil, nil, nil)
+	pool := NewPool(coord, 2, domain.StreamVideo, 6.0, nil, nil, nil)
 
 	if pool.size != 2 {
 		t.Fatalf("expected size 2, got %d", pool.size)
@@ -119,7 +130,7 @@ func TestNewPool(t *testing.T) {
 
 func TestPoolStartAndStop(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
 
 	ctx := context.Background()
 	if err := pool.Start(ctx); err != nil {
@@ -127,11 +138,31 @@ func TestPoolStartAndStop(t *testing.T) {
 	}
 
 	pool.Stop()
+
+	if err := pool.Start(ctx); err != nil {
+		t.Fatalf("restart after stop should work: %v", err)
+	}
+	pool.Stop()
+}
+
+func TestPoolStartSubscribeFailureCanRetry(t *testing.T) {
+	coord := &stubCoordinator{subErr: errors.New("subscribe failed")}
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+
+	if err := pool.Start(context.Background()); err == nil {
+		t.Fatalf("expected start error")
+	}
+
+	coord.subErr = nil
+	if err := pool.Start(context.Background()); err != nil {
+		t.Fatalf("expected retry to start after subscribe failure, got %v", err)
+	}
+	pool.Stop()
 }
 
 func TestPoolStartTwiceReturnsError(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
 
 	ctx := context.Background()
 	if err := pool.Start(ctx); err != nil {
@@ -147,7 +178,7 @@ func TestPoolStartTwiceReturnsError(t *testing.T) {
 
 func TestPoolStopWithoutStart(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
 	pool.Stop()
 }
 
@@ -184,6 +215,18 @@ func TestExtractSegmentsSingleKeyframe(t *testing.T) {
 	}
 	if segments[0].End != 10 {
 		t.Fatalf("expected end at duration, got %v", segments[0].End)
+	}
+}
+
+func TestExtractSegmentsUsesConfiguredTargetDuration(t *testing.T) {
+	p := &Pool{targetDuration: 4.0}
+	segments := p.extractSegments([]float64{0, 4, 8, 12}, 12, 1, 1)
+
+	if len(segments) != 1 {
+		t.Fatalf("expected one segment, got %#v", segments)
+	}
+	if segments[0].Start != 4 || segments[0].End != 8 {
+		t.Fatalf("target duration was not respected: %#v", segments[0])
 	}
 }
 
@@ -239,5 +282,16 @@ func TestWorkerSetError(t *testing.T) {
 	}
 	if w.State() != WorkerStateError {
 		t.Fatalf("expected error state, got %v", w.State())
+	}
+}
+
+func TestWaitForWorkerReturnsWorkerError(t *testing.T) {
+	p := &Pool{}
+	w := &Worker{}
+	w.setError(assertErr("ffmpeg failed"))
+
+	err := p.waitForWorker(context.Background(), w)
+	if err == nil || err.Error() != "ffmpeg failed" {
+		t.Fatalf("expected worker error, got %v", err)
 	}
 }

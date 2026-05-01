@@ -37,6 +37,9 @@ func TestVideoCommand_TranscodeIncludesSegmentTimes(t *testing.T) {
 	if !strings.Contains(joined, "-segment_times 6.500000,12.000000") {
 		t.Fatalf("expected relative segment times, got %s", joined)
 	}
+	if !strings.Contains(joined, "-t 18.000000") || strings.Contains(joined, "-to 30.000000") {
+		t.Fatalf("expected duration-based clipping, got %s", joined)
+	}
 	if !strings.Contains(joined, "-vf scale=1280:720") {
 		t.Fatalf("missing scale filter: %s", joined)
 	}
@@ -89,6 +92,9 @@ func TestAudioCommand_TranscodeAndCopy(t *testing.T) {
 	if !strings.Contains(joined, "-segment_times 5.000000") {
 		t.Fatalf("audio segment times missing: %s", joined)
 	}
+	if !strings.Contains(joined, "-t 10.000000") {
+		t.Fatalf("audio should clip by duration, got %s", joined)
+	}
 
 	copyArgs := builder.Audio(AudioParams{
 		InputURL:    "in.mkv",
@@ -128,6 +134,9 @@ func TestVideoStreamArgsIncludeKeyframesAndForcedIDRForCUDA(t *testing.T) {
 	if !strings.Contains(joined, "-vf scale_cuda=640:360:format=nv12") {
 		t.Fatalf("cuda scale missing: %s", joined)
 	}
+	if !strings.Contains(joined, "-t 10.000000") || strings.Contains(joined, "-to 20.000000") {
+		t.Fatalf("stream command should clip by duration, got %s", joined)
+	}
 }
 
 func TestHelpersHandleEdgeCases(t *testing.T) {
@@ -140,5 +149,8 @@ func TestHelpersHandleEdgeCases(t *testing.T) {
 	segs := []domain.Segment{{Start: 5}, {Start: 8}, {Start: 11}}
 	if got := formatSegmentTimesWithOffset(segs, 4); got != "4.000000,7.000000" {
 		t.Fatalf("unexpected offset times %q", got)
+	}
+	if got := formatDuration(12, 30); got != "18.000000" {
+		t.Fatalf("unexpected duration %q", got)
 	}
 }

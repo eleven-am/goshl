@@ -2,6 +2,7 @@ package transcode
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -64,6 +65,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	ctx, w.cancel = context.WithCancel(ctx)
 
 	w.cmd = exec.CommandContext(ctx, "ffmpeg", w.args...)
+	var stderr bytes.Buffer
+	w.cmd.Stderr = &stderr
 	stdout, err := w.cmd.StdoutPipe()
 	if err != nil {
 		w.setError(err)
@@ -75,12 +78,12 @@ func (w *Worker) Start(ctx context.Context) error {
 		return err
 	}
 
-	go w.run(ctx, stdout)
+	go w.run(ctx, stdout, &stderr)
 
 	return nil
 }
 
-func (w *Worker) run(ctx context.Context, stdout interface{}) {
+func (w *Worker) run(ctx context.Context, stdout interface{}, stderr *bytes.Buffer) {
 	reader, ok := stdout.(interface{ Read([]byte) (int, error) })
 	if !ok {
 		w.setError(fmt.Errorf("invalid stdout type"))
@@ -94,6 +97,7 @@ func (w *Worker) run(ctx context.Context, stdout interface{}) {
 		select {
 		case <-ctx.Done():
 			w.cmd.Wait()
+			w.setError(ctx.Err())
 			return
 		default:
 		}
@@ -116,6 +120,12 @@ func (w *Worker) run(ctx context.Context, stdout interface{}) {
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		w.cmd.Wait()
+		w.setError(fmt.Errorf("read ffmpeg output: %w", err))
+		return
+	}
+
 	cmdErr := w.cmd.Wait()
 
 	w.mu.Lock()
@@ -123,7 +133,11 @@ func (w *Worker) run(ctx context.Context, stdout interface{}) {
 
 	if cmdErr != nil && ctx.Err() == nil {
 		w.state = WorkerStateError
-		w.err = cmdErr
+		if stderr != nil && stderr.Len() > 0 {
+			w.err = fmt.Errorf("%w: %s", cmdErr, strings.TrimSpace(stderr.String()))
+		} else {
+			w.err = cmdErr
+		}
 		return
 	}
 

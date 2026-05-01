@@ -70,7 +70,7 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 	args = append(args,
 		"-ss", fmt.Sprintf("%.6f", startSeg.Start),
 		"-i", p.InputURL,
-		"-to", fmt.Sprintf("%.6f", endSeg.End),
+		"-t", formatDuration(startSeg.Start, endSeg.End),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -142,7 +142,7 @@ func (b *CommandBuilder) Audio(p AudioParams) []string {
 		"-nostats", "-hide_banner", "-loglevel", "warning",
 		"-ss", fmt.Sprintf("%.6f", startSeg.Start),
 		"-i", p.InputURL,
-		"-to", fmt.Sprintf("%.6f", endSeg.End),
+		"-t", formatDuration(startSeg.Start, endSeg.End),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -235,7 +235,7 @@ func (b *CommandBuilder) VideoStream(p VideoStreamParams) []string {
 	args = append(args,
 		"-ss", fmt.Sprintf("%.6f", p.StartTime),
 		"-i", p.InputURL,
-		"-to", fmt.Sprintf("%.6f", p.EndTime),
+		"-t", formatDuration(p.StartTime, p.EndTime),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -285,7 +285,7 @@ func (b *CommandBuilder) AudioStream(p AudioStreamParams) []string {
 		"-nostats", "-hide_banner", "-loglevel", "warning",
 		"-ss", fmt.Sprintf("%.6f", p.StartTime),
 		"-i", p.InputURL,
-		"-to", fmt.Sprintf("%.6f", p.EndTime),
+		"-t", formatDuration(p.StartTime, p.EndTime),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -310,4 +310,12 @@ func (b *CommandBuilder) audioStreamEncodeArgs(p AudioStreamParams) []string {
 		"-ac", fmt.Sprintf("%d", p.Rendition.Channels),
 		"-b:a", fmt.Sprintf("%d", p.Rendition.Bitrate),
 	}
+}
+
+func formatDuration(start, end float64) string {
+	duration := end - start
+	if duration < 0 {
+		duration = 0
+	}
+	return fmt.Sprintf("%.6f", duration)
 }

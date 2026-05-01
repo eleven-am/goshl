@@ -45,7 +45,7 @@ func TestGenerator_MasterIncludesAudioGroupsAndVariants(t *testing.T) {
 	}
 
 	audios := []domain.AudioRendition{
-		{Name: "aac_stereo", Codec: "aac"},
+		{Name: "aac_stereo", Codec: "aac", Default: true},
 		{Name: "ac3_passthrough", Codec: "ac3"},
 	}
 

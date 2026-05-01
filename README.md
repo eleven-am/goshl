@@ -70,6 +70,14 @@ type Storage interface {
     WriteSubtitleVTT(ctx context.Context, sourceURL string, lang string, data []byte) error
     ReadSubtitleVTT(ctx context.Context, sourceURL string, lang string) ([]byte, error)
     SubtitleVTTExists(ctx context.Context, sourceURL string, lang string) (bool, error)
+
+    WritePreview(ctx context.Context, sourceURL string, data []byte) error
+    ReadPreview(ctx context.Context, sourceURL string) ([]byte, error)
+    PreviewExists(ctx context.Context, sourceURL string) (bool, error)
+
+    WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error
+    ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error)
+    ThumbnailExists(ctx context.Context, sourceURL string) (bool, error)
 }
 ```
 
@@ -85,6 +93,9 @@ type Coordinator interface {
 
     NotifySegment(ctx context.Context, info SegmentData, status SegmentStatus) error
     WaitSegment(ctx context.Context, info SegmentData) (<-chan SegmentStatus, error)
+
+    AcquireLock(ctx context.Context, key string, ttl time.Duration) (token string, err error)
+    ReleaseLock(ctx context.Context, key string, token string) error
 
     Close()
 }
@@ -102,6 +113,8 @@ type PathGenerator interface {
     SpriteVTT(sourceURL string) string
     Sprite(sourceURL string, index int) string
     SubtitleVTT(sourceURL string, lang string) string
+    Preview(sourceURL string) string
+    Thumbnail(sourceURL string) string
 }
 ```
 

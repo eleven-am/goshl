@@ -112,35 +112,49 @@ var passthroughCodecs = map[string]bool{
 }
 
 func GenerateAudio(audio domain.AudioStream) []domain.AudioRendition {
+	return generateAudio(audio, 0, false, true)
+}
+
+func GenerateAudioTracks(audios []domain.AudioStream) []domain.AudioRendition {
 	var renditions []domain.AudioRendition
 
-	renditions = append(renditions, domain.AudioRendition{
-		Name:     "aac_stereo",
-		Codec:    "aac",
-		Bitrate:  128000,
-		Channels: 2,
-		Method:   domain.Transcode,
-	})
-
-	if audio.Channels >= 6 {
-		renditions = append(renditions, domain.AudioRendition{
-			Name:     "aac_surround",
-			Codec:    "aac",
-			Bitrate:  384000,
-			Channels: 6,
-			Method:   domain.Transcode,
-		})
-	}
-
-	if passthroughCodecs[audio.Codec] {
-		renditions = append(renditions, domain.AudioRendition{
-			Name:     audio.Codec + "_passthrough",
-			Codec:    audio.Codec,
-			Bitrate:  audio.Bitrate,
-			Channels: audio.Channels,
-			Method:   domain.DirectStream,
-		})
+	for i, audio := range audios {
+		prefixNames := len(audios) > 1
+		renditions = append(renditions, generateAudio(audio, i, prefixNames, i == 0)...)
 	}
 
 	return renditions
+}
+
+func generateAudio(audio domain.AudioStream, streamIndex int, prefixNames bool, defaultTrack bool) []domain.AudioRendition {
+	var renditions []domain.AudioRendition
+
+	renditions = append(renditions, audioRendition("aac_stereo", "aac", 128000, 2, domain.Transcode, audio, streamIndex, prefixNames, defaultTrack))
+
+	if audio.Channels >= 6 {
+		renditions = append(renditions, audioRendition("aac_surround", "aac", 384000, 6, domain.Transcode, audio, streamIndex, prefixNames, false))
+	}
+
+	if passthroughCodecs[audio.Codec] {
+		renditions = append(renditions, audioRendition(audio.Codec+"_passthrough", audio.Codec, audio.Bitrate, audio.Channels, domain.DirectStream, audio, streamIndex, prefixNames, false))
+	}
+
+	return renditions
+}
+
+func audioRendition(name, codec string, bitrate, channels int, method domain.PlaybackMethod, audio domain.AudioStream, streamIndex int, prefixNames bool, isDefault bool) domain.AudioRendition {
+	if prefixNames {
+		name = fmt.Sprintf("audio%d_%s", streamIndex, name)
+	}
+
+	return domain.AudioRendition{
+		Name:        name,
+		Codec:       codec,
+		Bitrate:     bitrate,
+		Channels:    channels,
+		Method:      method,
+		StreamIndex: streamIndex,
+		Language:    audio.Language,
+		Default:     isDefault,
+	}
 }

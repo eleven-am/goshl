@@ -47,14 +47,14 @@ func NewGenerator(storage domain.Storage) *Generator {
 	}
 }
 
-func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL string, duration float64, urlPattern string) ([]byte, error) {
+func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string) ([]byte, error) {
 	exists, err := g.storage.SpriteVTTExists(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("check sprite vtt: %w", err)
 	}
 
 	if !exists {
-		if err := g.generateSprites(ctx, sourceURL, duration, urlPattern); err != nil {
+		if err := g.generateSprites(ctx, sourceURL, duration, spriteURL); err != nil {
 			return nil, err
 		}
 	}
@@ -62,14 +62,14 @@ func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL string, duration
 	return g.storage.ReadSpriteVTT(ctx, sourceURL)
 }
 
-func (g *Generator) GetSprite(ctx context.Context, sourceURL string, duration float64, urlPattern string, index int) ([]byte, error) {
+func (g *Generator) GetSprite(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string, index int) ([]byte, error) {
 	exists, err := g.storage.SpriteExists(ctx, sourceURL, index)
 	if err != nil {
 		return nil, fmt.Errorf("check sprite: %w", err)
 	}
 
 	if !exists {
-		if err := g.generateSprites(ctx, sourceURL, duration, urlPattern); err != nil {
+		if err := g.generateSprites(ctx, sourceURL, duration, spriteURL); err != nil {
 			return nil, err
 		}
 	}
@@ -77,7 +77,7 @@ func (g *Generator) GetSprite(ctx context.Context, sourceURL string, duration fl
 	return g.storage.ReadSprite(ctx, sourceURL, index)
 }
 
-func (g *Generator) generateSprites(ctx context.Context, sourceURL string, duration float64, urlPattern string) error {
+func (g *Generator) generateSprites(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string) error {
 	thumbsPerSprite := g.cols * g.rows
 	totalThumbs := int(math.Ceil(duration / g.interval))
 	numSprites := int(math.Ceil(float64(totalThumbs) / float64(thumbsPerSprite)))
@@ -114,7 +114,7 @@ func (g *Generator) generateSprites(ctx context.Context, sourceURL string, durat
 		}
 	}
 
-	vtt := g.generateVTT(duration, numSprites, urlPattern)
+	vtt := g.generateVTT(duration, numSprites, spriteURL)
 	if err := g.storage.WriteSpriteVTT(ctx, sourceURL, vtt); err != nil {
 		return fmt.Errorf("write sprite vtt: %w", err)
 	}
@@ -122,14 +122,14 @@ func (g *Generator) generateSprites(ctx context.Context, sourceURL string, durat
 	return nil
 }
 
-func (g *Generator) generateVTT(duration float64, numSprites int, urlPattern string) []byte {
+func (g *Generator) generateVTT(duration float64, numSprites int, spriteURL func(int) string) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("WEBVTT\n\n")
 
 	currentTime := 0.0
 
 	for spriteIndex := 0; spriteIndex < numSprites; spriteIndex++ {
-		spriteURL := fmt.Sprintf(urlPattern, spriteIndex)
+		url := spriteURL(spriteIndex)
 
 		for row := 0; row < g.rows; row++ {
 			for col := 0; col < g.cols; col++ {
@@ -144,7 +144,7 @@ func (g *Generator) generateVTT(duration float64, numSprites int, urlPattern str
 				y := row * g.thumbHeight
 
 				buf.WriteString(fmt.Sprintf("%s --> %s\n", formatVTTTime(startTime), formatVTTTime(endTime)))
-				buf.WriteString(fmt.Sprintf("%s#xywh=%d,%d,%d,%d\n\n", spriteURL, x, y, g.thumbWidth, g.thumbHeight))
+				buf.WriteString(fmt.Sprintf("%s#xywh=%d,%d,%d,%d\n\n", url, x, y, g.thumbWidth, g.thumbHeight))
 
 				currentTime += g.interval
 			}
@@ -203,7 +203,7 @@ func formatVTTTime(seconds float64) string {
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, secs, millis)
 }
 
-func (g *Generator) GetPreview(ctx context.Context, sourceURL string, duration float64, urlPattern string, config domain.PreviewConfig) ([]byte, error) {
+func (g *Generator) GetPreview(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string, config domain.PreviewConfig) ([]byte, error) {
 	exists, err := g.storage.PreviewExists(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("check preview: %w", err)
@@ -213,7 +213,7 @@ func (g *Generator) GetPreview(ctx context.Context, sourceURL string, duration f
 		return g.storage.ReadPreview(ctx, sourceURL)
 	}
 
-	if err := g.generateSprites(ctx, sourceURL, duration, urlPattern); err != nil {
+	if err := g.generateSprites(ctx, sourceURL, duration, spriteURL); err != nil {
 		return nil, err
 	}
 
@@ -314,7 +314,7 @@ func (g *Generator) generatePreview(ctx context.Context, sourceURL string, durat
 	return buf.Bytes(), nil
 }
 
-func (g *Generator) GetThumbnail(ctx context.Context, sourceURL string, duration float64, urlPattern string, config domain.ThumbnailConfig) ([]byte, error) {
+func (g *Generator) GetThumbnail(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string, config domain.ThumbnailConfig) ([]byte, error) {
 	exists, err := g.storage.ThumbnailExists(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("check thumbnail: %w", err)
@@ -324,7 +324,7 @@ func (g *Generator) GetThumbnail(ctx context.Context, sourceURL string, duration
 		return g.storage.ReadThumbnail(ctx, sourceURL)
 	}
 
-	if err := g.generateSprites(ctx, sourceURL, duration, urlPattern); err != nil {
+	if err := g.generateSprites(ctx, sourceURL, duration, spriteURL); err != nil {
 		return nil, err
 	}
 

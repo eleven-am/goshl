@@ -6,19 +6,24 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/ffmpeg"
+	"github.com/eleven-am/goshl/internal/playlist"
 	"github.com/eleven-am/goshl/internal/rendition"
 )
 
+const defaultTargetDuration = 6.0
+
 type Pool struct {
-	coordinator domain.Coordinator
-	size        int
-	streamType  domain.StreamType
-	storage     domain.Storage
-	cmdBuilder  *ffmpeg.CommandBuilder
-	segStorage  domain.Storage
+	coordinator    domain.Coordinator
+	size           int
+	streamType     domain.StreamType
+	targetDuration float64
+	storage        domain.Storage
+	cmdBuilder     *ffmpeg.CommandBuilder
+	segStorage     domain.Storage
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -29,17 +34,23 @@ func NewPool(
 	coordinator domain.Coordinator,
 	size int,
 	streamType domain.StreamType,
+	targetDuration float64,
 	storage domain.Storage,
 	cmdBuilder *ffmpeg.CommandBuilder,
 	segStorage domain.Storage,
 ) *Pool {
+	if targetDuration <= 0 {
+		targetDuration = defaultTargetDuration
+	}
+
 	return &Pool{
-		coordinator: coordinator,
-		size:        size,
-		streamType:  streamType,
-		storage:     storage,
-		cmdBuilder:  cmdBuilder,
-		segStorage:  segStorage,
+		coordinator:    coordinator,
+		size:           size,
+		streamType:     streamType,
+		targetDuration: targetDuration,
+		storage:        storage,
+		cmdBuilder:     cmdBuilder,
+		segStorage:     segStorage,
 	}
 }
 
@@ -49,11 +60,16 @@ func (p *Pool) Start(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("pool already started")
 	}
-	ctx, p.cancel = context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	p.cancel = cancel
 	p.mu.Unlock()
 
 	jobs, err := p.coordinator.Subscribe(ctx, p.streamType)
 	if err != nil {
+		cancel()
+		p.mu.Lock()
+		p.cancel = nil
+		p.mu.Unlock()
 		return fmt.Errorf("subscribe: %w", err)
 	}
 
@@ -67,12 +83,17 @@ func (p *Pool) Start(ctx context.Context) error {
 
 func (p *Pool) Stop() {
 	p.mu.Lock()
-	if p.cancel != nil {
-		p.cancel()
-	}
+	cancel := p.cancel
 	p.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	p.wg.Wait()
+
+	p.mu.Lock()
+	p.cancel = nil
+	p.mu.Unlock()
 }
 
 func (p *Pool) worker(ctx context.Context, jobs <-chan domain.Job) {
@@ -152,7 +173,7 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 		}
 		args = p.cmdBuilder.Audio(ffmpeg.AudioParams{
 			InputURL:    job.SourceURL,
-			StreamIndex: 0,
+			StreamIndex: audioRendition.StreamIndex,
 			Rendition:   *audioRendition,
 			Segments:    segments,
 			OutputDir:   tmpDir,
@@ -165,9 +186,14 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 		return
 	}
 
-	p.waitForWorker(ctx, w)
+	if err := p.waitForWorker(ctx, w); err != nil {
+		p.publishError(ctx, job, err)
+		return
+	}
 
-	p.coordinator.Ack(ctx, job.ID)
+	if err := p.coordinator.Ack(ctx, job.ID); err != nil {
+		p.publishError(ctx, job, fmt.Errorf("ack job: %w", err))
+	}
 }
 
 func (p *Pool) getMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
@@ -182,68 +208,50 @@ func (p *Pool) getMetadata(ctx context.Context, sourceURL string) (*domain.Metad
 	return &meta, nil
 }
 
-func (p *Pool) waitForWorker(ctx context.Context, w *Worker) {
-	ticker := make(chan struct{})
-	go func() {
-		for w.State() == WorkerStateRunning {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-		}
-		close(ticker)
-	}()
+func (p *Pool) waitForWorker(ctx context.Context, w *Worker) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 
-	select {
-	case <-ctx.Done():
-		w.Kill()
-	case <-ticker:
+	for {
+		switch w.State() {
+		case WorkerStateDone:
+			return nil
+		case WorkerStateError:
+			if err := w.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("worker failed")
+		}
+
+		select {
+		case <-ctx.Done():
+			w.Kill()
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 
 func (p *Pool) extractSegments(keyframes []float64, duration float64, startIdx, endIdx int) []domain.Segment {
-	targetDuration := 6.0
 	var segments []domain.Segment
-	var idx int
 
-	for i := 0; i < len(keyframes); i++ {
-		start := keyframes[i]
-		var end float64
-
-		for j := i + 1; j < len(keyframes); j++ {
-			if keyframes[j]-start >= targetDuration {
-				end = keyframes[j]
-				i = j - 1
-				break
-			}
+	for _, segment := range playlist.CalculateSegments(keyframes, duration, p.effectiveTargetDuration()) {
+		if segment.Index >= startIdx && segment.Index <= endIdx {
+			segments = append(segments, segment)
 		}
-
-		if end == 0 {
-			if i < len(keyframes)-1 {
-				end = keyframes[len(keyframes)-1]
-				i = len(keyframes)
-			} else {
-				end = duration
-			}
-		}
-
-		if idx >= startIdx && idx <= endIdx {
-			segments = append(segments, domain.Segment{
-				Index:    idx,
-				Start:    start,
-				End:      end,
-				Duration: end - start,
-			})
-		}
-
-		idx++
-		if idx > endIdx {
+		if segment.Index > endIdx {
 			break
 		}
 	}
 
 	return segments
+}
+
+func (p *Pool) effectiveTargetDuration() float64 {
+	if p.targetDuration > 0 {
+		return p.targetDuration
+	}
+	return defaultTargetDuration
 }
 
 func (p *Pool) findVideoRendition(meta *domain.Metadata, name string) *domain.VideoRendition {
@@ -261,7 +269,7 @@ func (p *Pool) findAudioRendition(meta *domain.Metadata, name string) *domain.Au
 		return nil
 	}
 
-	renditions := rendition.GenerateAudio(meta.Audios[0])
+	renditions := rendition.GenerateAudioTracks(meta.Audios)
 	for _, r := range renditions {
 		if r.Name == name {
 			return &r

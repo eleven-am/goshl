@@ -74,7 +74,7 @@ func TestGenerateAudio_IncludesSurroundAndPassthrough(t *testing.T) {
 	}
 
 	stereo := renditions[0]
-	if stereo.Name != "aac_stereo" || stereo.Method != domain.Transcode || stereo.Bitrate != 128_000 {
+	if stereo.Name != "aac_stereo" || stereo.Method != domain.Transcode || stereo.Bitrate != 128_000 || !stereo.Default {
 		t.Fatalf("unexpected stereo rendition: %#v", stereo)
 	}
 
@@ -93,5 +93,38 @@ func TestGenerateAudio_IncludesSurroundAndPassthrough(t *testing.T) {
 	}
 	if passthrough == nil || passthrough.Method != domain.DirectStream || passthrough.Bitrate != 640_000 {
 		t.Fatalf("unexpected passthrough rendition: %#v", passthrough)
+	}
+}
+
+func TestGenerateAudioTracksDisambiguatesMultipleStreams(t *testing.T) {
+	renditions := GenerateAudioTracks([]domain.AudioStream{
+		{Codec: "aac", Channels: 2, Bitrate: 128_000, Language: "eng"},
+		{Codec: "ac3", Channels: 6, Bitrate: 640_000, Language: "spa"},
+	})
+
+	if len(renditions) == 0 {
+		t.Fatalf("expected audio renditions")
+	}
+
+	var defaultCount int
+	seen := map[string]bool{}
+	for _, r := range renditions {
+		if seen[r.Name] {
+			t.Fatalf("duplicate rendition name %q in %#v", r.Name, renditions)
+		}
+		seen[r.Name] = true
+		if r.Default {
+			defaultCount++
+			if r.StreamIndex != 0 {
+				t.Fatalf("default should be on first stream, got %#v", r)
+			}
+		}
+	}
+
+	if !seen["audio0_aac_stereo"] || !seen["audio1_aac_surround"] || !seen["audio1_ac3_passthrough"] {
+		t.Fatalf("missing expected prefixed renditions: %#v", renditions)
+	}
+	if defaultCount != 1 {
+		t.Fatalf("expected exactly one default rendition, got %d", defaultCount)
 	}
 }

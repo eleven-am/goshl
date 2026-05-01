@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -12,6 +13,16 @@ import (
 
 	"github.com/eleven-am/goshl/internal/domain"
 )
+
+func spriteURL(index int) string {
+	return fmt.Sprintf("http://sprites/%d.jpg", index)
+}
+
+func staticSpriteURL(url string) func(int) string {
+	return func(int) string {
+		return url
+	}
+}
 
 type stubStorage struct {
 	spriteVTTExists bool
@@ -22,11 +33,11 @@ type stubStorage struct {
 
 	existsErr error
 
-	wroteSprites    int
-	wroteSpriteVTT  int
-	wroteSubtitle   int
-	wrotePreview    int
-	wroteThumbnail  int
+	wroteSprites   int
+	wroteSpriteVTT int
+	wroteSubtitle  int
+	wrotePreview   int
+	wroteThumbnail int
 
 	spriteVTTData []byte
 	spriteData    map[int][]byte
@@ -138,7 +149,7 @@ func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bo
 func TestGenerateVTTProducesContinuousEntries(t *testing.T) {
 	g := &Generator{thumbWidth: 10, thumbHeight: 10, interval: 1, cols: 2, rows: 2}
 
-	out := string(g.generateVTT(3.0, 2, "http://sprites/%d.jpg"))
+	out := string(g.generateVTT(3.0, 2, spriteURL))
 
 	if !strings.Contains(out, "WEBVTT") {
 		t.Fatalf("missing header: %s", out)
@@ -155,7 +166,7 @@ func TestGetSpriteVTTUsesCacheWhenPresent(t *testing.T) {
 	storage := &stubStorage{spriteVTTExists: true, spriteVTTData: []byte("cached")}
 	g := NewGenerator(storage)
 
-	data, err := g.GetSpriteVTT(context.Background(), "file:///media", 30, "http://sprites/%d.jpg")
+	data, err := g.GetSpriteVTT(context.Background(), "file:///media", 30, spriteURL)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -171,7 +182,7 @@ func TestGetSpriteVTTPropagatesExistenceError(t *testing.T) {
 	storage := &stubStorage{existsErr: errors.New("boom")}
 	g := NewGenerator(storage)
 
-	_, err := g.GetSpriteVTT(context.Background(), "file:///media", 10, "pattern")
+	_, err := g.GetSpriteVTT(context.Background(), "file:///media", 10, staticSpriteURL("pattern"))
 	if err == nil || !strings.Contains(err.Error(), "check sprite vtt") {
 		t.Fatalf("expected propagated error, got %v", err)
 	}
@@ -199,7 +210,7 @@ func TestGetPreviewReturnsCachedData(t *testing.T) {
 	storage := &stubStorage{previewExists: true, previewData: []byte("cached-gif")}
 	g := NewGenerator(storage)
 
-	data, err := g.GetPreview(context.Background(), "file:///media", 10, "http://sprites/%d.jpg", domain.PreviewConfig{
+	data, err := g.GetPreview(context.Background(), "file:///media", 10, spriteURL, domain.PreviewConfig{
 		MaxFrames:     10,
 		Frameduration: 100,
 		Width:         100,
@@ -219,7 +230,7 @@ func TestGetPreviewPropagatesExistenceError(t *testing.T) {
 	storage := &stubStorage{existsErr: errors.New("boom")}
 	g := NewGenerator(storage)
 
-	_, err := g.GetPreview(context.Background(), "file:///media", 10, "pattern", domain.PreviewConfig{})
+	_, err := g.GetPreview(context.Background(), "file:///media", 10, staticSpriteURL("pattern"), domain.PreviewConfig{})
 	if err == nil || !strings.Contains(err.Error(), "check preview") {
 		t.Fatalf("expected propagated error, got %v", err)
 	}
@@ -328,7 +339,7 @@ func TestGetSpriteExistenceError(t *testing.T) {
 	storage := &stubStorage{existsErr: errors.New("sprite err")}
 	g := NewGenerator(storage)
 
-	_, err := g.GetSprite(context.Background(), "file:///media", 10, "pattern", 0)
+	_, err := g.GetSprite(context.Background(), "file:///media", 10, staticSpriteURL("pattern"), 0)
 	if err == nil || !strings.Contains(err.Error(), "check sprite") {
 		t.Fatalf("expected propagated error, got %v", err)
 	}
@@ -343,7 +354,7 @@ func TestGetSpriteReturnsCachedData(t *testing.T) {
 	}
 	g := NewGenerator(storage)
 
-	data, err := g.GetSprite(context.Background(), "file:///media", 10, "http://sprites/%d.jpg", 0)
+	data, err := g.GetSprite(context.Background(), "file:///media", 10, spriteURL, 0)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -419,7 +430,7 @@ func TestGetThumbnailReturnsCachedData(t *testing.T) {
 	}
 	g := NewGenerator(storage)
 
-	data, err := g.GetThumbnail(context.Background(), "file:///media", 60, "http://sprites/%d.jpg", domain.ThumbnailConfig{Position: 0.1, Width: 480})
+	data, err := g.GetThumbnail(context.Background(), "file:///media", 60, spriteURL, domain.ThumbnailConfig{Position: 0.1, Width: 480})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -434,7 +445,7 @@ func TestGetThumbnailExistsCheckError(t *testing.T) {
 	}
 	g := NewGenerator(storage)
 
-	_, err := g.GetThumbnail(context.Background(), "file:///media", 60, "http://sprites/%d.jpg", domain.ThumbnailConfig{Position: 0.1, Width: 480})
+	_, err := g.GetThumbnail(context.Background(), "file:///media", 60, spriteURL, domain.ThumbnailConfig{Position: 0.1, Width: 480})
 	if err == nil {
 		t.Fatalf("expected error")
 	}

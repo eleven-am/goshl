@@ -29,7 +29,7 @@ func (g *Generator) Master(sourceURL string, videos []domain.VideoRendition, aud
 			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%s\",NAME=\"%s\",DEFAULT=%s,AUTOSELECT=YES,URI=\"%s\"\n",
 			audioGroupID,
 			audio.Name,
-			defaultFlag(audio.Name == "aac_stereo"),
+			defaultFlag(audio.Default),
 			g.pathGen.VariantPlaylist(sourceURL, audio.Name, domain.StreamAudio),
 		))
 	}

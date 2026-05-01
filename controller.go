@@ -256,6 +256,7 @@ func NewController(opts Options) *Controller {
 		opts.Coordinator,
 		opts.VideoPoolSize,
 		domain.StreamVideo,
+		opts.TargetDuration,
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
@@ -265,6 +266,7 @@ func NewController(opts Options) *Controller {
 		opts.Coordinator,
 		opts.AudioPoolSize,
 		domain.StreamAudio,
+		opts.TargetDuration,
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
@@ -292,6 +294,7 @@ func (c *Controller) Start(ctx context.Context) error {
 		return fmt.Errorf("start video pool: %w", err)
 	}
 	if err := c.audioPool.Start(ctx); err != nil {
+		c.videoPool.Stop()
 		return fmt.Errorf("start audio pool: %w", err)
 	}
 	return nil
@@ -319,10 +322,7 @@ func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (stri
 	}
 
 	videos := rendition.GenerateVideo(meta.Video)
-	var audios []domain.AudioRendition
-	if len(meta.Audios) > 0 {
-		audios = rendition.GenerateAudio(meta.Audios[0])
-	}
+	audios := rendition.GenerateAudioTracks(meta.Audios)
 
 	return c.playlist.Master(sourceURL, videos, audios), nil
 }
@@ -441,10 +441,7 @@ func (c *Controller) SpriteVTT(ctx context.Context, sourceURL string) ([]byte, e
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
-	urlPattern := c.opts.PathGen.Sprite(sourceURL, 0)
-	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
-
-	return c.miscGen.GetSpriteVTT(ctx, sourceURL, meta.Duration, urlPattern)
+	return c.miscGen.GetSpriteVTT(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL))
 }
 
 // Sprite returns a sprite sheet image containing multiple video thumbnails.
@@ -460,10 +457,7 @@ func (c *Controller) Sprite(ctx context.Context, sourceURL string, index int) ([
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
-	urlPattern := c.opts.PathGen.Sprite(sourceURL, 0)
-	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
-
-	return c.miscGen.GetSprite(ctx, sourceURL, meta.Duration, urlPattern, index)
+	return c.miscGen.GetSprite(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL), index)
 }
 
 // SubtitleVTT extracts and returns subtitles in WebVTT format.
@@ -521,10 +515,7 @@ func (c *Controller) Preview(ctx context.Context, sourceURL string, config *Prev
 		}
 	}
 
-	urlPattern := c.opts.PathGen.Sprite(sourceURL, 0)
-	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
-
-	return c.miscGen.GetPreview(ctx, sourceURL, meta.Duration, urlPattern, cfg)
+	return c.miscGen.GetPreview(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL), cfg)
 }
 
 func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *ThumbnailConfig) ([]byte, error) {
@@ -543,10 +534,13 @@ func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *Th
 		}
 	}
 
-	urlPattern := c.opts.PathGen.Sprite(sourceURL, 0)
-	urlPattern = urlPattern[:len(urlPattern)-1] + "%d"
+	return c.miscGen.GetThumbnail(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL), cfg)
+}
 
-	return c.miscGen.GetThumbnail(ctx, sourceURL, meta.Duration, urlPattern, cfg)
+func (c *Controller) spriteURL(sourceURL string) func(int) string {
+	return func(index int) string {
+		return c.opts.PathGen.Sprite(sourceURL, index)
+	}
 }
 
 func (c *Controller) Metadata(ctx context.Context, sourceURL string) (*Metadata, error) {

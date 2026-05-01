@@ -22,4 +22,9 @@ type AudioRendition struct {
 	Bitrate  int
 	Channels int
 	Method   PlaybackMethod
+
+	// StreamIndex is the zero-based audio stream index used by ffmpeg's 0:a:N map.
+	StreamIndex int
+	Language    string
+	Default     bool
 }
