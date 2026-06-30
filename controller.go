@@ -53,6 +53,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -112,6 +113,9 @@ type (
 
 	// SubtitleStream contains subtitle stream information.
 	SubtitleStream = domain.SubtitleStream
+
+	// Accelerator identifies a hardware acceleration backend.
+	Accelerator = domain.Accelerator
 )
 
 const (
@@ -120,6 +124,21 @@ const (
 
 	// StreamAudio represents an audio stream.
 	StreamAudio = domain.StreamAudio
+
+	// AccelNone disables hardware acceleration and uses software encoding.
+	AccelNone = domain.AccelNone
+
+	// AccelCUDA selects NVIDIA CUDA/NVENC acceleration.
+	AccelCUDA = domain.AccelCUDA
+
+	// AccelVideoToolbox selects Apple VideoToolbox acceleration.
+	AccelVideoToolbox = domain.AccelVideoToolbox
+
+	// AccelVAAPI selects VAAPI acceleration.
+	AccelVAAPI = domain.AccelVAAPI
+
+	// AccelQSV selects Intel Quick Sync Video acceleration.
+	AccelQSV = domain.AccelQSV
 )
 
 var (
@@ -142,6 +161,10 @@ type Options struct {
 	// Automatically detects NVENC (NVIDIA) or VideoToolbox (Apple).
 	// Falls back to software encoding if no hardware support is found.
 	HWAccel bool
+
+	// HWAccelMode explicitly selects a hardware accelerator.
+	// When set, it takes precedence over HWAccel auto-detection.
+	HWAccelMode Accelerator
 
 	// SegmentTimeout is the maximum time to wait for a segment to be transcoded.
 	// Default: 30 seconds.
@@ -231,6 +254,7 @@ type Controller struct {
 	audioPool *transcode.Pool
 	prober    *probe.Prober
 	miscGen   *misc.Generator
+	hwConfig  *domain.HWAccelConfig
 }
 
 // NewController creates a new Controller with the given options.
@@ -243,7 +267,13 @@ func NewController(opts Options) *Controller {
 	opts.setDefaults()
 
 	var hwConfig *domain.HWAccelConfig
-	if opts.HWAccel {
+	if opts.HWAccelMode != "" {
+		var err error
+		hwConfig, err = hwaccel.RequireConfig(opts.HWAccelMode)
+		if err != nil {
+			panic(err)
+		}
+	} else if opts.HWAccel {
 		hwConfig = hwaccel.DetectBest()
 	} else {
 		hwConfig = hwaccel.NewConfig(domain.AccelNone)
@@ -278,8 +308,17 @@ func NewController(opts Options) *Controller {
 		videoPool: videoPool,
 		audioPool: audioPool,
 		prober:    probe.NewProber(opts.Storage),
-		miscGen:   misc.NewGenerator(opts.Storage),
+		miscGen:   misc.NewGenerator(opts.Storage, hwConfig),
+		hwConfig:  hwConfig,
 	}
+}
+
+// HWAccelConfig returns the hardware acceleration configuration selected by the controller.
+func (c *Controller) HWAccelConfig() domain.HWAccelConfig {
+	if c.hwConfig == nil {
+		return *hwaccel.NewConfig(domain.AccelNone)
+	}
+	return *c.hwConfig
 }
 
 // Start initializes the video and audio transcoding worker pools.
@@ -386,6 +425,9 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.SegmentTimeout+time.Minute)
 
 	if lockErr != nil {
+		if !errors.Is(lockErr, domain.ErrLockHeld) {
+			return nil, fmt.Errorf("acquire segment lock: %w", lockErr)
+		}
 		statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
 		if err != nil {
 			return nil, fmt.Errorf("wait segment: %w", err)
@@ -526,9 +568,7 @@ func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *Th
 
 	cfg := c.opts.DefaultThumbnailConfig
 	if config != nil {
-		if config.Position > 0 {
-			cfg.Position = config.Position
-		}
+		cfg.Position = config.Position
 		if config.Width > 0 {
 			cfg.Width = config.Width
 		}
@@ -584,6 +624,9 @@ func (c *Controller) getMetadata(ctx context.Context, sourceURL string) (*domain
 	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, 2*time.Minute)
 
 	if lockErr != nil {
+		if !errors.Is(lockErr, domain.ErrLockHeld) {
+			return nil, fmt.Errorf("acquire metadata lock: %w", lockErr)
+		}
 		return c.waitForMetadata(ctx, sourceURL, 2*time.Minute)
 	}
 	defer c.opts.Coordinator.ReleaseLock(ctx, lockKey, token)

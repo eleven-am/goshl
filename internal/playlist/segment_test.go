@@ -8,7 +8,24 @@ import (
 )
 
 func TestCalculateSegments_NoKeyframes(t *testing.T) {
-	if got := CalculateSegments(nil, 10, 6); got != nil {
+	got := CalculateSegments(nil, 10, 6)
+	want := []domain.Segment{
+		{Index: 0, Start: 0, End: 6, Duration: 6},
+		{Index: 1, Start: 6, End: 10, Duration: 4},
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("expected %d segments, got %d", len(want), len(got))
+	}
+	for i := range want {
+		if got[i].Index != want[i].Index || !almostEqual(got[i].Start, want[i].Start) || !almostEqual(got[i].End, want[i].End) || !almostEqual(got[i].Duration, want[i].Duration) {
+			t.Fatalf("segment %d mismatch: want %#v got %#v", i, want[i], got[i])
+		}
+	}
+}
+
+func TestCalculateSegments_NoKeyframesNoDuration(t *testing.T) {
+	if got := CalculateSegments(nil, 0, 6); got != nil {
 		t.Fatalf("expected nil, got %#v", got)
 	}
 }

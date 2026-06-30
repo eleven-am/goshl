@@ -161,6 +161,29 @@ func TestProbe_InvokesFFProbeAndPersistsMetadata(t *testing.T) {
 	}
 }
 
+func TestProbe_UsesStreamBitRateBeforeBPSTag(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := filepath.Join(tmpDir, "ffprobe")
+	if err := os.WriteFile(script, []byte(ffprobeBitRateScript), 0755); err != nil {
+		t.Fatalf("failed to write fake ffprobe: %v", err)
+	}
+
+	originalPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", originalPath) })
+	if err := os.Setenv("PATH", tmpDir+string(os.PathListSeparator)+originalPath); err != nil {
+		t.Fatalf("failed to update PATH: %v", err)
+	}
+
+	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), "file:///input")
+	if err != nil {
+		t.Fatalf("probe returned error: %v", err)
+	}
+
+	if meta.Video.Bitrate != 4_000_000 {
+		t.Fatalf("expected video bitrate from bit_rate, got %d", meta.Video.Bitrate)
+	}
+}
+
 const ffprobeScript = `#!/bin/sh
 if printf "%s" "$*" | grep -q "show_entries"; then
   cat <<'EOF'
@@ -180,5 +203,20 @@ EOF
 fi
 
 echo "unexpected args: $*" >&2
+exit 1
+`
+
+const ffprobeBitRateScript = `#!/bin/sh
+if printf "%s" "$*" | grep -q "show_entries"; then
+  exit 0
+fi
+
+if printf "%s" "$*" | grep -q "show_format"; then
+  cat <<'EOF'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"r_frame_rate":"30/1","bit_rate":"4000000","tags":{"BPS":"6000000"}}],"format":{"duration":"12.5"}}
+EOF
+  exit 0
+fi
+
 exit 1
 `

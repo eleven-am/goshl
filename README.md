@@ -148,7 +148,8 @@ goshl.Options{
     Coordinator:    myCoordinator,      // required
     PathGen:        myPathGen,          // required
 
-    HWAccel:        false,              // use GPU encoding if available
+    HWAccel:        false,              // auto-detect GPU encoding if available
+    HWAccelMode:    goshl.AccelNone,    // explicitly choose none, cuda, videotoolbox, vaapi, or qsv
     SegmentTimeout: 30 * time.Second,   // max wait for segment transcoding
     TargetDuration: 6.0,                // target segment duration in seconds
     SegmentsPerJob: 10,                 // segments per transcoding job
@@ -159,7 +160,25 @@ goshl.Options{
 
 ## Hardware acceleration
 
-Set `HWAccel: true` to use GPU encoding. Supports NVIDIA NVENC and Apple VideoToolbox. Falls back to software encoding if unavailable.
+Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Apple VideoToolbox, VAAPI, and Intel QSV. If detection fails, goshl uses software encoding and exposes the detection error through `controller.HWAccelConfig()`.
+
+Set `HWAccelMode` when the caller already knows the desired accelerator:
+
+```go
+controller := goshl.NewController(goshl.Options{
+    Storage:     myStorage,
+    Coordinator: myCoordinator,
+    PathGen:     myPathGen,
+    HWAccelMode: goshl.AccelCUDA,
+})
+```
+
+Sprite generation also uses hardware decode flags for GPU modes where frames can be downloaded back into the CPU filter chain safely.
+
+```go
+cfg := controller.HWAccelConfig()
+log.Printf("accelerator=%s requested=%s available=%v error=%s", cfg.Accelerator, cfg.Requested, cfg.Available, cfg.Error)
+```
 
 ## Author
 

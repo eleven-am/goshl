@@ -192,8 +192,11 @@ func TestFindNearestKeyframeEmptySlice(t *testing.T) {
 func TestExtractSegmentsEmptyKeyframes(t *testing.T) {
 	p := &Pool{}
 	segments := p.extractSegments([]float64{}, 10, 0, 5)
-	if len(segments) != 0 {
-		t.Fatalf("expected 0 segments for empty keyframes, got %d", len(segments))
+	if len(segments) != 2 {
+		t.Fatalf("expected 2 fallback segments, got %d", len(segments))
+	}
+	if segments[0].Start != 0 || segments[0].End != 6 || segments[1].Start != 6 || segments[1].End != 10 {
+		t.Fatalf("unexpected fallback segments: %#v", segments)
 	}
 }
 

@@ -556,6 +556,58 @@ func TestSegmentWaitsWhenLockHeld(t *testing.T) {
 	}
 }
 
+func TestSegmentReturnsCoordinatorLockFailure(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{lockErr: errors.New("coordinator down")}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	_, err := svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+	if err == nil || !strings.Contains(err.Error(), "acquire segment lock") {
+		t.Fatalf("expected lock failure, got %v", err)
+	}
+}
+
+func TestMetadataReturnsCoordinatorLockFailure(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	store := &stubStorage{metaExists: false}
+	coord := &stubCoordinator{lockErr: errors.New("coordinator down")}
+	svc := NewController(Options{
+		Storage:     store,
+		Coordinator: coord,
+		PathGen:     stubPathGen{},
+	})
+
+	_, err := svc.Metadata(context.Background(), "file:///media")
+	if err == nil || !strings.Contains(err.Error(), "acquire metadata lock") {
+		t.Fatalf("expected lock failure, got %v", err)
+	}
+}
+
+func TestControllerUsesExplicitHardwareMode(t *testing.T) {
+	svc := NewController(Options{
+		Storage:     &stubStorage{},
+		Coordinator: &stubCoordinator{},
+		PathGen:     stubPathGen{},
+		HWAccelMode: AccelVideoToolbox,
+	})
+
+	cfg := svc.HWAccelConfig()
+	if cfg.Accelerator != AccelVideoToolbox || cfg.Requested != AccelVideoToolbox {
+		t.Fatalf("unexpected hw config: %#v", cfg)
+	}
+}
+
 func TestSegmentDoubleCheckReturnsExistingAfterLock(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()

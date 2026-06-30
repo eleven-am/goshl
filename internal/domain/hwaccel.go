@@ -12,6 +12,9 @@ const (
 
 type HWAccelConfig struct {
 	Accelerator  Accelerator
+	Requested    Accelerator
+	Available    []Accelerator
+	Error        string
 	DecodeFlags  []string
 	EncodeFlags  []string
 	Encoder      string

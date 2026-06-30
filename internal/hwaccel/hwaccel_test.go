@@ -64,6 +64,32 @@ func TestNewConfigReturnsExpectedFlags(t *testing.T) {
 	}
 }
 
+func TestRequireConfigRejectsUnknownAccelerator(t *testing.T) {
+	if _, err := RequireConfig(domain.Accelerator("bad")); err == nil {
+		t.Fatalf("expected unknown accelerator error")
+	}
+}
+
+func TestDetectBestExposesDetectionError(t *testing.T) {
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	cfg := DetectBest()
+	if cfg.Accelerator != domain.AccelNone {
+		t.Fatalf("expected software fallback, got %s", cfg.Accelerator)
+	}
+	if cfg.Error == "" {
+		t.Fatalf("expected detection error to be exposed")
+	}
+}
+
 const fakeFFmpegDetectScript = `#!/bin/sh
 if [ "$1" = "-hwaccels" ]; then
 cat <<'EOF'

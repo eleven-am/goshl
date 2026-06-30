@@ -482,6 +482,48 @@ func TestGenerateThumbnailSuccess(t *testing.T) {
 	}
 }
 
+func TestGenerateThumbnailAllowsZeroPosition(t *testing.T) {
+	g := &Generator{
+		thumbWidth:  10,
+		thumbHeight: 10,
+		interval:    1,
+		cols:        2,
+		rows:        2,
+		storage:     nil,
+	}
+
+	spriteImg := createTestSpriteImage(20, 20)
+	storage := &stubStorage{
+		spriteData: map[int][]byte{0: spriteImg},
+	}
+	g.storage = storage
+
+	thumbnail, err := g.generateThumbnail(context.Background(), "file:///media", 4, domain.ThumbnailConfig{
+		Position: 0,
+		Width:    20,
+	})
+	if err != nil {
+		t.Fatalf("generateThumbnail error: %v", err)
+	}
+	if len(thumbnail) == 0 {
+		t.Fatalf("expected non-empty thumbnail data")
+	}
+}
+
+func TestSpriteFilterUsesHardwareDownloadForGPUFrames(t *testing.T) {
+	g := NewGenerator(&stubStorage{}, &domain.HWAccelConfig{
+		Accelerator: domain.AccelCUDA,
+		ScaleFilter: "scale_cuda=%d:%d:format=nv12",
+	})
+
+	filter := g.spriteFilter()
+	for _, want := range []string{"scale_cuda=160:90:format=nv12", "hwdownload", "tile=10x10"} {
+		if !strings.Contains(filter, want) {
+			t.Fatalf("expected %q in filter %q", want, filter)
+		}
+	}
+}
+
 func TestGenerateThumbnailPositionClamping(t *testing.T) {
 	g := &Generator{
 		thumbWidth:  10,

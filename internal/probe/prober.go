@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"os/exec"
 	"strconv"
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/mediaexec"
 )
 
 type Prober struct {
@@ -95,15 +95,13 @@ type ffprobeDisp struct {
 }
 
 func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata, error) {
-	cmd := exec.CommandContext(ctx, "ffprobe",
+	output, err := mediaexec.Output(ctx, "ffprobe",
 		"-v", "error",
 		"-show_format",
 		"-show_streams",
 		"-of", "json",
 		url,
 	)
-
-	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +126,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 					Codec:     s.CodecName,
 					Width:     s.Width,
 					Height:    s.Height,
-					Bitrate:   parseBitrate(s.Tags["BPS"]),
+					Bitrate:   parseBitrate(firstNonEmpty(s.BitRate, s.Tags["BPS"])),
 					FrameRate: parseFrameRate(s.RFrameRate),
 				}
 			}
@@ -154,25 +152,19 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 }
 
 func (p *Prober) probeKeyframes(ctx context.Context, url string) ([]float64, error) {
-	cmd := exec.CommandContext(ctx, "ffprobe",
+	output, err := mediaexec.Output(ctx, "ffprobe",
 		"-v", "error",
 		"-select_streams", "v:0",
 		"-show_entries", "packet=pts_time,flags",
 		"-of", "csv=p=0",
 		url,
 	)
-
-	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
 	}
 
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
 	var keyframes []float64
-	scanner := bufio.NewScanner(stdout)
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -190,11 +182,20 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string) ([]float64, err
 		keyframes = append(keyframes, pts)
 	}
 
-	if err := cmd.Wait(); err != nil {
+	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 
 	return keyframes, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func parseBitrate(s string) int {

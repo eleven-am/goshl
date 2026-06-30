@@ -3,10 +3,11 @@ package hwaccel
 import (
 	"bufio"
 	"context"
-	"os/exec"
+	"fmt"
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/mediaexec"
 )
 
 func Detect(ctx context.Context) ([]domain.Accelerator, error) {
@@ -57,9 +58,17 @@ func Select(available []domain.Accelerator) domain.Accelerator {
 func DetectBest() *domain.HWAccelConfig {
 	available, err := Detect(context.Background())
 	if err != nil {
-		return NewConfig(domain.AccelNone)
+		cfg := NewConfig(domain.AccelNone)
+		cfg.Requested = domain.AccelNone
+		cfg.Available = []domain.Accelerator{domain.AccelNone}
+		cfg.Error = err.Error()
+		return cfg
 	}
-	return NewConfig(Select(available))
+	selected := Select(available)
+	cfg := NewConfig(selected)
+	cfg.Requested = selected
+	cfg.Available = available
+	return cfg
 }
 
 func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
@@ -67,6 +76,7 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 	case domain.AccelCUDA:
 		return &domain.HWAccelConfig{
 			Accelerator:  domain.AccelCUDA,
+			Requested:    domain.AccelCUDA,
 			DecodeFlags:  []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"},
 			EncodeFlags:  []string{"-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll"},
 			Encoder:      "h264_nvenc",
@@ -76,6 +86,7 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 	case domain.AccelVideoToolbox:
 		return &domain.HWAccelConfig{
 			Accelerator:  domain.AccelVideoToolbox,
+			Requested:    domain.AccelVideoToolbox,
 			DecodeFlags:  []string{"-hwaccel", "videotoolbox"},
 			EncodeFlags:  []string{"-c:v", "h264_videotoolbox", "-realtime", "true", "-prio_speed", "true"},
 			Encoder:      "h264_videotoolbox",
@@ -85,6 +96,7 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 	case domain.AccelVAAPI:
 		return &domain.HWAccelConfig{
 			Accelerator:  domain.AccelVAAPI,
+			Requested:    domain.AccelVAAPI,
 			DecodeFlags:  []string{"-hwaccel", "vaapi", "-vaapi_device", "/dev/dri/renderD128"},
 			EncodeFlags:  []string{"-c:v", "h264_vaapi"},
 			Encoder:      "h264_vaapi",
@@ -94,6 +106,7 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 	case domain.AccelQSV:
 		return &domain.HWAccelConfig{
 			Accelerator:  domain.AccelQSV,
+			Requested:    domain.AccelQSV,
 			DecodeFlags:  []string{"-hwaccel", "qsv", "-hwaccel_output_format", "qsv"},
 			EncodeFlags:  []string{"-c:v", "h264_qsv", "-preset", "veryfast"},
 			Encoder:      "h264_qsv",
@@ -103,6 +116,7 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 	default:
 		return &domain.HWAccelConfig{
 			Accelerator:  domain.AccelNone,
+			Requested:    accel,
 			DecodeFlags:  []string{},
 			EncodeFlags:  []string{"-c:v", "libx264", "-preset", "ultrafast"},
 			Encoder:      "libx264",
@@ -112,9 +126,17 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 	}
 }
 
+func RequireConfig(accel domain.Accelerator) (*domain.HWAccelConfig, error) {
+	switch accel {
+	case domain.AccelNone, domain.AccelCUDA, domain.AccelVideoToolbox, domain.AccelVAAPI, domain.AccelQSV:
+		return NewConfig(accel), nil
+	default:
+		return nil, fmt.Errorf("unsupported hardware accelerator %q", accel)
+	}
+}
+
 func detectHWAccels(ctx context.Context) (map[string]bool, error) {
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-hwaccels")
-	output, err := cmd.Output()
+	output, err := mediaexec.Output(ctx, "ffmpeg", "-hwaccels")
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +154,7 @@ func detectHWAccels(ctx context.Context) (map[string]bool, error) {
 }
 
 func detectEncoders(ctx context.Context) (map[string]bool, error) {
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-encoders")
-	output, err := cmd.Output()
+	output, err := mediaexec.Output(ctx, "ffmpeg", "-encoders")
 	if err != nil {
 		return nil, err
 	}

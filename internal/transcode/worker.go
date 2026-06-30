@@ -5,14 +5,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/mediaexec"
 )
 
 type WorkerState int
@@ -36,7 +37,7 @@ type Worker struct {
 	mu     sync.RWMutex
 	state  WorkerState
 	err    error
-	cmd    *exec.Cmd
+	cmd    interface{ Wait() error }
 	cancel context.CancelFunc
 }
 
@@ -64,39 +65,26 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	ctx, w.cancel = context.WithCancel(ctx)
 
-	w.cmd = exec.CommandContext(ctx, "ffmpeg", w.args...)
-	var stderr bytes.Buffer
-	w.cmd.Stderr = &stderr
-	stdout, err := w.cmd.StdoutPipe()
+	cmd, stdout, stderr, err := mediaexec.StartOutput(ctx, "ffmpeg", w.args...)
 	if err != nil {
 		w.setError(err)
 		return err
 	}
+	w.cmd = cmd
 
-	if err := w.cmd.Start(); err != nil {
-		w.setError(err)
-		return err
-	}
-
-	go w.run(ctx, stdout, &stderr)
+	go w.run(ctx, stdout, stderr)
 
 	return nil
 }
 
-func (w *Worker) run(ctx context.Context, stdout interface{}, stderr *bytes.Buffer) {
-	reader, ok := stdout.(interface{ Read([]byte) (int, error) })
-	if !ok {
-		w.setError(fmt.Errorf("invalid stdout type"))
-		return
-	}
-
+func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer) {
 	scanner := bufio.NewScanner(reader)
 	skipFirst := w.skipFirst
 
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			w.cmd.Wait()
+			_ = w.cmd.Wait()
 			w.setError(ctx.Err())
 			return
 		default:
@@ -115,13 +103,13 @@ func (w *Worker) run(ctx context.Context, stdout interface{}, stderr *bytes.Buff
 
 		if err := w.uploadSegment(ctx, filename); err != nil {
 			w.setError(err)
-			w.cmd.Wait()
+			_ = w.cmd.Wait()
 			return
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		w.cmd.Wait()
+		_ = w.cmd.Wait()
 		w.setError(fmt.Errorf("read ffmpeg output: %w", err))
 		return
 	}
@@ -133,11 +121,11 @@ func (w *Worker) run(ctx context.Context, stdout interface{}, stderr *bytes.Buff
 
 	if cmdErr != nil && ctx.Err() == nil {
 		w.state = WorkerStateError
-		if stderr != nil && stderr.Len() > 0 {
-			w.err = fmt.Errorf("%w: %s", cmdErr, strings.TrimSpace(stderr.String()))
-		} else {
-			w.err = cmdErr
+		stderrText := ""
+		if stderr != nil {
+			stderrText = stderr.String()
 		}
+		w.err = mediaexec.Error("ffmpeg", w.args, stderrText, cmdErr)
 		return
 	}
 
