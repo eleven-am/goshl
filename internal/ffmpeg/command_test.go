@@ -37,8 +37,11 @@ func TestVideoCommand_TranscodeIncludesSegmentTimes(t *testing.T) {
 	if !strings.Contains(joined, "-segment_times 6.500000,12.000000") {
 		t.Fatalf("expected relative segment times, got %s", joined)
 	}
-	if !strings.Contains(joined, "-t 18.000000") || strings.Contains(joined, "-to 30.000000") {
-		t.Fatalf("expected duration-based clipping, got %s", joined)
+	if !strings.Contains(joined, "-force_key_frames 12.000000,18.500000,24.000000") {
+		t.Fatalf("expected absolute keyframe times, got %s", joined)
+	}
+	if !strings.Contains(joined, "-to 30.000000") || strings.Contains(joined, "-t 18.000000") {
+		t.Fatalf("expected absolute end-time clipping, got %s", joined)
 	}
 	if !strings.Contains(joined, "-vf scale=1280:720") {
 		t.Fatalf("missing scale filter: %s", joined)
@@ -46,6 +49,7 @@ func TestVideoCommand_TranscodeIncludesSegmentTimes(t *testing.T) {
 	if !strings.Contains(joined, filepath.Join("/tmp/out", "segment-%05d.ts")) {
 		t.Fatalf("output pattern missing: %s", joined)
 	}
+	assertTimestampsPreservedAfterSeek(t, joined)
 }
 
 func TestVideoCommand_DirectStreamUsesCopyAndOffsetTimes(t *testing.T) {
@@ -68,9 +72,13 @@ func TestVideoCommand_DirectStreamUsesCopyAndOffsetTimes(t *testing.T) {
 	if !strings.Contains(joined, "-c:v copy") {
 		t.Fatalf("direct stream should copy video: %s", joined)
 	}
+	if !strings.Contains(joined, "-bsf:v h264_mp4toannexb,dump_extra") {
+		t.Fatalf("direct stream should repeat H.264 parameter sets: %s", joined)
+	}
 	if !strings.Contains(joined, "-segment_times 6.500000") {
 		t.Fatalf("expected offset segment times when seek offset present: %s", joined)
 	}
+	assertTimestampsPreservedAfterSeek(t, joined)
 }
 
 func TestAudioCommand_TranscodeAndCopy(t *testing.T) {
@@ -92,9 +100,10 @@ func TestAudioCommand_TranscodeAndCopy(t *testing.T) {
 	if !strings.Contains(joined, "-segment_times 5.000000") {
 		t.Fatalf("audio segment times missing: %s", joined)
 	}
-	if !strings.Contains(joined, "-t 10.000000") {
-		t.Fatalf("audio should clip by duration, got %s", joined)
+	if !strings.Contains(joined, "-to 10.000000") || strings.Contains(joined, "-t 10.000000") {
+		t.Fatalf("audio should clip at the absolute end time, got %s", joined)
 	}
+	assertTimestampsPreservedAfterSeek(t, joined)
 
 	copyArgs := builder.Audio(AudioParams{
 		InputURL:    "in.mkv",
@@ -117,7 +126,7 @@ func TestVideoStreamArgsIncludeKeyframesAndForcedIDRForCUDA(t *testing.T) {
 		DecodeFlags:  []string{"-hwaccel", "cuda"},
 		EncodeFlags:  []string{"-c:v", "h264_nvenc"},
 		Encoder:      "h264_nvenc",
-		KeyframeFlag: "-force_idr",
+		KeyframeFlag: "-force_key_frames",
 		ScaleFilter:  "scale_cuda=%d:%d:format=nv12",
 	})
 
@@ -128,15 +137,29 @@ func TestVideoStreamArgsIncludeKeyframesAndForcedIDRForCUDA(t *testing.T) {
 	})
 
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "-force_idr 0.000000,2.500000,5.000000") {
+	if !strings.Contains(joined, "-force_key_frames 0.000000,2.500000,5.000000") {
 		t.Fatalf("cuda keyframes missing: %s", joined)
+	}
+	if !strings.Contains(joined, "-forced-idr 1") {
+		t.Fatalf("cuda forced IDR mode missing: %s", joined)
 	}
 	if !strings.Contains(joined, "-vf scale_cuda=640:360:format=nv12") {
 		t.Fatalf("cuda scale missing: %s", joined)
 	}
-	if !strings.Contains(joined, "-t 10.000000") || strings.Contains(joined, "-to 20.000000") {
-		t.Fatalf("stream command should clip by duration, got %s", joined)
+	if !strings.Contains(joined, "-to 20.000000") || strings.Contains(joined, "-t 10.000000") {
+		t.Fatalf("stream command should clip at the absolute end time, got %s", joined)
 	}
+	assertTimestampsPreservedAfterSeek(t, joined)
+}
+
+func TestAudioStreamResetsTimestampsAfterSeek(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	args := builder.AudioStream(AudioStreamParams{
+		StreamParams: StreamParams{InputURL: "file.mkv", StreamIndex: 1, StartTime: 30, EndTime: 40},
+		Rendition:    domain.AudioRendition{Method: domain.Transcode, Channels: 2, Bitrate: 192000},
+	})
+
+	assertTimestampsPreservedAfterSeek(t, strings.Join(args, " "))
 }
 
 func TestHelpersHandleEdgeCases(t *testing.T) {
@@ -150,7 +173,11 @@ func TestHelpersHandleEdgeCases(t *testing.T) {
 	if got := formatSegmentTimesWithOffset(segs, 4); got != "4.000000,7.000000" {
 		t.Fatalf("unexpected offset times %q", got)
 	}
-	if got := formatDuration(12, 30); got != "18.000000" {
-		t.Fatalf("unexpected duration %q", got)
+}
+
+func assertTimestampsPreservedAfterSeek(t *testing.T, joined string) {
+	t.Helper()
+	if !strings.Contains(joined, "-copyts") || !strings.Contains(joined, "-start_at_zero") {
+		t.Fatalf("seek output must preserve the media timeline: %s", joined)
 	}
 }

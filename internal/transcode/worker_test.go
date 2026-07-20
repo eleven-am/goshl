@@ -281,3 +281,75 @@ func TestWorkerAudioSegments(t *testing.T) {
 		t.Fatalf("expected audio segment, got video")
 	}
 }
+
+func TestWorkerFailsWhenFFmpegProducesNoSegments(t *testing.T) {
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte(fakeFFmpegScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	w := NewWorker([]string{"--emit"}, &memoryStorage{}, "file:///source", "1080p", true, tmp, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	waitForWorker(t, ctx, w)
+
+	if w.State() != WorkerStateError || w.Err() == nil || w.Err().Error() != "ffmpeg produced no segments" {
+		t.Fatalf("expected missing segment error, state %v err %v", w.State(), w.Err())
+	}
+}
+
+func TestWorkerRejectsEmptySegment(t *testing.T) {
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte(fakeFFmpegScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	filename := "segment-00007.ts"
+	if err := os.WriteFile(filepath.Join(tmp, filename), nil, 0644); err != nil {
+		t.Fatalf("prime file: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	storage := &memoryStorage{}
+	w := NewWorker([]string{"--emit", filename}, storage, "file:///source", "1080p", true, tmp, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	waitForWorker(t, ctx, w)
+
+	if w.State() != WorkerStateError || w.Err() == nil || w.Err().Error() != "segment 7 is empty" {
+		t.Fatalf("expected empty segment error, state %v err %v", w.State(), w.Err())
+	}
+	if len(storage.writes) != 0 {
+		t.Fatalf("expected no empty segment writes, got %d", len(storage.writes))
+	}
+}
+
+func waitForWorker(t *testing.T, ctx context.Context, w *Worker) {
+	t.Helper()
+	for {
+		state := w.State()
+		if state == WorkerStateDone || state == WorkerStateError {
+			return
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("worker did not finish before context deadline, state %v err %v", state, w.Err())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

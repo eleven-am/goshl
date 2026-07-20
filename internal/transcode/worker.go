@@ -80,6 +80,7 @@ func (w *Worker) Start(ctx context.Context) error {
 func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer) {
 	scanner := bufio.NewScanner(reader)
 	skipFirst := w.skipFirst
+	uploadedSegments := 0
 
 	for scanner.Scan() {
 		select {
@@ -106,6 +107,7 @@ func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer
 			_ = w.cmd.Wait()
 			return
 		}
+		uploadedSegments++
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -129,6 +131,12 @@ func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer
 		return
 	}
 
+	if uploadedSegments == 0 && ctx.Err() == nil {
+		w.state = WorkerStateError
+		w.err = fmt.Errorf("ffmpeg produced no segments")
+		return
+	}
+
 	w.state = WorkerStateDone
 }
 
@@ -143,6 +151,9 @@ func (w *Worker) uploadSegment(ctx context.Context, filename string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("read segment file %s: %w", filename, err)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("segment %d is empty", idx)
 	}
 
 	info := domain.SegmentData{

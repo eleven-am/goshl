@@ -62,6 +62,11 @@ func TestNewConfigReturnsExpectedFlags(t *testing.T) {
 	if none.Accelerator != "none" || none.Encoder != "libx264" {
 		t.Fatalf("fallback config unexpected: %#v", none)
 	}
+
+	cuda := NewConfig(domain.AccelCUDA)
+	if cuda.KeyframeFlag != "-force_key_frames" {
+		t.Fatalf("unexpected CUDA keyframe flag %q", cuda.KeyframeFlag)
+	}
 }
 
 func TestRequireConfigRejectsUnknownAccelerator(t *testing.T) {

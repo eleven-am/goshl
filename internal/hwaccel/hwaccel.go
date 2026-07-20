@@ -80,7 +80,7 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 			DecodeFlags:  []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"},
 			EncodeFlags:  []string{"-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll"},
 			Encoder:      "h264_nvenc",
-			KeyframeFlag: "-force_idr",
+			KeyframeFlag: "-force_key_frames",
 			ScaleFilter:  "scale_cuda=%d:%d:format=nv12",
 		}
 	case domain.AccelVideoToolbox:

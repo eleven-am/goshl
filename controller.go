@@ -177,7 +177,7 @@ type Options struct {
 
 	// SegmentsPerJob is the number of segments transcoded per job.
 	// Higher values improve throughput but increase latency for first segment.
-	// Default: 10.
+	// Default: 4.
 	SegmentsPerJob int
 
 	// VideoPoolSize is the number of concurrent video transcoding workers.
@@ -205,7 +205,7 @@ func (o *Options) setDefaults() {
 		o.TargetDuration = 6.0
 	}
 	if o.SegmentsPerJob == 0 {
-		o.SegmentsPerJob = 10
+		o.SegmentsPerJob = 4
 	}
 	if o.VideoPoolSize == 0 {
 		o.VideoPoolSize = 2

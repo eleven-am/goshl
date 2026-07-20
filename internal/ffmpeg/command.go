@@ -70,7 +70,7 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 	args = append(args,
 		"-ss", fmt.Sprintf("%.6f", startSeg.Start),
 		"-i", p.InputURL,
-		"-t", formatDuration(startSeg.Start, endSeg.End),
+		"-to", fmt.Sprintf("%.6f", endSeg.End),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -108,7 +108,7 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 
 func (b *CommandBuilder) videoEncodeArgs(p VideoParams) []string {
 	if p.Rendition.Method == domain.DirectStream {
-		return []string{"-c:v", "copy"}
+		return []string{"-c:v", "copy", "-bsf:v", "h264_mp4toannexb,dump_extra"}
 	}
 
 	segmentTimes := formatKeyframeTimes(p.Segments)
@@ -142,7 +142,7 @@ func (b *CommandBuilder) Audio(p AudioParams) []string {
 		"-nostats", "-hide_banner", "-loglevel", "warning",
 		"-ss", fmt.Sprintf("%.6f", startSeg.Start),
 		"-i", p.InputURL,
-		"-t", formatDuration(startSeg.Start, endSeg.End),
+		"-to", fmt.Sprintf("%.6f", endSeg.End),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -215,10 +215,9 @@ func formatKeyframeTimes(segments []domain.Segment) string {
 		return ""
 	}
 
-	seekOffset := segments[0].Start
 	times := make([]string, 0, len(segments))
 	for _, seg := range segments {
-		times = append(times, fmt.Sprintf("%.6f", seg.Start-seekOffset))
+		times = append(times, fmt.Sprintf("%.6f", seg.Start))
 	}
 	return strings.Join(times, ",")
 }
@@ -235,7 +234,7 @@ func (b *CommandBuilder) VideoStream(p VideoStreamParams) []string {
 	args = append(args,
 		"-ss", fmt.Sprintf("%.6f", p.StartTime),
 		"-i", p.InputURL,
-		"-t", formatDuration(p.StartTime, p.EndTime),
+		"-to", fmt.Sprintf("%.6f", p.EndTime),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -285,7 +284,7 @@ func (b *CommandBuilder) AudioStream(p AudioStreamParams) []string {
 		"-nostats", "-hide_banner", "-loglevel", "warning",
 		"-ss", fmt.Sprintf("%.6f", p.StartTime),
 		"-i", p.InputURL,
-		"-t", formatDuration(p.StartTime, p.EndTime),
+		"-to", fmt.Sprintf("%.6f", p.EndTime),
 		"-copyts",
 		"-start_at_zero",
 		"-muxdelay", "0",
@@ -310,12 +309,4 @@ func (b *CommandBuilder) audioStreamEncodeArgs(p AudioStreamParams) []string {
 		"-ac", fmt.Sprintf("%d", p.Rendition.Channels),
 		"-b:a", fmt.Sprintf("%d", p.Rendition.Bitrate),
 	}
-}
-
-func formatDuration(start, end float64) string {
-	duration := end - start
-	if duration < 0 {
-		duration = 0
-	}
-	return fmt.Sprintf("%.6f", duration)
 }

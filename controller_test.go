@@ -442,8 +442,8 @@ func TestOptionsSetDefaults(t *testing.T) {
 	if opts.TargetDuration != 6.0 {
 		t.Errorf("expected TargetDuration 6.0, got %v", opts.TargetDuration)
 	}
-	if opts.SegmentsPerJob != 10 {
-		t.Errorf("expected SegmentsPerJob 10, got %v", opts.SegmentsPerJob)
+	if opts.SegmentsPerJob != 4 {
+		t.Errorf("expected SegmentsPerJob 4, got %v", opts.SegmentsPerJob)
 	}
 	if opts.VideoPoolSize != 2 {
 		t.Errorf("expected VideoPoolSize 2, got %v", opts.VideoPoolSize)

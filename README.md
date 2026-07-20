@@ -152,7 +152,7 @@ goshl.Options{
     HWAccelMode:    goshl.AccelNone,    // explicitly choose none, cuda, videotoolbox, vaapi, or qsv
     SegmentTimeout: 30 * time.Second,   // max wait for segment transcoding
     TargetDuration: 6.0,                // target segment duration in seconds
-    SegmentsPerJob: 10,                 // segments per transcoding job
+    SegmentsPerJob: 4,                  // segments per transcoding job
     VideoPoolSize:  2,                  // video transcoding workers
     AudioPoolSize:  4,                  // audio transcoding workers
 }
