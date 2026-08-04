@@ -13,6 +13,11 @@ import (
 	"github.com/eleven-am/goshl/internal/mediaexec"
 )
 
+const (
+	validationWidth  = 320
+	validationHeight = 180
+)
+
 func Detect(ctx context.Context) ([]domain.Accelerator, error) {
 	hwaccels, err := detectHWAccels(ctx)
 	if err != nil {
@@ -193,12 +198,12 @@ func Validate(ctx context.Context, config *domain.HWAccelConfig) error {
 	}
 	defer os.RemoveAll(directory)
 	input := filepath.Join(directory, "input.mp4")
-	if err := mediaexec.Run(ctx, "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24", "-frames:v", "12", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", input); err != nil {
+	if err := mediaexec.Run(ctx, "ffmpeg", "-v", "error", "-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=24", validationWidth, validationHeight), "-frames:v", "12", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", input); err != nil {
 		return fmt.Errorf("create validation input: %w", err)
 	}
 	args := []string{"-v", "error"}
 	args = append(args, config.DecodeFlags...)
-	args = append(args, "-i", input, "-vf", fmt.Sprintf(config.ScaleFilter, 64, 36))
+	args = append(args, "-i", input, "-vf", fmt.Sprintf(config.ScaleFilter, validationWidth, validationHeight))
 	args = append(args, config.EncodeFlags...)
 	args = append(args, "-frames:v", "1", "-f", "null", "-")
 	if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {

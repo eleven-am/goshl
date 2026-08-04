@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.0.13] - 2026-08-04
+
+- Use NVENC-supported frame dimensions for the functional hardware pipeline self-test
+
 ## [0.0.12] - 2026-08-04
 
 - Normalize non-zero media timestamps and preserve the complete playback timeline

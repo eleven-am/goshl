@@ -2,6 +2,7 @@ package hwaccel
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,16 @@ func TestNewConfigReturnsExpectedFlags(t *testing.T) {
 func TestRequireConfigRejectsUnknownAccelerator(t *testing.T) {
 	if _, err := RequireConfig(domain.Accelerator("bad")); err == nil {
 		t.Fatalf("expected unknown accelerator error")
+	}
+}
+
+func TestValidationDimensionsAreNVENCSafe(t *testing.T) {
+	if validationWidth < 320 || validationHeight < 180 {
+		t.Fatalf("hardware validation dimensions are too small: %dx%d", validationWidth, validationHeight)
+	}
+	filter := fmt.Sprintf(NewConfig(domain.AccelCUDA).ScaleFilter, validationWidth, validationHeight)
+	if !strings.Contains(filter, "scale=320:180") {
+		t.Fatalf("unexpected validation filter: %s", filter)
 	}
 }
 
