@@ -2,7 +2,6 @@ package transcode
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -28,11 +27,12 @@ const (
 type Worker struct {
 	args      []string
 	storage   domain.Storage
-	sourceURL string
+	mediaKey  string
 	rendition string
 	isVideo   bool
 	tmpDir    string
 	skipFirst bool
+	expected  map[int]struct{}
 
 	mu     sync.RWMutex
 	state  WorkerState
@@ -41,17 +41,24 @@ type Worker struct {
 	cancel context.CancelFunc
 }
 
-func NewWorker(args []string, storage domain.Storage, sourceURL string, rendition string, isVideo bool, tmpDir string, skipFirst bool) *Worker {
-	return &Worker{
+func NewWorker(args []string, storage domain.Storage, mediaKey string, rendition string, isVideo bool, tmpDir string, skipFirst bool, expectedIndices ...[]int) *Worker {
+	worker := &Worker{
 		args:      args,
 		storage:   storage,
-		sourceURL: sourceURL,
+		mediaKey:  mediaKey,
 		rendition: rendition,
 		isVideo:   isVideo,
 		tmpDir:    tmpDir,
 		skipFirst: skipFirst,
 		state:     WorkerStateIdle,
 	}
+	if len(expectedIndices) > 0 {
+		worker.expected = make(map[int]struct{}, len(expectedIndices[0]))
+		for _, index := range expectedIndices[0] {
+			worker.expected[index] = struct{}{}
+		}
+	}
+	return worker
 }
 
 func (w *Worker) Start(ctx context.Context) error {
@@ -60,13 +67,14 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.mu.Unlock()
 		return fmt.Errorf("worker already started")
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	w.state = WorkerStateRunning
+	w.cancel = cancel
 	w.mu.Unlock()
-
-	ctx, w.cancel = context.WithCancel(ctx)
 
 	cmd, stdout, stderr, err := mediaexec.StartOutput(ctx, "ffmpeg", w.args...)
 	if err != nil {
+		cancel()
 		w.setError(err)
 		return err
 	}
@@ -77,10 +85,11 @@ func (w *Worker) Start(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer) {
+func (w *Worker) run(ctx context.Context, reader io.Reader, stderr fmt.Stringer) {
 	scanner := bufio.NewScanner(reader)
 	skipFirst := w.skipFirst
 	uploadedSegments := 0
+	uploaded := make(map[int]struct{})
 
 	for scanner.Scan() {
 		select {
@@ -91,10 +100,11 @@ func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer
 		default:
 		}
 
-		filename := strings.TrimSpace(scanner.Text())
-		if filename == "" {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
+		filename := filepath.Base(line)
 
 		if skipFirst {
 			skipFirst = false
@@ -102,11 +112,35 @@ func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer
 			continue
 		}
 
-		if err := w.uploadSegment(ctx, filename); err != nil {
+		index, err := parseSegmentIndex(filename)
+		if err != nil {
 			w.setError(err)
+			w.Kill()
 			_ = w.cmd.Wait()
 			return
 		}
+		if _, duplicate := uploaded[index]; duplicate {
+			w.Kill()
+			_ = w.cmd.Wait()
+			w.setError(fmt.Errorf("duplicate segment %d", index))
+			return
+		}
+		if len(w.expected) > 0 {
+			if _, ok := w.expected[index]; !ok {
+				w.Kill()
+				_ = w.cmd.Wait()
+				w.setError(fmt.Errorf("ffmpeg produced unexpected segment %d", index))
+				return
+			}
+		}
+		err = w.uploadSegment(ctx, filename, index)
+		if err != nil {
+			w.setError(err)
+			w.Kill()
+			_ = w.cmd.Wait()
+			return
+		}
+		uploaded[index] = struct{}{}
 		uploadedSegments++
 	}
 
@@ -120,8 +154,13 @@ func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if ctx.Err() != nil {
+		w.state = WorkerStateError
+		w.err = ctx.Err()
+		return
+	}
 
-	if cmdErr != nil && ctx.Err() == nil {
+	if cmdErr != nil {
 		w.state = WorkerStateError
 		stderrText := ""
 		if stderr != nil {
@@ -131,21 +170,32 @@ func (w *Worker) run(ctx context.Context, reader io.Reader, stderr *bytes.Buffer
 		return
 	}
 
-	if uploadedSegments == 0 && ctx.Err() == nil {
+	if uploadedSegments == 0 {
 		w.state = WorkerStateError
 		w.err = fmt.Errorf("ffmpeg produced no segments")
 		return
+	}
+	if len(w.expected) > 0 {
+		for index := range w.expected {
+			if _, ok := uploaded[index]; !ok {
+				w.state = WorkerStateError
+				w.err = fmt.Errorf("ffmpeg did not produce expected segment %d", index)
+				return
+			}
+		}
+		for index := range uploaded {
+			if _, ok := w.expected[index]; !ok {
+				w.state = WorkerStateError
+				w.err = fmt.Errorf("ffmpeg produced unexpected segment %d", index)
+				return
+			}
+		}
 	}
 
 	w.state = WorkerStateDone
 }
 
-func (w *Worker) uploadSegment(ctx context.Context, filename string) error {
-	idx, err := parseSegmentIndex(filename)
-	if err != nil {
-		return nil
-	}
-
+func (w *Worker) uploadSegment(ctx context.Context, filename string, index int) error {
 	filePath := filepath.Join(w.tmpDir, filename)
 
 	data, err := os.ReadFile(filePath)
@@ -153,18 +203,18 @@ func (w *Worker) uploadSegment(ctx context.Context, filename string) error {
 		return fmt.Errorf("read segment file %s: %w", filename, err)
 	}
 	if len(data) == 0 {
-		return fmt.Errorf("segment %d is empty", idx)
+		return fmt.Errorf("segment %d is empty", index)
 	}
 
 	info := domain.SegmentData{
-		SourceURL: w.sourceURL,
-		Index:     idx,
+		MediaKey:  w.mediaKey,
+		Index:     index,
 		Rendition: w.rendition,
 		IsVideo:   w.isVideo,
 	}
 
 	if err := w.storage.WriteSegment(ctx, info, data); err != nil {
-		return fmt.Errorf("write segment %d: %w", idx, err)
+		return fmt.Errorf("write segment %d: %w", index, err)
 	}
 
 	os.Remove(filePath)
@@ -178,7 +228,11 @@ func parseSegmentIndex(filename string) (int, error) {
 	if len(parts) < 2 {
 		return 0, fmt.Errorf("invalid segment filename: %s", filename)
 	}
-	return strconv.Atoi(parts[len(parts)-1])
+	index, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 0, fmt.Errorf("invalid segment filename: %s", filename)
+	}
+	return index, nil
 }
 
 func (w *Worker) Kill() {

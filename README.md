@@ -29,11 +29,14 @@ Requires `ffmpeg` and `ffprobe` in PATH.
 ## Quick start
 
 ```go
-controller := goshl.NewController(goshl.Options{
+controller, err := goshl.NewControllerWithContext(ctx, goshl.Options{
     Storage:     myStorage,
     Coordinator: myCoordinator,
     PathGen:     myPathGen,
 })
+if err != nil {
+    log.Fatal(err)
+}
 
 if err := controller.Start(ctx); err != nil {
     log.Fatal(err)
@@ -49,41 +52,45 @@ You need to implement three interfaces:
 
 Handles persistence of segments, metadata, sprites, and subtitles.
 
+Metadata methods receive an opaque media key. Asset methods receive an opaque asset key. Store these values exactly as provided; do not derive them again from the source URL. `SegmentData.MediaKey` carries the same opaque media identity. Goshl versions these keys using the source revision and active media pipeline so incompatible output is not reused.
+
 ```go
 type Storage interface {
-    MetadataExists(ctx context.Context, sourceURL string) (bool, error)
-    GetMetadata(ctx context.Context, sourceURL string) ([]byte, error)
-    SetMetadata(ctx context.Context, sourceURL string, data []byte) error
+    MetadataExists(ctx context.Context, mediaKey string) (bool, error)
+    GetMetadata(ctx context.Context, mediaKey string) ([]byte, error)
+    SetMetadata(ctx context.Context, mediaKey string, data []byte) error
 
     WriteSegment(ctx context.Context, info SegmentData, data []byte) error
     ReadSegment(ctx context.Context, info SegmentData) ([]byte, error)
     SegmentExists(ctx context.Context, info SegmentData) (bool, error)
 
-    WriteSprite(ctx context.Context, sourceURL string, index int, data []byte) error
-    ReadSprite(ctx context.Context, sourceURL string, index int) ([]byte, error)
-    SpriteExists(ctx context.Context, sourceURL string, index int) (bool, error)
+    WriteSprite(ctx context.Context, assetKey string, index int, data []byte) error
+    ReadSprite(ctx context.Context, assetKey string, index int) ([]byte, error)
+    SpriteExists(ctx context.Context, assetKey string, index int) (bool, error)
 
-    WriteSpriteVTT(ctx context.Context, sourceURL string, data []byte) error
-    ReadSpriteVTT(ctx context.Context, sourceURL string) ([]byte, error)
-    SpriteVTTExists(ctx context.Context, sourceURL string) (bool, error)
+    WriteSpriteVTT(ctx context.Context, assetKey string, data []byte) error
+    ReadSpriteVTT(ctx context.Context, assetKey string) ([]byte, error)
+    SpriteVTTExists(ctx context.Context, assetKey string) (bool, error)
 
-    WriteSubtitleVTT(ctx context.Context, sourceURL string, lang string, data []byte) error
-    ReadSubtitleVTT(ctx context.Context, sourceURL string, lang string) ([]byte, error)
-    SubtitleVTTExists(ctx context.Context, sourceURL string, lang string) (bool, error)
+    WriteSubtitleVTT(ctx context.Context, assetKey string, trackID string, data []byte) error
+    ReadSubtitleVTT(ctx context.Context, assetKey string, trackID string) ([]byte, error)
+    SubtitleVTTExists(ctx context.Context, assetKey string, trackID string) (bool, error)
 
-    WritePreview(ctx context.Context, sourceURL string, data []byte) error
-    ReadPreview(ctx context.Context, sourceURL string) ([]byte, error)
-    PreviewExists(ctx context.Context, sourceURL string) (bool, error)
+    WritePreview(ctx context.Context, assetKey string, data []byte) error
+    ReadPreview(ctx context.Context, assetKey string) ([]byte, error)
+    PreviewExists(ctx context.Context, assetKey string) (bool, error)
 
-    WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error
-    ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error)
-    ThumbnailExists(ctx context.Context, sourceURL string) (bool, error)
+    WriteThumbnail(ctx context.Context, assetKey string, data []byte) error
+    ReadThumbnail(ctx context.Context, assetKey string) ([]byte, error)
+    ThumbnailExists(ctx context.Context, assetKey string) (bool, error)
 }
 ```
 
 ### Coordinator
 
 Manages job distribution and segment notifications. For single-instance deployments, an in-memory implementation works. For distributed setups, use something like Redis.
+
+Jobs are concrete, versioned work contracts. A coordinator must preserve every `Job` field unchanged. Enqueue and acknowledgement operations should be idempotent by `Job.ID`; notifications may be transient because Goshl also verifies durable storage while waiting.
 
 ```go
 type Coordinator interface {
@@ -96,8 +103,6 @@ type Coordinator interface {
 
     AcquireLock(ctx context.Context, key string, ttl time.Duration) (token string, err error)
     ReleaseLock(ctx context.Context, key string, token string) error
-
-    Close()
 }
 ```
 
@@ -107,14 +112,11 @@ Generates URLs that get embedded in playlists. These URLs should route back to y
 
 ```go
 type PathGenerator interface {
-    MasterPlaylist(sourceURL string) string
     VariantPlaylist(sourceURL string, rendition string, streamType StreamType) string
     Segment(sourceURL string, rendition string, streamType StreamType, index int) string
-    SpriteVTT(sourceURL string) string
     Sprite(sourceURL string, index int) string
-    SubtitleVTT(sourceURL string, lang string) string
-    Preview(sourceURL string) string
-    Thumbnail(sourceURL string) string
+    SubtitlePlaylist(sourceURL string, trackID string) string
+    SubtitleVTT(sourceURL string, trackID string) string
 }
 ```
 
@@ -136,8 +138,9 @@ vtt, err := controller.SpriteVTT(ctx, sourceURL)
 // Returns sprite sheet image
 sprite, err := controller.Sprite(ctx, sourceURL, 0)
 
-// Returns subtitles in WebVTT format
-subs, err := controller.SubtitleVTT(ctx, sourceURL, "en")
+// Returns a subtitle media playlist and WebVTT payload by stable track ID
+playlist, err := controller.SubtitlePlaylist(ctx, sourceURL, "subtitle-3")
+subs, err := controller.SubtitleVTT(ctx, sourceURL, "subtitle-3")
 ```
 
 ## Options
@@ -151,16 +154,26 @@ goshl.Options{
     HWAccel:        false,              // auto-detect GPU encoding if available
     HWAccelMode:    goshl.AccelNone,    // explicitly choose none, cuda, videotoolbox, vaapi, or qsv
     SegmentTimeout: 30 * time.Second,   // max wait for segment transcoding
+    JobTimeout:     2 * time.Minute,    // hard deadline for queued FFmpeg work
     TargetDuration: 6.0,                // target segment duration in seconds
     SegmentsPerJob: 4,                  // segments per transcoding job
     VideoPoolSize:  2,                  // video transcoding workers
     AudioPoolSize:  4,                  // audio transcoding workers
+
+    CacheVersion:   "deployment-v1",   // bump when host-side media policy changes
+    SourceRevision: revisionResolver,   // ETag/version resolver for remote sources
+    Observer:       observer,           // structured lifecycle events
+
+    HWAccelDecodeMode:    goshl.DecodeSafe,
+    AllowHardwareFallback: false,
 }
 ```
 
+Local files use size and modification time as their default source revision. Remote URLs are treated as immutable unless `SourceRevision` returns an ETag, version, or content fingerprint. Call `controller.MediaKey` to inspect the resolved opaque key. If storage also implements `DeleteMedia(context.Context, string) error`, `controller.Invalidate` purges that media key.
+
 ## Hardware acceleration
 
-Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Apple VideoToolbox, VAAPI, and Intel QSV. If detection fails, goshl uses software encoding and exposes the detection error through `controller.HWAccelConfig()`.
+Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Apple VideoToolbox, VAAPI, and Intel QSV. Detection performs a bounded decode/filter/encode self-test. Auto mode falls back to software and exposes the reason through `controller.HWAccelConfig()` and observer events.
 
 Set `HWAccelMode` when the caller already knows the desired accelerator:
 
@@ -170,15 +183,35 @@ controller := goshl.NewController(goshl.Options{
     Coordinator: myCoordinator,
     PathGen:     myPathGen,
     HWAccelMode: goshl.AccelCUDA,
+    HWAccelDecodeMode: goshl.DecodeSafe,
 })
 ```
 
-Sprite generation also uses hardware decode flags for GPU modes where frames can be downloaded back into the CPU filter chain safely.
+`DecodeSafe` is the CUDA default: NVDEC is used without retaining decoder frames in the CUDA surface pool, then scaling runs on host frames before NVENC. This is the compatible path for the Blackwell decoder failure identified in the lab. `DecodeDevice` opts into the full device-frame decode/scale/encode graph. Explicit hardware selection fails construction when its self-test fails unless `AllowHardwareFallback` is enabled.
 
 ```go
 cfg := controller.HWAccelConfig()
 log.Printf("accelerator=%s requested=%s available=%v error=%s", cfg.Accelerator, cfg.Requested, cfg.Available, cfg.Error)
 ```
+
+## Observability
+
+`Observer` receives typed events for metadata and segment cache hits/misses, lock waits and release failures, job enqueue/start/completion/failure, acknowledgement failures, notification failures, segment readiness, and hardware selection/fallback. Event identities are opaque hashes; raw signed source URLs are not emitted. Observer callbacks should return promptly.
+
+FFmpeg and FFprobe stderr are bounded, and source URLs, credentials, query strings, and media paths are redacted from returned command errors.
+
+## Compatibility notes
+
+This version intentionally tightens the distributed contracts:
+
+See [MIGRATION.md](MIGRATION.md) for the complete consumer and rollout guide.
+
+- `PathGenerator` must implement `SubtitlePlaylist`.
+- Unused route methods and `Coordinator.Close` were removed from the required interfaces; lifecycle ownership remains with the host.
+- `SegmentData` now uses `MediaKey` instead of overloading `SourceURL`.
+- Coordinators must serialize the expanded concrete `Job` fields.
+- Storage keys are versioned opaque identities rather than source URLs.
+- Direct H.264 remuxing is restricted to compatible 8-bit `yuv420p` Baseline/Main/High streams that start with a keyframe; other inputs transcode to High-profile `yuv420p` H.264.
 
 ## Author
 

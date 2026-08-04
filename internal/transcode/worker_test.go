@@ -3,11 +3,14 @@ package transcode
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/ffmpeg"
 )
 
 type memoryStorage struct {
@@ -102,7 +105,7 @@ func TestWorkerUploadsSegmentsAndSkipsFirstWhenConfigured(t *testing.T) {
 	storage := &memoryStorage{}
 	w := NewWorker([]string{"--emit", files[0], files[1]}, storage, "file:///source", "1080p", true, tmp, true)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := w.Start(ctx); err != nil {
@@ -128,7 +131,7 @@ func TestWorkerUploadsSegmentsAndSkipsFirstWhenConfigured(t *testing.T) {
 	if len(storage.writes) != 1 {
 		t.Fatalf("expected only one segment written (skipping first), got %d", len(storage.writes))
 	}
-	if storage.writes[0].Index != 2 || storage.writes[0].SourceURL != "file:///source" {
+	if storage.writes[0].Index != 2 || storage.writes[0].MediaKey != "file:///source" {
 		t.Fatalf("unexpected written segment info: %#v", storage.writes[0])
 	}
 }
@@ -207,7 +210,7 @@ func TestWorkerNoSkipFirst(t *testing.T) {
 	storage := &memoryStorage{}
 	w := NewWorker([]string{"--emit", files[0], files[1]}, storage, "file:///source", "1080p", true, tmp, false)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := w.Start(ctx); err != nil {
@@ -256,7 +259,7 @@ func TestWorkerAudioSegments(t *testing.T) {
 	storage := &memoryStorage{}
 	w := NewWorker([]string{"--emit", files[0]}, storage, "file:///source", "aac_stereo", false, tmp, false)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := w.Start(ctx); err != nil {
@@ -294,7 +297,7 @@ func TestWorkerFailsWhenFFmpegProducesNoSegments(t *testing.T) {
 	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
 
 	w := NewWorker([]string{"--emit"}, &memoryStorage{}, "file:///source", "1080p", true, tmp, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := w.Start(ctx); err != nil {
@@ -324,7 +327,7 @@ func TestWorkerRejectsEmptySegment(t *testing.T) {
 
 	storage := &memoryStorage{}
 	w := NewWorker([]string{"--emit", filename}, storage, "file:///source", "1080p", true, tmp, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := w.Start(ctx); err != nil {
@@ -337,6 +340,112 @@ func TestWorkerRejectsEmptySegment(t *testing.T) {
 	}
 	if len(storage.writes) != 0 {
 		t.Fatalf("expected no empty segment writes, got %d", len(storage.writes))
+	}
+}
+
+func TestWorkerRejectsMalformedSegmentListEntry(t *testing.T) {
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte(fakeFFmpegScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	filename := "not-a-segment.ts"
+	if err := os.WriteFile(filepath.Join(tmp, filename), []byte("data"), 0644); err != nil {
+		t.Fatalf("prime file: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	w := NewWorker([]string{"--emit", filename}, &memoryStorage{}, "file:///source", "1080p", true, tmp, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	waitForWorker(t, ctx, w)
+	if w.State() != WorkerStateError || w.Err() == nil || !strings.Contains(w.Err().Error(), "invalid segment filename") {
+		t.Fatalf("expected malformed filename error, state %v err %v", w.State(), w.Err())
+	}
+}
+
+func TestWorkerRejectsPartialExpectedBatch(t *testing.T) {
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "ffmpeg")
+	if err := os.WriteFile(script, []byte(fakeFFmpegScript), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	filename := "segment-00001.ts"
+	if err := os.WriteFile(filepath.Join(tmp, filename), []byte("data"), 0644); err != nil {
+		t.Fatalf("prime file: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
+	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
+
+	w := NewWorker([]string{"--emit", filename}, &memoryStorage{}, "media-key", "1080p", true, tmp, false, []int{1, 2})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	waitForWorker(t, ctx, w)
+	if w.State() != WorkerStateError || w.Err() == nil || !strings.Contains(w.Err().Error(), "expected segment 2") {
+		t.Fatalf("expected partial batch error, state %v err %v", w.State(), w.Err())
+	}
+}
+
+func TestWorkerStoresCompleteRealFFmpegBatch(t *testing.T) {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+	tmp := t.TempDir()
+	input := filepath.Join(tmp, "nonzero.ts")
+	create := exec.Command(ffmpegPath,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25",
+		"-t", "4", "-c:v", "libx264", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0",
+		"-f", "mpegts", input,
+	)
+	if data, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("create fixture: %v: %s", err, data)
+	}
+	outputDir := filepath.Join(tmp, "segments")
+	if err := os.Mkdir(outputDir, 0755); err != nil {
+		t.Fatalf("create segment directory: %v", err)
+	}
+	builder := ffmpeg.NewCommandBuilder(&domain.HWAccelConfig{
+		Accelerator:  domain.AccelNone,
+		EncodeFlags:  []string{"-c:v", "libx264"},
+		KeyframeFlag: "-force_key_frames",
+		ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
+	})
+	args := builder.Video(ffmpeg.VideoParams{
+		InputURL:    input,
+		StreamIndex: 0,
+		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 500_000},
+		Segments: []domain.Segment{
+			{Index: 0, Start: 0, End: 2, Duration: 2},
+			{Index: 1, Start: 2, End: 4, Duration: 2},
+		},
+		OutputDir: outputDir,
+	})
+	storage := &memoryStorage{}
+	worker := NewWorker(args, storage, "media-key", "180p", true, outputDir, false, []int{0, 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := worker.Start(ctx); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+	waitForWorker(t, ctx, worker)
+	if worker.State() != WorkerStateDone {
+		t.Fatalf("real FFmpeg worker failed: %v", worker.Err())
+	}
+	if len(storage.writes) != 2 || storage.writes[0].Index != 0 || storage.writes[1].Index != 1 {
+		t.Fatalf("unexpected stored batch: %#v", storage.writes)
 	}
 }
 

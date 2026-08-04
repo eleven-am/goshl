@@ -7,7 +7,7 @@ import (
 )
 
 func TestGenerateVideo_DirectStreamAndClamping(t *testing.T) {
-	src := domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, Bitrate: 10_000_000}
+	src := domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, Bitrate: 10_000_000, PixelFormat: "yuv420p", Profile: "High", Level: 40, StartsWithKeyframe: true}
 
 	renditions := GenerateVideo(src)
 
@@ -19,8 +19,8 @@ func TestGenerateVideo_DirectStreamAndClamping(t *testing.T) {
 	if top.Method != domain.DirectStream {
 		t.Fatalf("expected direct stream when codec matches source, got %s", top.Method)
 	}
-	if top.Bitrate != 8_000_000 { // clamp to max for 1080p
-		t.Fatalf("bitrate should be clamped to 8Mbps, got %d", top.Bitrate)
+	if top.Bitrate != 10_000_000 {
+		t.Fatalf("direct stream bitrate should match the source, got %d", top.Bitrate)
 	}
 
 	var has720 bool
@@ -126,5 +126,52 @@ func TestGenerateAudioTracksDisambiguatesMultipleStreams(t *testing.T) {
 	}
 	if defaultCount != 1 {
 		t.Fatalf("expected exactly one default rendition, got %d", defaultCount)
+	}
+}
+
+func TestGenerateVideoIncludesSourceSizedLowResolution(t *testing.T) {
+	r := GenerateVideo(domain.VideoStream{Codec: "h264", Width: 426, Height: 240, Bitrate: 400_000, PixelFormat: "yuv420p", Profile: "High", Level: 30, FrameRate: 24, StartsWithKeyframe: true})
+	if len(r) != 1 {
+		t.Fatalf("expected one source-sized rendition, got %#v", r)
+	}
+	if r[0].Name != "240p" || r[0].Width != 426 || r[0].Height != 240 {
+		t.Fatalf("unexpected source rendition: %#v", r[0])
+	}
+}
+
+func TestGenerateVideoIncludesNonstandardSourceRung(t *testing.T) {
+	r := GenerateVideo(domain.VideoStream{Codec: "h264", Width: 2560, Height: 1440, Bitrate: 12_000_000, PixelFormat: "yuv420p", Profile: "High", Level: 51, FrameRate: 60, StartsWithKeyframe: true})
+	if len(r) == 0 || r[0].Name != "1440p" || r[0].Method != domain.DirectStream || r[0].Bitrate != 12_000_000 {
+		t.Fatalf("expected unchanged source rung first, got %#v", r)
+	}
+}
+
+func TestGenerateVideoRejectsIncompatibleDirectStream(t *testing.T) {
+	r := GenerateVideo(domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, Bitrate: 5_000_000, PixelFormat: "yuv420p10le", Profile: "High 10", Level: 51})
+	if len(r) == 0 || r[0].Method != domain.Transcode {
+		t.Fatalf("expected incompatible H264 to transcode, got %#v", r)
+	}
+}
+
+func TestGenerateVideoRejectsUnknownOrExcessiveH264Level(t *testing.T) {
+	for _, level := range []int{0, 60} {
+		renditions := GenerateVideo(domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, Bitrate: 5_000_000, PixelFormat: "yuv420p", Profile: "High", Level: level, StartsWithKeyframe: true})
+		if len(renditions) == 0 || renditions[0].Method != domain.Transcode {
+			t.Fatalf("level %d must not be remuxed directly: %#v", level, renditions)
+		}
+	}
+}
+
+func TestGenerateVideoRejectsRotatedDirectStream(t *testing.T) {
+	renditions := GenerateVideo(domain.VideoStream{Codec: "h264", Width: 1080, Height: 1920, Bitrate: 5_000_000, PixelFormat: "yuv420p", Profile: "High", Level: 40, Rotation: 90, StartsWithKeyframe: true})
+	if len(renditions) == 0 || renditions[0].Method != domain.Transcode {
+		t.Fatalf("rotated source must be normalized by transcoding: %#v", renditions)
+	}
+}
+
+func TestGenerateVideoRejectsAnamorphicDirectStream(t *testing.T) {
+	renditions := GenerateVideo(domain.VideoStream{Codec: "h264", Width: 768, Height: 576, Bitrate: 2_000_000, PixelFormat: "yuv420p", Profile: "High", Level: 31, SampleAspect: "16:15", StartsWithKeyframe: true})
+	if len(renditions) == 0 || renditions[0].Method != domain.Transcode {
+		t.Fatalf("anamorphic source must be normalized by transcoding: %#v", renditions)
 	}
 }

@@ -128,6 +128,33 @@ func TestNewPool(t *testing.T) {
 	}
 }
 
+func TestValidateJobRejectsMixedPipelineProfile(t *testing.T) {
+	pool := &Pool{streamType: domain.StreamVideo, profile: "worker-profile"}
+	job := domain.Job{
+		ID:              "job",
+		MediaKey:        "media",
+		Profile:         "other-profile",
+		SourceURL:       "source",
+		Rendition:       "720p",
+		StreamType:      domain.StreamVideo,
+		StartIndex:      0,
+		EndIndex:        0,
+		RequestedIndex:  0,
+		EnqueuedAt:      time.Now(),
+		Deadline:        time.Now().Add(time.Minute),
+		Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
+		ExpectedIndices: []int{0},
+		VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
+	}
+	if err := pool.validateJob(job); err == nil {
+		t.Fatalf("expected mixed pipeline profile rejection")
+	}
+	job.Profile = "worker-profile"
+	if err := pool.validateJob(job); err != nil {
+		t.Fatalf("expected valid concrete job: %v", err)
+	}
+}
+
 func TestPoolStartAndStop(t *testing.T) {
 	coord := &stubCoordinator{}
 	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 )
 
 type stubStorage struct {
+	mu                 sync.Mutex
 	metaData           []byte
 	metaExists         bool
 	segments           map[int][]byte
@@ -25,6 +27,16 @@ type stubStorage struct {
 	spriteVTT          []byte
 	metaExistsCalls    int
 	segmentExistsCalls int
+}
+
+type invalidatingStorage struct {
+	*stubStorage
+	keys []string
+}
+
+func (s *invalidatingStorage) DeleteMedia(ctx context.Context, mediaKey string) error {
+	s.keys = append(s.keys, mediaKey)
+	return nil
 }
 
 func (s *stubStorage) MetadataExists(ctx context.Context, sourceURL string) (bool, error) {
@@ -40,6 +52,8 @@ func (s *stubStorage) SetMetadata(ctx context.Context, sourceURL string, data []
 	return nil
 }
 func (s *stubStorage) WriteSegment(ctx context.Context, info domain.SegmentData, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.segments == nil {
 		s.segments = make(map[int][]byte)
 	}
@@ -47,13 +61,26 @@ func (s *stubStorage) WriteSegment(ctx context.Context, info domain.SegmentData,
 	return nil
 }
 func (s *stubStorage) ReadSegment(ctx context.Context, info domain.SegmentData) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.segmentCalls++
 	return s.segments[info.Index], nil
 }
 func (s *stubStorage) SegmentExists(ctx context.Context, info domain.SegmentData) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.segmentExistsCalls++
 	_, ok := s.segments[info.Index]
 	return ok, nil
+}
+
+func (s *stubStorage) setSegment(index int, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.segments == nil {
+		s.segments = make(map[int][]byte)
+	}
+	s.segments[index] = data
 }
 func (s *stubStorage) WriteSprite(ctx context.Context, mediaID string, index int, data []byte) error {
 	return nil
@@ -113,6 +140,7 @@ type stubCoordinator struct {
 	lockCalls     []string
 	releaseCalls  []string
 	onAcquireLock func(key string)
+	onWaitSegment func(info domain.SegmentData)
 }
 
 func (c *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
@@ -134,6 +162,9 @@ func (c *stubCoordinator) NotifySegment(ctx context.Context, info domain.Segment
 	return nil
 }
 func (c *stubCoordinator) WaitSegment(ctx context.Context, info domain.SegmentData) (<-chan domain.SegmentStatus, error) {
+	if c.onWaitSegment != nil {
+		c.onWaitSegment(info)
+	}
 	return c.waitSegmentChan(), nil
 }
 func (c *stubCoordinator) waitSegmentChan() chan domain.SegmentStatus {
@@ -165,6 +196,10 @@ func (c *stubCoordinator) Close() {}
 
 type stubPathGen struct{}
 
+func testVideoMetadata(duration float64, keyframes []float64) *domain.Metadata {
+	return &domain.Metadata{Duration: duration, Keyframes: keyframes, Video: domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, Bitrate: 5_000_000, PixelFormat: "yuv420p", Profile: "High", Level: 40, FrameRate: 24, StartsWithKeyframe: true}}
+}
+
 func (stubPathGen) MasterPlaylist(sourceURL string) string { return "/master" }
 func (stubPathGen) VariantPlaylist(sourceURL string, rendition string, streamType domain.StreamType) string {
 	return "/variant"
@@ -176,9 +211,10 @@ func (stubPathGen) SpriteVTT(sourceURL string) string { return "/sprites.vtt" }
 func (stubPathGen) Sprite(sourceURL string, index int) string {
 	return "/sprite-" + strconv.Itoa(index) + ".jpg"
 }
-func (stubPathGen) SubtitleVTT(sourceURL string, lang string) string { return "/sub.vtt" }
-func (stubPathGen) Preview(sourceURL string) string                  { return "/preview.gif" }
-func (stubPathGen) Thumbnail(sourceURL string) string                { return "/thumbnail.jpg" }
+func (stubPathGen) SubtitlePlaylist(sourceURL string, trackID string) string { return "/sub.m3u8" }
+func (stubPathGen) SubtitleVTT(sourceURL string, lang string) string         { return "/sub.vtt" }
+func (stubPathGen) Preview(sourceURL string) string                          { return "/preview.gif" }
+func (stubPathGen) Thumbnail(sourceURL string) string                        { return "/thumbnail.jpg" }
 
 // installFakeFFmpeg ensures hwaccel.Detect can run without real ffmpeg.
 func installFakeFFmpeg(t *testing.T) func() {
@@ -249,8 +285,8 @@ func TestMasterPlaylistIncludesAllAudioTracks(t *testing.T) {
 			t.Fatalf("expected audio rendition %q in playlist: %s", want, out)
 		}
 	}
-	if strings.Count(out, "DEFAULT=YES") != 1 {
-		t.Fatalf("expected exactly one default audio rendition: %s", out)
+	if strings.Count(out, "DEFAULT=YES") != 3 {
+		t.Fatalf("expected one default in each compatible audio group: %s", out)
 	}
 }
 
@@ -280,7 +316,8 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}, Video: domain.VideoStream{Width: 1920, Height: 1080}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
+	meta.Audios = []domain.AudioStream{{Index: 1, Codec: "aac", Channels: 2, Bitrate: 128_000, Default: true}}
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{0: []byte("seg0")}}
 	coord := &stubCoordinator{}
@@ -306,9 +343,7 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 	if len(coord.enqueued) != 1 {
 		t.Fatalf("expected enqueue, got %d", len(coord.enqueued))
 	}
-	opts := Options{}
-	opts.setDefaults()
-	if coord.enqueued[0].StartIndex != 0 || coord.enqueued[0].EndIndex != opts.SegmentsPerJob-1 {
+	if coord.enqueued[0].StartIndex != 0 || coord.enqueued[0].EndIndex != 1 {
 		t.Fatalf("unexpected job indices: %#v", coord.enqueued[0])
 	}
 }
@@ -334,7 +369,7 @@ func TestVariantPlaylistReturnsPlaylist(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
 	metaBytes, _ := json.Marshal(meta)
 	svc := NewController(Options{
 		Storage:     &stubStorage{metaData: metaBytes, metaExists: true},
@@ -496,7 +531,7 @@ func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
 	coord := &stubCoordinator{}
@@ -516,8 +551,8 @@ func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
 	if len(coord.lockCalls) != 1 {
 		t.Fatalf("expected 1 lock call, got %d", len(coord.lockCalls))
 	}
-	if !strings.Contains(coord.lockCalls[0], "segment:") {
-		t.Fatalf("expected segment lock key, got %q", coord.lockCalls[0])
+	if !strings.HasPrefix(coord.lockCalls[0], "job:") {
+		t.Fatalf("expected canonical job lock key, got %q", coord.lockCalls[0])
 	}
 	if len(coord.releaseCalls) != 1 {
 		t.Fatalf("expected 1 release call, got %d", len(coord.releaseCalls))
@@ -528,7 +563,7 @@ func TestSegmentWaitsWhenLockHeld(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
 	coord := &stubCoordinator{lockErr: domain.ErrLockHeld}
@@ -560,7 +595,7 @@ func TestSegmentReturnsCoordinatorLockFailure(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
 	coord := &stubCoordinator{lockErr: errors.New("coordinator down")}
@@ -612,7 +647,7 @@ func TestSegmentDoubleCheckReturnsExistingAfterLock(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
 
@@ -620,7 +655,7 @@ func TestSegmentDoubleCheckReturnsExistingAfterLock(t *testing.T) {
 	coord := &stubCoordinator{
 		onAcquireLock: func(key string) {
 			lockAcquired = true
-			store.segments[1] = []byte("appeared")
+			store.setSegment(1, []byte("appeared"))
 		},
 	}
 
@@ -699,7 +734,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 60, Keyframes: []float64{0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60}}
+	meta := testVideoMetadata(60, []float64{0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60})
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
 	coord := &stubCoordinator{}
@@ -747,7 +782,7 @@ func TestSegmentSkipsLockWhenAlreadyExists(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}}
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
 	metaBytes, _ := json.Marshal(meta)
 	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{3: []byte("cached")}}
 	coord := &stubCoordinator{}
@@ -767,5 +802,249 @@ func TestSegmentSkipsLockWhenAlreadyExists(t *testing.T) {
 
 	if len(coord.lockCalls) != 0 {
 		t.Fatalf("expected no lock calls when segment exists, got %d", len(coord.lockCalls))
+	}
+}
+
+func TestSegmentRechecksStorageAfterWaitRegistration(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}, Video: domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, PixelFormat: "yuv420p", Profile: "High", Level: 40}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{lockErr: domain.ErrLockHeld}
+	coord.onWaitSegment = func(info domain.SegmentData) {
+		store.setSegment(info.Index, []byte("ready-before-subscription"))
+	}
+	svc := NewController(Options{Storage: store, Coordinator: coord, PathGen: stubPathGen{}, SegmentTimeout: 20 * time.Millisecond})
+
+	data, err := svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+	if err != nil {
+		t.Fatalf("expected storage recheck to recover missed notification: %v", err)
+	}
+	if string(data) != "ready-before-subscription" {
+		t.Fatalf("unexpected segment %q", data)
+	}
+}
+
+func TestSegmentPollsDurableStorageWhenNotificationIsLost(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{lockErr: domain.ErrLockHeld}
+	svc := NewController(Options{Storage: store, Coordinator: coord, PathGen: stubPathGen{}, SegmentTimeout: time.Second})
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		store.setSegment(1, []byte("durable-without-notification"))
+	}()
+
+	data, err := svc.Segment(context.Background(), "file:///media", StreamVideo, "1080p", 1)
+	if err != nil {
+		t.Fatalf("expected durable polling to recover notification loss: %v", err)
+	}
+	if string(data) != "durable-without-notification" {
+		t.Fatalf("unexpected segment %q", data)
+	}
+}
+
+func TestSegmentContinuesPollingAfterNotificationChannelCloses(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := testVideoMetadata(12, []float64{0, 6, 12})
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	waitCh := make(chan domain.SegmentStatus)
+	close(waitCh)
+	coord := &stubCoordinator{lockErr: domain.ErrLockHeld, waitCh: waitCh}
+	svc := NewController(Options{Storage: store, Coordinator: coord, PathGen: stubPathGen{}, SegmentTimeout: time.Second})
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		store.setSegment(1, []byte("ready-after-close"))
+	}()
+
+	data, err := svc.Segment(context.Background(), "file:///media", StreamVideo, "1080p", 1)
+	if err != nil {
+		t.Fatalf("expected polling after notification close: %v", err)
+	}
+	if string(data) != "ready-after-close" {
+		t.Fatalf("unexpected segment %q", data)
+	}
+}
+
+func TestSegmentLocksCanonicalBatch(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 30, Keyframes: []float64{0, 6, 12, 18, 24, 30}, Video: domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, PixelFormat: "yuv420p", Profile: "High", Level: 40}}
+	metaBytes, _ := json.Marshal(meta)
+	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
+	coord := &stubCoordinator{}
+	svc := NewController(Options{Storage: store, Coordinator: coord, PathGen: stubPathGen{}})
+
+	for _, index := range []int{1, 2} {
+		coord.waitCh = make(chan domain.SegmentStatus, 1)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", index)
+	}
+
+	if len(coord.lockCalls) != 2 || coord.lockCalls[0] != coord.lockCalls[1] {
+		t.Fatalf("segments in one batch must use one lock identity: %#v", coord.lockCalls)
+	}
+}
+
+func TestNewControllerWithContextRejectsInvalidOptions(t *testing.T) {
+	_, err := NewControllerWithContext(context.Background(), Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}, SegmentsPerJob: -1})
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("expected invalid options error, got %v", err)
+	}
+}
+
+func TestSegmentRejectsInvalidRequestBeforeQueueing(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{Duration: 12, Keyframes: []float64{0, 6, 12}, Video: domain.VideoStream{Width: 1920, Height: 1080}}
+	metaBytes, _ := json.Marshal(meta)
+	coord := &stubCoordinator{}
+	svc := NewController(Options{Storage: &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}, Coordinator: coord, PathGen: stubPathGen{}})
+
+	if _, err := svc.Segment(context.Background(), "file:///media", StreamType("bogus"), "1080p", 0); !errors.Is(err, ErrInvalidStreamType) {
+		t.Fatalf("expected invalid stream type, got %v", err)
+	}
+	if _, err := svc.Segment(context.Background(), "file:///media", StreamVideo, "1080p", -1); !errors.Is(err, ErrSegmentOutOfRange) {
+		t.Fatalf("expected segment range error, got %v", err)
+	}
+	if len(coord.enqueued) != 0 {
+		t.Fatalf("invalid requests must not enqueue work: %#v", coord.enqueued)
+	}
+}
+
+func TestMediaKeyChangesWithSourceRevisionAndPipeline(t *testing.T) {
+	base := Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}, SourceRevision: func(context.Context, string) (string, error) { return "revision-a", nil }}
+	first := NewController(base)
+	firstKey, err := first.MediaKey(context.Background(), "https://media.example/video")
+	if err != nil {
+		t.Fatalf("resolve first key: %v", err)
+	}
+
+	base.SourceRevision = func(context.Context, string) (string, error) { return "revision-b", nil }
+	second := NewController(base)
+	secondKey, err := second.MediaKey(context.Background(), "https://media.example/video")
+	if err != nil {
+		t.Fatalf("resolve second key: %v", err)
+	}
+	if firstKey == secondKey {
+		t.Fatalf("source revisions must not share a media key")
+	}
+
+	base.SourceRevision = func(context.Context, string) (string, error) { return "revision-a", nil }
+	base.TargetDuration = 4
+	third := NewController(base)
+	thirdKey, err := third.MediaKey(context.Background(), "https://media.example/video")
+	if err != nil {
+		t.Fatalf("resolve third key: %v", err)
+	}
+	if firstKey == thirdKey {
+		t.Fatalf("pipeline changes must not share a media key")
+	}
+}
+
+func TestLocalSourcePathHandlesFilesWithoutParsingRemoteURLs(t *testing.T) {
+	for input, want := range map[string]string{
+		"/media/video.mkv":             "/media/video.mkv",
+		"file:///media/My%20Video.mkv": "/media/My Video.mkv",
+		"file://localhost/media/a.mkv": "/media/a.mkv",
+	} {
+		got, local := localSourcePath(input)
+		if !local || got != want {
+			t.Fatalf("localSourcePath(%q) = %q, %v; want %q, true", input, got, local, want)
+		}
+	}
+	if _, local := localSourcePath("https://[::1/video?token=secret"); local {
+		t.Fatalf("remote URL must not be treated as a local file")
+	}
+}
+
+func TestInvalidateUsesResolvedMediaKey(t *testing.T) {
+	storage := &invalidatingStorage{stubStorage: &stubStorage{}}
+	controller := NewController(Options{
+		Storage:        storage,
+		Coordinator:    &stubCoordinator{},
+		PathGen:        stubPathGen{},
+		SourceRevision: func(context.Context, string) (string, error) { return "revision", nil },
+	})
+	want, err := controller.MediaKey(context.Background(), "https://media.example/video")
+	if err != nil {
+		t.Fatalf("resolve media key: %v", err)
+	}
+	if err := controller.Invalidate(context.Background(), "https://media.example/video"); err != nil {
+		t.Fatalf("invalidate media: %v", err)
+	}
+	if len(storage.keys) != 1 || storage.keys[0] != want {
+		t.Fatalf("invalidated keys %#v, want %q", storage.keys, want)
+	}
+}
+
+func TestInvalidateReportsUnsupportedStorage(t *testing.T) {
+	controller := NewController(Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}})
+	if err := controller.Invalidate(context.Background(), "source"); !errors.Is(err, ErrCacheInvalidationUnsupported) {
+		t.Fatalf("expected unsupported invalidation error, got %v", err)
+	}
+}
+
+func TestGeneratedAssetRequestsRejectInvalidConfigurationBeforeProbe(t *testing.T) {
+	storage := &stubStorage{}
+	controller := NewController(Options{Storage: storage, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}})
+	if _, err := controller.Preview(context.Background(), "source", &PreviewConfig{Width: -1}); !errors.Is(err, ErrInvalidPreviewConfig) {
+		t.Fatalf("expected invalid preview configuration, got %v", err)
+	}
+	if _, err := controller.Thumbnail(context.Background(), "source", &ThumbnailConfig{Position: math.NaN()}); !errors.Is(err, ErrInvalidThumbnailConfig) {
+		t.Fatalf("expected invalid thumbnail configuration, got %v", err)
+	}
+	if storage.metaExistsCalls != 0 {
+		t.Fatalf("invalid asset requests must not probe storage")
+	}
+}
+
+func TestAssetIdentityIncludesRequestedConfiguration(t *testing.T) {
+	first := assetIdentity("media", "preview", PreviewConfig{MaxFrames: 20, Frameduration: 200, Width: 320})
+	second := assetIdentity("media", "preview", PreviewConfig{MaxFrames: 40, Frameduration: 200, Width: 320})
+	if first == second {
+		t.Fatalf("preview configurations must not share an artifact key")
+	}
+}
+
+func TestBuildJobUsesOverlapOnlyForDirectStream(t *testing.T) {
+	controller := &Controller{opts: Options{JobTimeout: time.Minute}, pipelineVersion: "test"}
+	segments := []domain.Segment{
+		{Index: 0, Start: 0, End: 6},
+		{Index: 1, Start: 6, End: 12},
+		{Index: 2, Start: 12, End: 18},
+	}
+	direct := domain.VideoRendition{Name: "source", Method: domain.DirectStream}
+	transcoded := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
+	directJob := controller.buildJob("source", "key", StreamVideo, direct.Name, 1, 1, 2, segments, &direct, nil)
+	transcodedJob := controller.buildJob("source", "key", StreamVideo, transcoded.Name, 1, 1, 2, segments, &transcoded, nil)
+	if directJob.Overlap == nil {
+		t.Fatalf("direct stream must retain the preceding GOP boundary")
+	}
+	if transcodedJob.Overlap != nil {
+		t.Fatalf("transcoded video must not process a discarded preceding segment")
+	}
+}
+
+func TestHWAccelConfigReturnsIndependentSlices(t *testing.T) {
+	svc := NewController(Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}})
+	first := svc.HWAccelConfig()
+	first.EncodeFlags[0] = "mutated"
+	second := svc.HWAccelConfig()
+	if second.EncodeFlags[0] == "mutated" {
+		t.Fatalf("returned hardware configuration mutated the controller")
 	}
 }

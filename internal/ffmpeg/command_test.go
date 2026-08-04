@@ -175,6 +175,25 @@ func TestHelpersHandleEdgeCases(t *testing.T) {
 	}
 }
 
+func TestVideoCommandDoesNotMutateHardwareConfig(t *testing.T) {
+	config := &domain.HWAccelConfig{
+		EncodeFlags:  make([]string, 2, 16),
+		KeyframeFlag: "-force_key_frames",
+		ScaleFilter:  "scale=%d:%d",
+	}
+	copy(config.EncodeFlags, []string{"-c:v", "libx264"})
+	builder := NewCommandBuilder(config)
+	builder.Video(VideoParams{
+		InputURL:  "input.mp4",
+		Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600_000},
+		Segments:  []domain.Segment{{Index: 0, Start: 0, End: 6}},
+		OutputDir: "/tmp/out",
+	})
+	if len(config.EncodeFlags) != 2 || config.EncodeFlags[0] != "-c:v" || config.EncodeFlags[1] != "libx264" {
+		t.Fatalf("command construction mutated shared hardware configuration: %#v", config.EncodeFlags)
+	}
+}
+
 func assertTimestampsPreservedAfterSeek(t *testing.T, joined string) {
 	t.Helper()
 	if !strings.Contains(joined, "-copyts") || !strings.Contains(joined, "-start_at_zero") {

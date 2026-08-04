@@ -59,7 +59,7 @@ func TestCalculateSegments_SingleKeyframeCreatesTailSegment(t *testing.T) {
 	keyframes := []float64{1.0}
 	segments := CalculateSegments(keyframes, 4.0, 6.0)
 
-	want := domain.Segment{Index: 0, Start: 1.0, End: 4.0, Duration: 3.0}
+	want := domain.Segment{Index: 0, Start: 0, End: 4.0, Duration: 4.0}
 	if len(segments) != 1 {
 		t.Fatalf("expected 1 segment, got %d", len(segments))
 	}

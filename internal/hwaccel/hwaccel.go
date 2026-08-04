@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/mediaexec"
@@ -56,7 +59,13 @@ func Select(available []domain.Accelerator) domain.Accelerator {
 }
 
 func DetectBest() *domain.HWAccelConfig {
-	available, err := Detect(context.Background())
+	return DetectBestContext(context.Background())
+}
+
+func DetectBestContext(ctx context.Context) *domain.HWAccelConfig {
+	detectCtx, detectCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer detectCancel()
+	available, err := Detect(detectCtx)
 	if err != nil {
 		cfg := NewConfig(domain.AccelNone)
 		cfg.Requested = domain.AccelNone
@@ -68,20 +77,49 @@ func DetectBest() *domain.HWAccelConfig {
 	cfg := NewConfig(selected)
 	cfg.Requested = selected
 	cfg.Available = available
+	if selected != domain.AccelNone {
+		validateCtx, cancel := context.WithTimeout(detectCtx, 15*time.Second)
+		err = Validate(validateCtx, cfg)
+		cancel()
+		if err != nil {
+			fallback := NewConfig(domain.AccelNone)
+			fallback.Requested = selected
+			fallback.Available = available
+			fallback.Error = err.Error()
+			return fallback
+		}
+	}
 	return cfg
 }
 
 func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
+	return NewConfigWithMode(accel, domain.DecodeSafe)
+}
+
+func NewConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) *domain.HWAccelConfig {
+	if mode == "" {
+		mode = domain.DecodeSafe
+	}
 	switch accel {
 	case domain.AccelCUDA:
+		decodeFlags := []string{"-hwaccel", "cuda"}
+		scaleFilter := "scale=%d:%d,setsar=1,format=yuv420p"
+		deviceFrames := false
+		if mode == domain.DecodeDevice {
+			decodeFlags = []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"}
+			scaleFilter = "scale_cuda=%d:%d:format=nv12,setsar=1"
+			deviceFrames = true
+		}
 		return &domain.HWAccelConfig{
 			Accelerator:  domain.AccelCUDA,
 			Requested:    domain.AccelCUDA,
-			DecodeFlags:  []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"},
+			DecodeFlags:  decodeFlags,
 			EncodeFlags:  []string{"-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll"},
 			Encoder:      "h264_nvenc",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale_cuda=%d:%d:format=nv12",
+			ScaleFilter:  scaleFilter,
+			DecodeMode:   mode,
+			DeviceFrames: deviceFrames,
 		}
 	case domain.AccelVideoToolbox:
 		return &domain.HWAccelConfig{
@@ -91,7 +129,8 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 			EncodeFlags:  []string{"-c:v", "h264_videotoolbox", "-realtime", "true", "-prio_speed", "true"},
 			Encoder:      "h264_videotoolbox",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale=%d:%d",
+			ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
+			DecodeMode:   mode,
 		}
 	case domain.AccelVAAPI:
 		return &domain.HWAccelConfig{
@@ -101,7 +140,9 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 			EncodeFlags:  []string{"-c:v", "h264_vaapi"},
 			Encoder:      "h264_vaapi",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale_vaapi=%d:%d:format=nv12",
+			ScaleFilter:  "scale_vaapi=%d:%d:format=nv12,setsar=1",
+			DecodeMode:   domain.DecodeDevice,
+			DeviceFrames: true,
 		}
 	case domain.AccelQSV:
 		return &domain.HWAccelConfig{
@@ -111,7 +152,9 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 			EncodeFlags:  []string{"-c:v", "h264_qsv", "-preset", "veryfast"},
 			Encoder:      "h264_qsv",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale_qsv=%d:%d:format=nv12",
+			ScaleFilter:  "scale_qsv=%d:%d:format=nv12,setsar=1",
+			DecodeMode:   domain.DecodeDevice,
+			DeviceFrames: true,
 		}
 	default:
 		return &domain.HWAccelConfig{
@@ -121,18 +164,47 @@ func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
 			EncodeFlags:  []string{"-c:v", "libx264", "-preset", "ultrafast"},
 			Encoder:      "libx264",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale=%d:%d",
+			ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
+			DecodeMode:   domain.DecodeSafe,
 		}
 	}
 }
 
 func RequireConfig(accel domain.Accelerator) (*domain.HWAccelConfig, error) {
+	return RequireConfigWithMode(accel, domain.DecodeSafe)
+}
+
+func RequireConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) (*domain.HWAccelConfig, error) {
 	switch accel {
 	case domain.AccelNone, domain.AccelCUDA, domain.AccelVideoToolbox, domain.AccelVAAPI, domain.AccelQSV:
-		return NewConfig(accel), nil
+		return NewConfigWithMode(accel, mode), nil
 	default:
 		return nil, fmt.Errorf("unsupported hardware accelerator %q", accel)
 	}
+}
+
+func Validate(ctx context.Context, config *domain.HWAccelConfig) error {
+	if config == nil || config.Accelerator == domain.AccelNone {
+		return nil
+	}
+	directory, err := os.MkdirTemp("", "goshl-hwaccel-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(directory)
+	input := filepath.Join(directory, "input.mp4")
+	if err := mediaexec.Run(ctx, "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=128x72:rate=24", "-frames:v", "12", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", input); err != nil {
+		return fmt.Errorf("create validation input: %w", err)
+	}
+	args := []string{"-v", "error"}
+	args = append(args, config.DecodeFlags...)
+	args = append(args, "-i", input, "-vf", fmt.Sprintf(config.ScaleFilter, 64, 36))
+	args = append(args, config.EncodeFlags...)
+	args = append(args, "-frames:v", "1", "-f", "null", "-")
+	if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {
+		return fmt.Errorf("validate %s pipeline: %w", config.Accelerator, err)
+	}
+	return nil
 }
 
 func detectHWAccels(ctx context.Context) (map[string]bool, error) {

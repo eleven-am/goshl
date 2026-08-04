@@ -8,7 +8,7 @@ func CalculateSegments(keyframes []float64, duration float64, targetDuration flo
 	}
 
 	var segments []domain.Segment
-	segmentStart := keyframes[0]
+	segmentStart := 0.0
 	segmentIndex := 0
 
 	for i := 1; i < len(keyframes); i++ {

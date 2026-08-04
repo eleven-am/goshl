@@ -3,6 +3,7 @@ package misc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color/palette"
@@ -12,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/disintegration/imaging"
 	"github.com/eleven-am/goshl/internal/domain"
@@ -28,15 +30,29 @@ const (
 )
 
 type Generator struct {
-	storage domain.Storage
-	hwAccel *domain.HWAccelConfig
-	sprites singleflight.Group
+	storage     domain.Storage
+	hwAccel     *domain.HWAccelConfig
+	sprites     singleflight.Group
+	previews    singleflight.Group
+	thumbnails  singleflight.Group
+	subtitles   singleflight.Group
+	coordinator domain.Coordinator
+	observer    domain.Observer
 
 	thumbWidth  int
 	thumbHeight int
 	interval    float64
 	cols        int
 	rows        int
+}
+
+func NewGeneratorWithCoordinator(storage domain.Storage, coordinator domain.Coordinator, hwAccel *domain.HWAccelConfig, observers ...domain.Observer) *Generator {
+	generator := NewGenerator(storage, hwAccel)
+	generator.coordinator = coordinator
+	if len(observers) > 0 {
+		generator.observer = observers[0]
+	}
+	return generator
 }
 
 func NewGenerator(storage domain.Storage, hwAccel ...*domain.HWAccelConfig) *Generator {
@@ -56,52 +72,46 @@ func NewGenerator(storage domain.Storage, hwAccel ...*domain.HWAccelConfig) *Gen
 	}
 }
 
-func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string) ([]byte, error) {
-	exists, err := g.storage.SpriteVTTExists(ctx, sourceURL)
+func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string) ([]byte, error) {
+	exists, err := g.storage.SpriteVTTExists(ctx, spriteKey)
 	if err != nil {
 		return nil, fmt.Errorf("check sprite vtt: %w", err)
 	}
 
 	if !exists {
-		if err := g.ensureSprites(ctx, sourceURL, duration, spriteURL); err != nil {
+		if err := g.ensureSprites(ctx, sourceURL, spriteKey, duration, spriteURL); err != nil {
 			return nil, err
 		}
 	}
 
-	return g.storage.ReadSpriteVTT(ctx, sourceURL)
+	return g.storage.ReadSpriteVTT(ctx, spriteKey)
 }
 
-func (g *Generator) GetSprite(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string, index int) ([]byte, error) {
-	exists, err := g.storage.SpriteExists(ctx, sourceURL, index)
+func (g *Generator) GetSprite(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string, index int) ([]byte, error) {
+	exists, err := g.storage.SpriteExists(ctx, spriteKey, index)
 	if err != nil {
 		return nil, fmt.Errorf("check sprite: %w", err)
 	}
 
 	if !exists {
-		if err := g.ensureSprites(ctx, sourceURL, duration, spriteURL); err != nil {
+		if err := g.ensureSprites(ctx, sourceURL, spriteKey, duration, spriteURL); err != nil {
 			return nil, err
 		}
 	}
 
-	return g.storage.ReadSprite(ctx, sourceURL, index)
+	return g.storage.ReadSprite(ctx, spriteKey, index)
 }
 
-func (g *Generator) ensureSprites(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string) error {
-	_, err, _ := g.sprites.Do(sourceURL, func() (any, error) {
-		ready, err := g.spritesReady(ctx, sourceURL, duration)
-		if err != nil {
-			return nil, err
-		}
-		if ready {
-			return nil, nil
-		}
-		return nil, g.generateSprites(ctx, sourceURL, duration, spriteURL)
+func (g *Generator) ensureSprites(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string) error {
+	return g.generateOnce(ctx, &g.sprites, spriteKey, func(runCtx context.Context) (bool, error) {
+		return g.spritesReady(runCtx, spriteKey, duration)
+	}, func(runCtx context.Context) error {
+		return g.generateSprites(runCtx, sourceURL, spriteKey, duration, spriteURL)
 	})
-	return err
 }
 
-func (g *Generator) spritesReady(ctx context.Context, sourceURL string, duration float64) (bool, error) {
-	vttExists, err := g.storage.SpriteVTTExists(ctx, sourceURL)
+func (g *Generator) spritesReady(ctx context.Context, spriteKey string, duration float64) (bool, error) {
+	vttExists, err := g.storage.SpriteVTTExists(ctx, spriteKey)
 	if err != nil {
 		return false, fmt.Errorf("check sprite vtt: %w", err)
 	}
@@ -110,7 +120,7 @@ func (g *Generator) spritesReady(ctx context.Context, sourceURL string, duration
 	}
 
 	for i := 0; i < g.spriteCount(duration); i++ {
-		exists, err := g.storage.SpriteExists(ctx, sourceURL, i)
+		exists, err := g.storage.SpriteExists(ctx, spriteKey, i)
 		if err != nil {
 			return false, fmt.Errorf("check sprite %d: %w", i, err)
 		}
@@ -122,7 +132,7 @@ func (g *Generator) spritesReady(ctx context.Context, sourceURL string, duration
 	return true, nil
 }
 
-func (g *Generator) generateSprites(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string) error {
+func (g *Generator) generateSprites(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string) error {
 	numSprites := g.spriteCount(duration)
 
 	tmpDir, err := os.MkdirTemp("", "sprites-*")
@@ -133,14 +143,7 @@ func (g *Generator) generateSprites(ctx context.Context, sourceURL string, durat
 
 	outputPattern := filepath.Join(tmpDir, "sprite-%d.jpg")
 
-	args := []string{"-nostats", "-hide_banner", "-loglevel", "warning"}
-	args = append(args, g.hwAccel.DecodeFlags...)
-	args = append(args,
-		"-i", sourceURL,
-		"-vf", g.spriteFilter(),
-		"-q:v", "5",
-		outputPattern,
-	)
+	args := g.spriteArgs(sourceURL, outputPattern)
 
 	if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {
 		return fmt.Errorf("ffmpeg sprite generation: %w", err)
@@ -153,17 +156,34 @@ func (g *Generator) generateSprites(ctx context.Context, sourceURL string, durat
 			return fmt.Errorf("read sprite %d: %w", i, err)
 		}
 
-		if err := g.storage.WriteSprite(ctx, sourceURL, i, data); err != nil {
+		if err := g.storage.WriteSprite(ctx, spriteKey, i, data); err != nil {
 			return fmt.Errorf("write sprite %d: %w", i, err)
 		}
 	}
 
 	vtt := g.generateVTT(duration, numSprites, spriteURL)
-	if err := g.storage.WriteSpriteVTT(ctx, sourceURL, vtt); err != nil {
+	if err := g.storage.WriteSpriteVTT(ctx, spriteKey, vtt); err != nil {
 		return fmt.Errorf("write sprite vtt: %w", err)
 	}
 
 	return nil
+}
+
+func (g *Generator) spriteArgs(sourceURL string, outputPattern string) []string {
+	args := []string{"-nostats", "-hide_banner", "-loglevel", "warning"}
+	if g.hwAccel != nil && g.hwAccel.Accelerator == domain.AccelCUDA {
+		args = append(args, "-threads", "1")
+	}
+	if g.hwAccel != nil {
+		args = append(args, g.hwAccel.DecodeFlags...)
+	}
+	args = append(args,
+		"-i", sourceURL,
+		"-vf", g.spriteFilter(),
+		"-q:v", "5",
+		outputPattern,
+	)
+	return args
 }
 
 func (g *Generator) spriteCount(duration float64) int {
@@ -180,6 +200,9 @@ func (g *Generator) spriteFilter() string {
 
 	switch g.hwAccel.Accelerator {
 	case domain.AccelCUDA, domain.AccelQSV, domain.AccelVAAPI:
+		if !g.hwAccel.DeviceFrames {
+			return filter
+		}
 		scale := fmt.Sprintf(g.hwAccel.ScaleFilter, g.thumbWidth, g.thumbHeight)
 		return fmt.Sprintf("%s,hwdownload,format=nv12,fps=1/%g,tile=%dx%d", scale, g.interval, g.cols, g.rows)
 	default:
@@ -222,25 +245,29 @@ func (g *Generator) generateVTT(duration float64, numSprites int, spriteURL func
 	return buf.Bytes()
 }
 
-func (g *Generator) GetSubtitles(ctx context.Context, sourceURL string, streamIndex int, lang string) ([]byte, error) {
-	exists, err := g.storage.SubtitleVTTExists(ctx, sourceURL, lang)
+func (g *Generator) GetSubtitles(ctx context.Context, sourceURL, subtitleKey string, streamIndex int, trackID string) ([]byte, error) {
+	exists, err := g.storage.SubtitleVTTExists(ctx, subtitleKey, trackID)
 	if err != nil {
 		return nil, fmt.Errorf("check subtitle vtt: %w", err)
 	}
 
 	if !exists {
-		if err := g.extractSubtitles(ctx, sourceURL, streamIndex, lang); err != nil {
+		if err := g.generateOnce(ctx, &g.subtitles, subtitleKey, func(runCtx context.Context) (bool, error) {
+			return g.storage.SubtitleVTTExists(runCtx, subtitleKey, trackID)
+		}, func(runCtx context.Context) error {
+			return g.extractSubtitles(runCtx, sourceURL, subtitleKey, streamIndex, trackID)
+		}); err != nil {
 			return nil, err
 		}
 	}
 
-	return g.storage.ReadSubtitleVTT(ctx, sourceURL, lang)
+	return g.storage.ReadSubtitleVTT(ctx, subtitleKey, trackID)
 }
 
-func (g *Generator) extractSubtitles(ctx context.Context, sourceURL string, streamIndex int, lang string) error {
+func (g *Generator) extractSubtitles(ctx context.Context, sourceURL, subtitleKey string, streamIndex int, trackID string) error {
 	args := []string{
 		"-i", sourceURL,
-		"-map", fmt.Sprintf("0:s:%d", streamIndex),
+		"-map", fmt.Sprintf("0:%d", streamIndex),
 		"-c:s", "webvtt",
 		"-f", "webvtt",
 		"pipe:1",
@@ -251,7 +278,7 @@ func (g *Generator) extractSubtitles(ctx context.Context, sourceURL string, stre
 		return fmt.Errorf("ffmpeg subtitle extraction: %w", err)
 	}
 
-	if err := g.storage.WriteSubtitleVTT(ctx, sourceURL, lang, output); err != nil {
+	if err := g.storage.WriteSubtitleVTT(ctx, subtitleKey, trackID, output); err != nil {
 		return fmt.Errorf("write subtitle vtt: %w", err)
 	}
 
@@ -267,91 +294,72 @@ func formatVTTTime(seconds float64) string {
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, secs, millis)
 }
 
-func (g *Generator) GetPreview(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string, config domain.PreviewConfig) ([]byte, error) {
-	exists, err := g.storage.PreviewExists(ctx, sourceURL)
+func (g *Generator) GetPreview(ctx context.Context, sourceURL, spriteKey, previewKey string, duration float64, spriteURL func(int) string, config domain.PreviewConfig) ([]byte, error) {
+	exists, err := g.storage.PreviewExists(ctx, previewKey)
 	if err != nil {
 		return nil, fmt.Errorf("check preview: %w", err)
 	}
 
 	if exists {
-		return g.storage.ReadPreview(ctx, sourceURL)
+		return g.storage.ReadPreview(ctx, previewKey)
 	}
 
-	if err := g.ensureSprites(ctx, sourceURL, duration, spriteURL); err != nil {
+	if err := g.generateOnce(ctx, &g.previews, previewKey, func(runCtx context.Context) (bool, error) {
+		return g.storage.PreviewExists(runCtx, previewKey)
+	}, func(runCtx context.Context) error {
+		if err := g.ensureSprites(runCtx, sourceURL, spriteKey, duration, spriteURL); err != nil {
+			return err
+		}
+		preview, err := g.generatePreview(runCtx, spriteKey, duration, config)
+		if err != nil {
+			return err
+		}
+		if err := g.storage.WritePreview(runCtx, previewKey, preview); err != nil {
+			return fmt.Errorf("write preview: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
-	preview, err := g.generatePreview(ctx, sourceURL, duration, config)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := g.storage.WritePreview(ctx, sourceURL, preview); err != nil {
-		return nil, fmt.Errorf("write preview: %w", err)
-	}
-
-	return preview, nil
+	return g.storage.ReadPreview(ctx, previewKey)
 }
 
-func (g *Generator) generatePreview(ctx context.Context, sourceURL string, duration float64, config domain.PreviewConfig) ([]byte, error) {
+func (g *Generator) generatePreview(ctx context.Context, spriteKey string, duration float64, config domain.PreviewConfig) ([]byte, error) {
 	thumbsPerSprite := g.cols * g.rows
 	totalThumbs := int(math.Ceil(duration / g.interval))
-	numSprites := int(math.Ceil(float64(totalThumbs) / float64(thumbsPerSprite)))
-
-	var allFrames []image.Image
-
-	for spriteIdx := 0; spriteIdx < numSprites; spriteIdx++ {
-		spriteData, err := g.storage.ReadSprite(ctx, sourceURL, spriteIdx)
-		if err != nil {
-			return nil, fmt.Errorf("read sprite %d: %w", spriteIdx, err)
-		}
-
-		spriteImg, err := jpeg.Decode(bytes.NewReader(spriteData))
-		if err != nil {
-			return nil, fmt.Errorf("decode sprite %d: %w", spriteIdx, err)
-		}
-
-		framesInThisSprite := thumbsPerSprite
-		remainingThumbs := totalThumbs - (spriteIdx * thumbsPerSprite)
-		if remainingThumbs < thumbsPerSprite {
-			framesInThisSprite = remainingThumbs
-		}
-
-		for i := 0; i < framesInThisSprite; i++ {
-			row := i / g.cols
-			col := i % g.cols
-			x := col * g.thumbWidth
-			y := row * g.thumbHeight
-
-			rect := image.Rect(x, y, x+g.thumbWidth, y+g.thumbHeight)
-			frame := imaging.Crop(spriteImg, rect)
-			allFrames = append(allFrames, frame)
-		}
-	}
-
-	if len(allFrames) == 0 {
+	if totalThumbs <= 0 || config.MaxFrames <= 0 || config.Width <= 0 || config.Frameduration <= 0 {
 		return nil, fmt.Errorf("no frames extracted from sprites")
 	}
-
-	var sampledFrames []image.Image
-	if len(allFrames) <= config.MaxFrames {
-		sampledFrames = allFrames
-	} else {
-		step := float64(len(allFrames)) / float64(config.MaxFrames)
-		for i := 0; i < config.MaxFrames; i++ {
-			idx := int(float64(i) * step)
-			if idx >= len(allFrames) {
-				idx = len(allFrames) - 1
-			}
-			sampledFrames = append(sampledFrames, allFrames[idx])
-		}
+	frameCount := min(totalThumbs, config.MaxFrames)
+	indices := make([]int, frameCount)
+	for i := range indices {
+		indices[i] = int(float64(i) * float64(totalThumbs) / float64(frameCount))
 	}
 
 	aspectRatio := float64(g.thumbHeight) / float64(g.thumbWidth)
 	targetHeight := int(float64(config.Width) * aspectRatio)
-
-	var resizedFrames []*image.Paletted
-	for _, frame := range sampledFrames {
+	resizedFrames := make([]*image.Paletted, 0, frameCount)
+	loadedSprite := -1
+	var spriteImg image.Image
+	for _, index := range indices {
+		spriteIndex := index / thumbsPerSprite
+		if spriteIndex != loadedSprite {
+			spriteData, err := g.storage.ReadSprite(ctx, spriteKey, spriteIndex)
+			if err != nil {
+				return nil, fmt.Errorf("read sprite %d: %w", spriteIndex, err)
+			}
+			spriteImg, err = jpeg.Decode(bytes.NewReader(spriteData))
+			if err != nil {
+				return nil, fmt.Errorf("decode sprite %d: %w", spriteIndex, err)
+			}
+			loadedSprite = spriteIndex
+		}
+		frameIndex := index % thumbsPerSprite
+		row := frameIndex / g.cols
+		col := frameIndex % g.cols
+		rect := image.Rect(col*g.thumbWidth, row*g.thumbHeight, (col+1)*g.thumbWidth, (row+1)*g.thumbHeight)
+		frame := imaging.Crop(spriteImg, rect)
 		resized := imaging.Resize(frame, config.Width, targetHeight, imaging.Lanczos)
 
 		bounds := resized.Bounds()
@@ -362,7 +370,7 @@ func (g *Generator) generatePreview(ctx context.Context, sourceURL string, durat
 
 	delays := make([]int, len(resizedFrames))
 	for i := range delays {
-		delays[i] = config.Frameduration / 10
+		delays[i] = max(1, config.Frameduration/10)
 	}
 
 	animatedGIF := &gif.GIF{
@@ -378,33 +386,35 @@ func (g *Generator) generatePreview(ctx context.Context, sourceURL string, durat
 	return buf.Bytes(), nil
 }
 
-func (g *Generator) GetThumbnail(ctx context.Context, sourceURL string, duration float64, spriteURL func(int) string, config domain.ThumbnailConfig) ([]byte, error) {
-	exists, err := g.storage.ThumbnailExists(ctx, sourceURL)
+func (g *Generator) GetThumbnail(ctx context.Context, sourceURL, thumbnailKey string, duration float64, config domain.ThumbnailConfig) ([]byte, error) {
+	exists, err := g.storage.ThumbnailExists(ctx, thumbnailKey)
 	if err != nil {
 		return nil, fmt.Errorf("check thumbnail: %w", err)
 	}
 
 	if exists {
-		return g.storage.ReadThumbnail(ctx, sourceURL)
+		return g.storage.ReadThumbnail(ctx, thumbnailKey)
 	}
 
-	if err := g.ensureSprites(ctx, sourceURL, duration, spriteURL); err != nil {
+	if err := g.generateOnce(ctx, &g.thumbnails, thumbnailKey, func(runCtx context.Context) (bool, error) {
+		return g.storage.ThumbnailExists(runCtx, thumbnailKey)
+	}, func(runCtx context.Context) error {
+		thumbnail, err := mediaexec.Output(runCtx, "ffmpeg", g.thumbnailArgs(sourceURL, duration, config)...)
+		if err != nil {
+			return err
+		}
+		if err := g.storage.WriteThumbnail(runCtx, thumbnailKey, thumbnail); err != nil {
+			return fmt.Errorf("write thumbnail: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 
-	thumbnail, err := g.generateThumbnail(ctx, sourceURL, duration, config)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := g.storage.WriteThumbnail(ctx, sourceURL, thumbnail); err != nil {
-		return nil, fmt.Errorf("write thumbnail: %w", err)
-	}
-
-	return thumbnail, nil
+	return g.storage.ReadThumbnail(ctx, thumbnailKey)
 }
 
-func (g *Generator) generateThumbnail(ctx context.Context, sourceURL string, duration float64, config domain.ThumbnailConfig) ([]byte, error) {
+func (g *Generator) thumbnailArgs(sourceURL string, duration float64, config domain.ThumbnailConfig) []string {
 	timestamp := duration * config.Position
 	if timestamp < 0 {
 		timestamp = 0
@@ -416,38 +426,84 @@ func (g *Generator) generateThumbnail(ctx context.Context, sourceURL string, dur
 		}
 	}
 
-	frameIndex := int(timestamp / g.interval)
+	return []string{
+		"-nostats", "-hide_banner", "-loglevel", "warning",
+		"-ss", fmt.Sprintf("%.6f", timestamp),
+		"-i", sourceURL,
+		"-frames:v", "1",
+		"-vf", fmt.Sprintf("scale=%d:-2", config.Width),
+		"-q:v", "2",
+		"-f", "image2",
+		"pipe:1",
+	}
+}
 
-	thumbsPerSprite := g.cols * g.rows
-	spriteIdx := frameIndex / thumbsPerSprite
-	frameInSprite := frameIndex % thumbsPerSprite
+func (g *Generator) generateOnce(ctx context.Context, group *singleflight.Group, key string, ready func(context.Context) (bool, error), generate func(context.Context) error) error {
+	result := group.DoChan(key, func() (any, error) {
+		runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		return nil, g.coordinateGeneration(runCtx, key, ready, generate)
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case outcome := <-result:
+		return outcome.Err
+	}
+}
 
-	spriteData, err := g.storage.ReadSprite(ctx, sourceURL, spriteIdx)
+func (g *Generator) coordinateGeneration(ctx context.Context, key string, ready func(context.Context) (bool, error), generate func(context.Context) error) error {
+	if g.coordinator == nil {
+		isReady, err := ready(ctx)
+		if err != nil || isReady {
+			return err
+		}
+		return generate(ctx)
+	}
+	lockKey := "asset:" + key
+	token, err := g.coordinator.AcquireLock(ctx, lockKey, 11*time.Minute)
 	if err != nil {
-		return nil, fmt.Errorf("read sprite %d: %w", spriteIdx, err)
+		if !errors.Is(err, domain.ErrLockHeld) {
+			return fmt.Errorf("acquire asset lock: %w", err)
+		}
+		g.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: key})
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				isReady, readyErr := ready(ctx)
+				if readyErr != nil {
+					return readyErr
+				}
+				if isReady {
+					return nil
+				}
+			}
+		}
 	}
-
-	spriteImg, err := jpeg.Decode(bytes.NewReader(spriteData))
-	if err != nil {
-		return nil, fmt.Errorf("decode sprite %d: %w", spriteIdx, err)
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if releaseErr := g.coordinator.ReleaseLock(cleanup, lockKey, token); releaseErr != nil {
+			g.observe(cleanup, domain.Event{Type: domain.EventLockReleaseFailed, MediaKey: key, Error: releaseErr.Error()})
+		}
+	}()
+	isReady, err := ready(ctx)
+	if err != nil || isReady {
+		return err
 	}
+	return generate(ctx)
+}
 
-	row := frameInSprite / g.cols
-	col := frameInSprite % g.cols
-	x := col * g.thumbWidth
-	y := row * g.thumbHeight
-
-	rect := image.Rect(x, y, x+g.thumbWidth, y+g.thumbHeight)
-	frame := imaging.Crop(spriteImg, rect)
-
-	aspectRatio := float64(g.thumbHeight) / float64(g.thumbWidth)
-	targetHeight := int(float64(config.Width) * aspectRatio)
-	resized := imaging.Resize(frame, config.Width, targetHeight, imaging.Lanczos)
-
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 85}); err != nil {
-		return nil, fmt.Errorf("encode jpeg: %w", err)
+func (g *Generator) observe(ctx context.Context, event domain.Event) {
+	if g.observer == nil {
+		return
 	}
-
-	return buf.Bytes(), nil
+	if event.Time.IsZero() {
+		event.Time = time.Now()
+	}
+	g.observer.Observe(ctx, event)
 }

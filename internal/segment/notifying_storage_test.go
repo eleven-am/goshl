@@ -3,7 +3,6 @@ package segment
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -158,14 +157,23 @@ func TestNotifyingStoragePublishesErrorWhenStorageFails(t *testing.T) {
 	}
 }
 
-func TestNotifyingStorageReturnsErrorWhenPublishFails(t *testing.T) {
+func TestNotifyingStorageKeepsDurableSuccessWhenPublishFails(t *testing.T) {
 	storage := &stubStorage{}
 	pubsub := &stubPubSub{err: errors.New("pubsub err")}
-	n := NewNotifyingStorage(storage, pubsub)
+	var events []domain.Event
+	n := NewNotifyingStorage(storage, pubsub, domain.ObserverFunc(func(ctx context.Context, event domain.Event) {
+		events = append(events, event)
+	}))
 
 	err := n.WriteSegment(context.Background(), domain.SegmentData{}, nil)
-	if err == nil || !strings.Contains(err.Error(), "pubsub") {
-		t.Fatalf("expected publish error, got %v", err)
+	if err != nil {
+		t.Fatalf("durable write must remain successful: %v", err)
+	}
+	if len(pubsub.publishes) != 3 {
+		t.Fatalf("expected three notification attempts, got %d", len(pubsub.publishes))
+	}
+	if len(events) != 1 || events[0].Type != domain.EventSegmentNotifyFailed {
+		t.Fatalf("expected notification failure event, got %#v", events)
 	}
 }
 

@@ -76,7 +76,7 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 		"-muxdelay", "0",
 	)
 
-	args = append(args, "-map", fmt.Sprintf("0:V:%d", p.StreamIndex))
+	args = append(args, "-map", fmt.Sprintf("0:%d", p.StreamIndex))
 
 	args = append(args, b.videoEncodeArgs(p)...)
 
@@ -112,11 +112,17 @@ func (b *CommandBuilder) videoEncodeArgs(p VideoParams) []string {
 	}
 
 	segmentTimes := formatKeyframeTimes(p.Segments)
+	level := p.Rendition.Level
+	if level <= 0 {
+		level = outputLevel(p.Rendition.Height, p.Rendition.FrameRate)
+	}
 
-	args := b.HWAccel.EncodeFlags
+	args := append([]string(nil), b.HWAccel.EncodeFlags...)
 
 	args = append(args,
 		"-vf", fmt.Sprintf(b.HWAccel.ScaleFilter, p.Rendition.Width, p.Rendition.Height),
+		"-profile:v", "high",
+		"-level:v", fmt.Sprintf("%.1f", float64(level)/10),
 		"-b:v", fmt.Sprintf("%d", p.Rendition.Bitrate),
 		"-maxrate", fmt.Sprintf("%d", int(float64(p.Rendition.Bitrate)*1.5)),
 		"-bufsize", fmt.Sprintf("%d", p.Rendition.Bitrate*5),
@@ -128,6 +134,27 @@ func (b *CommandBuilder) videoEncodeArgs(p VideoParams) []string {
 	}
 
 	return args
+}
+
+func outputLevel(height int, frameRate float64) int {
+	switch {
+	case height >= 2160 && frameRate > 30:
+		return 52
+	case height >= 2160:
+		return 51
+	case height >= 1080 && frameRate > 30:
+		return 42
+	case height >= 1080:
+		return 40
+	case height >= 720 && frameRate > 30:
+		return 32
+	case height >= 720:
+		return 31
+	case height >= 480:
+		return 30
+	default:
+		return 21
+	}
 }
 
 func (b *CommandBuilder) Audio(p AudioParams) []string {
@@ -148,7 +175,7 @@ func (b *CommandBuilder) Audio(p AudioParams) []string {
 		"-muxdelay", "0",
 	}
 
-	args = append(args, "-map", fmt.Sprintf("0:a:%d", p.StreamIndex))
+	args = append(args, "-map", fmt.Sprintf("0:%d", p.StreamIndex))
 
 	args = append(args, b.audioEncodeArgs(p)...)
 
@@ -240,7 +267,7 @@ func (b *CommandBuilder) VideoStream(p VideoStreamParams) []string {
 		"-muxdelay", "0",
 	)
 
-	args = append(args, "-map", fmt.Sprintf("0:V:%d", p.StreamIndex))
+	args = append(args, "-map", fmt.Sprintf("0:%d", p.StreamIndex))
 
 	args = append(args, b.videoStreamEncodeArgs(p)...)
 
@@ -259,6 +286,7 @@ func (b *CommandBuilder) videoStreamEncodeArgs(p VideoStreamParams) []string {
 
 	args = append(args,
 		"-vf", fmt.Sprintf(b.HWAccel.ScaleFilter, p.Rendition.Width, p.Rendition.Height),
+		"-profile:v", "high",
 		"-b:v", fmt.Sprintf("%d", p.Rendition.Bitrate),
 		"-maxrate", fmt.Sprintf("%d", int(float64(p.Rendition.Bitrate)*1.5)),
 		"-bufsize", fmt.Sprintf("%d", p.Rendition.Bitrate*5),
@@ -290,7 +318,7 @@ func (b *CommandBuilder) AudioStream(p AudioStreamParams) []string {
 		"-muxdelay", "0",
 	}
 
-	args = append(args, "-map", fmt.Sprintf("0:a:%d", p.StreamIndex))
+	args = append(args, "-map", fmt.Sprintf("0:%d", p.StreamIndex))
 
 	args = append(args, b.audioStreamEncodeArgs(p)...)
 

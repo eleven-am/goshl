@@ -1,6 +1,7 @@
 package domain
 
 type Accelerator string
+type DecodeMode string
 
 const (
 	AccelNone         Accelerator = "none"
@@ -8,6 +9,8 @@ const (
 	AccelVideoToolbox Accelerator = "videotoolbox"
 	AccelVAAPI        Accelerator = "vaapi"
 	AccelQSV          Accelerator = "qsv"
+	DecodeSafe        DecodeMode  = "safe"
+	DecodeDevice      DecodeMode  = "device"
 )
 
 type HWAccelConfig struct {
@@ -20,4 +23,6 @@ type HWAccelConfig struct {
 	Encoder      string
 	KeyframeFlag string
 	ScaleFilter  string
+	DecodeMode   DecodeMode
+	DeviceFrames bool
 }

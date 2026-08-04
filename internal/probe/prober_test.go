@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -184,6 +185,111 @@ func TestProbe_UsesStreamBitRateBeforeBPSTag(t *testing.T) {
 	}
 }
 
+func TestProbe_NormalizesNonZeroStartTimeAndSelectsPlayableVideo(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := filepath.Join(tmpDir, "ffprobe")
+	if err := os.WriteFile(script, []byte(ffprobeNonZeroStartScript), 0755); err != nil {
+		t.Fatalf("failed to write fake ffprobe: %v", err)
+	}
+
+	originalPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", originalPath) })
+	if err := os.Setenv("PATH", tmpDir+string(os.PathListSeparator)+originalPath); err != nil {
+		t.Fatalf("failed to update PATH: %v", err)
+	}
+
+	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), "file:///input")
+	if err != nil {
+		t.Fatalf("probe returned error: %v", err)
+	}
+
+	if meta.StartTime != 1.466667 {
+		t.Fatalf("expected original start time, got %f", meta.StartTime)
+	}
+	if meta.Video.Index != 1 {
+		t.Fatalf("expected playable video stream index 1, got %d", meta.Video.Index)
+	}
+	if meta.Video.PixelFormat != "yuv420p" || meta.Video.Profile != "High" || meta.Video.Level != 40 {
+		t.Fatalf("missing compatibility metadata: %#v", meta.Video)
+	}
+	if meta.Video.Width != 1080 || meta.Video.Height != 1920 || meta.Video.Rotation != 90 {
+		t.Fatalf("expected display-oriented dimensions: %#v", meta.Video)
+	}
+	want := []float64{0, 2, 4}
+	if len(meta.Keyframes) != len(want) {
+		t.Fatalf("expected %d normalized keyframes, got %#v", len(want), meta.Keyframes)
+	}
+	for i := range want {
+		if meta.Keyframes[i] < want[i]-0.000001 || meta.Keyframes[i] > want[i]+0.000001 {
+			t.Fatalf("keyframe %d: expected %f, got %f", i, want[i], meta.Keyframes[i])
+		}
+	}
+}
+
+func TestProbe_NormalizesRealMPEGTSFixture(t *testing.T) {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe is unavailable")
+	}
+
+	output := filepath.Join(t.TempDir(), "nonzero.ts")
+	cmd := exec.Command(ffmpegPath,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25",
+		"-t", "4", "-c:v", "libx264", "-g", "25", "-keyint_min", "25", "-sc_threshold", "0",
+		"-f", "mpegts", output,
+	)
+	if data, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create fixture: %v: %s", err, data)
+	}
+
+	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), output)
+	if err != nil {
+		t.Fatalf("probe fixture: %v", err)
+	}
+	if meta.StartTime <= 0 {
+		t.Fatalf("fixture did not have a non-zero origin: %f", meta.StartTime)
+	}
+	if len(meta.Keyframes) == 0 || meta.Keyframes[0] < -0.001 || meta.Keyframes[0] > 0.001 {
+		t.Fatalf("keyframes were not normalized: %#v", meta.Keyframes)
+	}
+	for _, keyframe := range meta.Keyframes {
+		if keyframe < 0 || keyframe > meta.Duration {
+			t.Fatalf("keyframe outside playback timeline: %f of %f", keyframe, meta.Duration)
+		}
+	}
+}
+
+func TestValidateMetadataRejectsUnplayableInputs(t *testing.T) {
+	for _, metadata := range []*domain.Metadata{
+		nil,
+		{Duration: 0, Audios: []domain.AudioStream{{Codec: "aac"}}},
+		{Duration: 10},
+		{Duration: 10, Video: domain.VideoStream{Codec: "h264"}},
+	} {
+		if err := validateMetadata(metadata); err == nil {
+			t.Fatalf("expected invalid metadata rejection: %#v", metadata)
+		}
+	}
+	if err := validateMetadata(&domain.Metadata{Duration: 10, Audios: []domain.AudioStream{{Codec: "aac"}}}); err != nil {
+		t.Fatalf("audio-only media must remain playable: %v", err)
+	}
+}
+
+func TestDisplayDimensionsApplySampleAspectBeforeRotation(t *testing.T) {
+	width, height := displayDimensions(720, 576, "16:15", 0)
+	if width != 768 || height != 576 {
+		t.Fatalf("unexpected anamorphic dimensions %dx%d", width, height)
+	}
+	width, height = displayDimensions(720, 576, "16:15", -90)
+	if width != 576 || height != 768 {
+		t.Fatalf("unexpected rotated dimensions %dx%d", width, height)
+	}
+}
+
 const ffprobeScript = `#!/bin/sh
 if printf "%s" "$*" | grep -q "show_entries"; then
   cat <<'EOF'
@@ -214,6 +320,26 @@ fi
 if printf "%s" "$*" | grep -q "show_format"; then
   cat <<'EOF'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"r_frame_rate":"30/1","bit_rate":"4000000","tags":{"BPS":"6000000"}}],"format":{"duration":"12.5"}}
+EOF
+  exit 0
+fi
+
+exit 1
+`
+
+const ffprobeNonZeroStartScript = `#!/bin/sh
+if printf "%s" "$*" | grep -q "show_entries"; then
+  cat <<'EOF'
+1.466667,K
+3.466667,K
+5.466667,K
+EOF
+  exit 0
+fi
+
+if printf "%s" "$*" | grep -q "show_format"; then
+  cat <<'EOF'
+{"streams":[{"index":0,"codec_name":"mjpeg","codec_type":"video","width":600,"height":600,"disposition":{"attached_pic":1}},{"index":1,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"profile":"High","level":40,"pix_fmt":"yuv420p","r_frame_rate":"24/1","disposition":{"default":1},"side_data_list":[{"rotation":90}]}],"format":{"start_time":"1.466667","duration":"10.0"}}
 EOF
   exit 0
 fi

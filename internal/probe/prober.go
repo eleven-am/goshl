@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -20,12 +23,16 @@ func NewProber(storage domain.Storage) *Prober {
 }
 
 func (p *Prober) Probe(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
-	exists, err := p.storage.MetadataExists(ctx, sourceURL)
+	return p.ProbeWithKey(ctx, sourceURL, sourceURL)
+}
+
+func (p *Prober) ProbeWithKey(ctx context.Context, sourceURL, mediaKey string) (*domain.Metadata, error) {
+	exists, err := p.storage.MetadataExists(ctx, mediaKey)
 	if err != nil {
 		return nil, err
 	}
 	if exists {
-		data, err := p.storage.GetMetadata(ctx, sourceURL)
+		data, err := p.storage.GetMetadata(ctx, mediaKey)
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +53,7 @@ func (p *Prober) Probe(ctx context.Context, sourceURL string) (*domain.Metadata,
 		return nil, err
 	}
 
-	if err := p.storage.SetMetadata(ctx, sourceURL, data); err != nil {
+	if err := p.storage.SetMetadata(ctx, mediaKey, data); err != nil {
 		return nil, err
 	}
 
@@ -58,14 +65,34 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 	if err != nil {
 		return nil, err
 	}
-
-	keyframes, err := p.probeKeyframes(ctx, url)
-	if err != nil {
+	if err := validateMetadata(streams); err != nil {
 		return nil, err
 	}
 
-	streams.Keyframes = keyframes
+	var keyframes []float64
+	if streams.Video.Codec != "" {
+		keyframes, err = p.probeKeyframes(ctx, url, streams.Video.Index)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	streams.Keyframes = normalizeKeyframes(keyframes, streams.StartTime, streams.Duration)
+	streams.Video.StartsWithKeyframe = len(streams.Keyframes) > 0 && math.Abs(streams.Keyframes[0]) < 0.000001
 	return streams, nil
+}
+
+func validateMetadata(metadata *domain.Metadata) error {
+	if metadata == nil || metadata.Duration <= 0 || math.IsNaN(metadata.Duration) || math.IsInf(metadata.Duration, 0) {
+		return fmt.Errorf("media has no finite positive duration")
+	}
+	if metadata.Video.Codec == "" && len(metadata.Audios) == 0 {
+		return fmt.Errorf("media has no playable audio or video stream")
+	}
+	if metadata.Video.Codec != "" && (metadata.Video.Width <= 0 || metadata.Video.Height <= 0) {
+		return fmt.Errorf("video stream has invalid dimensions")
+	}
+	return nil
 }
 
 type ffprobeOutput struct {
@@ -79,19 +106,37 @@ type ffprobeStream struct {
 	CodecType   string            `json:"codec_type"`
 	Width       int               `json:"width"`
 	Height      int               `json:"height"`
+	Profile     string            `json:"profile"`
+	Level       int               `json:"level"`
+	PixelFormat string            `json:"pix_fmt"`
+	BitDepth    string            `json:"bits_per_raw_sample"`
 	RFrameRate  string            `json:"r_frame_rate"`
 	Channels    int               `json:"channels"`
+	Layout      string            `json:"channel_layout"`
 	BitRate     string            `json:"bit_rate"`
+	ColorRange  string            `json:"color_range"`
+	ColorSpace  string            `json:"color_space"`
+	ColorTRC    string            `json:"color_transfer"`
+	ColorPrim   string            `json:"color_primaries"`
+	SAR         string            `json:"sample_aspect_ratio"`
 	Tags        map[string]string `json:"tags"`
 	Disposition ffprobeDisp       `json:"disposition"`
+	SideData    []ffprobeSideData `json:"side_data_list"`
 }
 
 type ffprobeFormat struct {
-	Duration string `json:"duration"`
+	StartTime string `json:"start_time"`
+	Duration  string `json:"duration"`
 }
 
 type ffprobeDisp struct {
-	Forced int `json:"forced"`
+	Forced      int `json:"forced"`
+	Default     int `json:"default"`
+	AttachedPic int `json:"attached_pic"`
+}
+
+type ffprobeSideData struct {
+	Rotation int `json:"rotation"`
 }
 
 func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata, error) {
@@ -113,37 +158,60 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 
 	metadata := &domain.Metadata{}
 
+	if start, err := strconv.ParseFloat(ff.Format.StartTime, 64); err == nil {
+		metadata.StartTime = start
+	}
 	if dur, err := strconv.ParseFloat(ff.Format.Duration, 64); err == nil {
 		metadata.Duration = dur
 	}
 
+	videoIndex := selectVideoStream(ff.Streams)
 	for _, s := range ff.Streams {
 		switch s.CodecType {
 		case "video":
-			if metadata.Video.Index == 0 && metadata.Video.Codec == "" {
+			if s.Index == videoIndex {
+				rotation := parseRotation(s.Tags, s.SideData)
+				width, height := displayDimensions(s.Width, s.Height, s.SAR, rotation)
 				metadata.Video = domain.VideoStream{
-					Index:     s.Index,
-					Codec:     s.CodecName,
-					Width:     s.Width,
-					Height:    s.Height,
-					Bitrate:   parseBitrate(firstNonEmpty(s.BitRate, s.Tags["BPS"])),
-					FrameRate: parseFrameRate(s.RFrameRate),
+					Index:          s.Index,
+					Codec:          s.CodecName,
+					Profile:        s.Profile,
+					Level:          s.Level,
+					PixelFormat:    s.PixelFormat,
+					BitDepth:       parseBitDepth(s.BitDepth, s.PixelFormat),
+					Width:          width,
+					Height:         height,
+					Bitrate:        parseBitrate(firstNonEmpty(s.BitRate, s.Tags["BPS"])),
+					FrameRate:      parseFrameRate(s.RFrameRate),
+					ColorRange:     s.ColorRange,
+					ColorSpace:     s.ColorSpace,
+					ColorTransfer:  s.ColorTRC,
+					ColorPrimaries: s.ColorPrim,
+					SampleAspect:   s.SAR,
+					Rotation:       rotation,
+					Default:        s.Disposition.Default == 1,
 				}
 			}
 		case "audio":
 			metadata.Audios = append(metadata.Audios, domain.AudioStream{
-				Index:    s.Index,
-				Codec:    s.CodecName,
-				Language: s.Tags["language"],
-				Channels: s.Channels,
-				Bitrate:  parseBitrate(s.BitRate),
+				Index:         s.Index,
+				Codec:         s.CodecName,
+				Language:      s.Tags["language"],
+				Title:         s.Tags["title"],
+				Channels:      s.Channels,
+				ChannelLayout: s.Layout,
+				Bitrate:       parseBitrate(s.BitRate),
+				Default:       s.Disposition.Default == 1,
 			})
 		case "subtitle":
 			metadata.Subtitles = append(metadata.Subtitles, domain.SubtitleStream{
 				Index:    s.Index,
+				ID:       fmt.Sprintf("subtitle-%d", s.Index),
 				Codec:    s.CodecName,
 				Language: s.Tags["language"],
+				Title:    s.Tags["title"],
 				Forced:   s.Disposition.Forced == 1,
+				Default:  s.Disposition.Default == 1,
 			})
 		}
 	}
@@ -151,20 +219,21 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 	return metadata, nil
 }
 
-func (p *Prober) probeKeyframes(ctx context.Context, url string) ([]float64, error) {
-	output, err := mediaexec.Output(ctx, "ffprobe",
+func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int) ([]float64, error) {
+	args := []string{
 		"-v", "error",
-		"-select_streams", "v:0",
+		"-select_streams", strconv.Itoa(streamIndex),
 		"-show_entries", "packet=pts_time,flags",
 		"-of", "csv=p=0",
 		url,
-	)
+	}
+	cmd, output, stderr, err := mediaexec.StartOutput(ctx, "ffprobe", args...)
 	if err != nil {
 		return nil, err
 	}
 
 	var keyframes []float64
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	scanner := bufio.NewScanner(output)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -183,10 +252,103 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string) ([]float64, err
 	}
 
 	if err := scanner.Err(); err != nil {
+		_ = cmd.Wait()
 		return nil, err
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, mediaexec.Error("ffprobe", args, stderr.String(), err)
 	}
 
 	return keyframes, nil
+}
+
+func selectVideoStream(streams []ffprobeStream) int {
+	selected := -1
+	for _, stream := range streams {
+		if stream.CodecType != "video" || stream.Disposition.AttachedPic == 1 {
+			continue
+		}
+		if selected == -1 || stream.Disposition.Default == 1 {
+			selected = stream.Index
+		}
+		if stream.Disposition.Default == 1 {
+			break
+		}
+	}
+	return selected
+}
+
+func normalizeKeyframes(keyframes []float64, startTime, duration float64) []float64 {
+	normalized := make([]float64, 0, len(keyframes))
+	for _, keyframe := range keyframes {
+		value := keyframe - startTime
+		if math.Abs(value) < 0.000001 {
+			value = 0
+		}
+		if value < 0 || value > duration+0.000001 || math.IsNaN(value) || math.IsInf(value, 0) {
+			continue
+		}
+		normalized = append(normalized, value)
+	}
+	sort.Float64s(normalized)
+	result := normalized[:0]
+	for _, value := range normalized {
+		if len(result) == 0 || math.Abs(result[len(result)-1]-value) > 0.000001 {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func parseBitDepth(raw, pixelFormat string) int {
+	if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+		return value
+	}
+	for _, depth := range []int{16, 14, 12, 10, 9} {
+		if strings.Contains(pixelFormat, strconv.Itoa(depth)) {
+			return depth
+		}
+	}
+	if pixelFormat != "" {
+		return 8
+	}
+	return 0
+}
+
+func parseRotation(tags map[string]string, sideData []ffprobeSideData) int {
+	for _, data := range sideData {
+		if data.Rotation != 0 {
+			return normalizedRotation(data.Rotation)
+		}
+	}
+	value, _ := strconv.Atoi(tags["rotate"])
+	return normalizedRotation(value)
+}
+
+func normalizedRotation(rotation int) int {
+	rotation %= 360
+	if rotation < 0 {
+		rotation += 360
+	}
+	return rotation
+}
+
+func displayDimensions(width, height int, sampleAspect string, rotation int) (int, int) {
+	parts := strings.Split(sampleAspect, ":")
+	if len(parts) == 2 {
+		numerator, numeratorErr := strconv.ParseFloat(parts[0], 64)
+		denominator, denominatorErr := strconv.ParseFloat(parts[1], 64)
+		if numeratorErr == nil && denominatorErr == nil && numerator > 0 && denominator > 0 {
+			width = int(math.Round(float64(width) * numerator / denominator))
+			if width%2 != 0 {
+				width++
+			}
+		}
+	}
+	if normalizedRotation(rotation)%180 != 0 {
+		return height, width
+	}
+	return width, height
 }
 
 func firstNonEmpty(values ...string) string {

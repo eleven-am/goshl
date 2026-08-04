@@ -55,6 +55,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
@@ -114,8 +115,30 @@ type (
 	// SubtitleStream contains subtitle stream information.
 	SubtitleStream = domain.SubtitleStream
 
+	Segment = domain.Segment
+
+	VideoRendition = domain.VideoRendition
+
+	AudioRendition = domain.AudioRendition
+
+	PlaybackMethod = domain.PlaybackMethod
+
 	// Accelerator identifies a hardware acceleration backend.
 	Accelerator = domain.Accelerator
+
+	HWAccelConfig = domain.HWAccelConfig
+
+	SegmentState = domain.SegmentState
+
+	Observer = domain.Observer
+
+	ObserverFunc = domain.ObserverFunc
+
+	Event = domain.Event
+
+	EventType = domain.EventType
+
+	DecodeMode = domain.DecodeMode
 )
 
 const (
@@ -124,6 +147,8 @@ const (
 
 	// StreamAudio represents an audio stream.
 	StreamAudio = domain.StreamAudio
+
+	StreamSubtitle = domain.StreamSubtitle
 
 	// AccelNone disables hardware acceleration and uses software encoding.
 	AccelNone = domain.AccelNone
@@ -139,6 +164,54 @@ const (
 
 	// AccelQSV selects Intel Quick Sync Video acceleration.
 	AccelQSV = domain.AccelQSV
+
+	SegmentStateReady = domain.SegmentStateReady
+
+	SegmentStateError = domain.SegmentStateError
+
+	DecodeSafe = domain.DecodeSafe
+
+	DecodeDevice = domain.DecodeDevice
+
+	DirectPlay = domain.DirectPlay
+
+	DirectStream = domain.DirectStream
+
+	Transcode = domain.Transcode
+
+	EventMetadataCacheHit = domain.EventMetadataCacheHit
+
+	EventMetadataCacheMiss = domain.EventMetadataCacheMiss
+
+	EventMetadataProbed = domain.EventMetadataProbed
+
+	EventSegmentCacheHit = domain.EventSegmentCacheHit
+
+	EventSegmentCacheMiss = domain.EventSegmentCacheMiss
+
+	EventLockWait = domain.EventLockWait
+
+	EventJobEnqueued = domain.EventJobEnqueued
+
+	EventJobStarted = domain.EventJobStarted
+
+	EventJobCompleted = domain.EventJobCompleted
+
+	EventJobFailed = domain.EventJobFailed
+
+	EventJobAckFailed = domain.EventJobAckFailed
+
+	EventSegmentReady = domain.EventSegmentReady
+
+	EventSegmentFailed = domain.EventSegmentFailed
+
+	EventSegmentNotifyFailed = domain.EventSegmentNotifyFailed
+
+	EventHardwareSelected = domain.EventHardwareSelected
+
+	EventHardwareFallback = domain.EventHardwareFallback
+
+	EventLockReleaseFailed = domain.EventLockReleaseFailed
 )
 
 var (
@@ -195,6 +268,18 @@ type Options struct {
 	// DefaultThumbnailConfig sets default parameters for thumbnail generation.
 	// Defaults: Position=0.1 (10% into video), Width=480.
 	DefaultThumbnailConfig ThumbnailConfig
+
+	JobTimeout time.Duration
+
+	CacheVersion string
+
+	SourceRevision SourceRevisionResolver
+
+	Observer Observer
+
+	HWAccelDecodeMode DecodeMode
+
+	AllowHardwareFallback bool
 }
 
 func (o *Options) setDefaults() {
@@ -212,6 +297,12 @@ func (o *Options) setDefaults() {
 	}
 	if o.AudioPoolSize == 0 {
 		o.AudioPoolSize = 4
+	}
+	if o.JobTimeout == 0 {
+		o.JobTimeout = 2 * time.Minute
+	}
+	if o.HWAccelDecodeMode == "" {
+		o.HWAccelDecodeMode = domain.DecodeSafe
 	}
 	if o.DefaultPreviewConfig.MaxFrames == 0 {
 		o.DefaultPreviewConfig.MaxFrames = 40
@@ -231,15 +322,64 @@ func (o *Options) setDefaults() {
 }
 
 func (o *Options) validate() {
+	if err := o.validateError(); err != nil {
+		panic(err)
+	}
+}
+
+func (o *Options) validateError() error {
 	if o.Storage == nil {
-		panic("service: Storage is required")
+		return fmt.Errorf("%w: Storage is required", ErrInvalidOptions)
 	}
 	if o.Coordinator == nil {
-		panic("service: Coordinator is required")
+		return fmt.Errorf("%w: Coordinator is required", ErrInvalidOptions)
 	}
 	if o.PathGen == nil {
-		panic("service: PathGen is required")
+		return fmt.Errorf("%w: PathGen is required", ErrInvalidOptions)
 	}
+	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
+		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
+	}
+	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 {
+		return fmt.Errorf("%w: pool and batch sizes must be positive", ErrInvalidOptions)
+	}
+	if o.DefaultPreviewConfig.MaxFrames < 0 || o.DefaultPreviewConfig.Frameduration < 0 || o.DefaultPreviewConfig.Width < 0 || o.DefaultThumbnailConfig.Position < 0 || o.DefaultThumbnailConfig.Position > 1 || math.IsNaN(o.DefaultThumbnailConfig.Position) || math.IsInf(o.DefaultThumbnailConfig.Position, 0) || o.DefaultThumbnailConfig.Width < 0 {
+		return fmt.Errorf("%w: generated asset configuration is invalid", ErrInvalidOptions)
+	}
+	if o.HWAccelDecodeMode != "" && o.HWAccelDecodeMode != domain.DecodeSafe && o.HWAccelDecodeMode != domain.DecodeDevice {
+		return fmt.Errorf("%w: unsupported hardware decode mode %q", ErrInvalidOptions, o.HWAccelDecodeMode)
+	}
+	return nil
+}
+
+func (o *Options) validateResolvedError() error {
+	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.TargetDuration <= 0 {
+		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
+	}
+	if o.SegmentsPerJob <= 0 || o.VideoPoolSize <= 0 || o.AudioPoolSize <= 0 {
+		return fmt.Errorf("%w: pool and batch sizes must be positive", ErrInvalidOptions)
+	}
+	if err := validatePreviewConfig(o.DefaultPreviewConfig); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidOptions, err)
+	}
+	if err := validateThumbnailConfig(o.DefaultThumbnailConfig); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidOptions, err)
+	}
+	return nil
+}
+
+func validatePreviewConfig(config domain.PreviewConfig) error {
+	if config.MaxFrames <= 0 || config.MaxFrames > 1000 || config.Frameduration <= 0 || config.Frameduration > 60_000 || config.Width <= 0 || config.Width > 4096 {
+		return ErrInvalidPreviewConfig
+	}
+	return nil
+}
+
+func validateThumbnailConfig(config domain.ThumbnailConfig) error {
+	if config.Position < 0 || config.Position > 1 || math.IsNaN(config.Position) || math.IsInf(config.Position, 0) || config.Width <= 0 || config.Width > 8192 {
+		return ErrInvalidThumbnailConfig
+	}
+	return nil
 }
 
 // Controller is the main entry point for HLS transcoding operations.
@@ -248,13 +388,14 @@ func (o *Options) validate() {
 // A Controller must be started with Start before processing requests,
 // and stopped with Stop when shutting down to ensure clean worker termination.
 type Controller struct {
-	opts      Options
-	playlist  *playlist.Generator
-	videoPool *transcode.Pool
-	audioPool *transcode.Pool
-	prober    *probe.Prober
-	miscGen   *misc.Generator
-	hwConfig  *domain.HWAccelConfig
+	opts            Options
+	playlist        *playlist.Generator
+	videoPool       *transcode.Pool
+	audioPool       *transcode.Pool
+	prober          *probe.Prober
+	miscGen         *misc.Generator
+	hwConfig        *domain.HWAccelConfig
+	pipelineVersion string
 }
 
 // NewController creates a new Controller with the given options.
@@ -263,24 +404,51 @@ type Controller struct {
 // The controller is not started automatically; call Start to begin
 // processing transcoding jobs.
 func NewController(opts Options) *Controller {
-	opts.validate()
+	controller, err := NewControllerWithContext(context.Background(), opts)
+	if err != nil {
+		panic(err)
+	}
+	return controller
+}
+
+func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, error) {
+	if err := opts.validateError(); err != nil {
+		return nil, err
+	}
 	opts.setDefaults()
+	if err := opts.validateResolvedError(); err != nil {
+		return nil, err
+	}
 
 	var hwConfig *domain.HWAccelConfig
 	if opts.HWAccelMode != "" {
 		var err error
-		hwConfig, err = hwaccel.RequireConfig(opts.HWAccelMode)
+		hwConfig, err = hwaccel.RequireConfigWithMode(opts.HWAccelMode, opts.HWAccelDecodeMode)
 		if err != nil {
-			panic(err)
+			return nil, err
+		}
+		if opts.HWAccelMode != domain.AccelNone {
+			validateCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			validationErr := hwaccel.Validate(validateCtx, hwConfig)
+			cancel()
+			if validationErr != nil {
+				if !opts.AllowHardwareFallback {
+					return nil, fmt.Errorf("hardware pipeline validation failed: %w", validationErr)
+				}
+				hwConfig = hwaccel.NewConfig(domain.AccelNone)
+				hwConfig.Requested = opts.HWAccelMode
+				hwConfig.Error = validationErr.Error()
+			}
 		}
 	} else if opts.HWAccel {
-		hwConfig = hwaccel.DetectBest()
+		hwConfig = hwaccel.DetectBestContext(ctx)
 	} else {
 		hwConfig = hwaccel.NewConfig(domain.AccelNone)
 	}
 	cmdBuilder := ffmpeg.NewCommandBuilder(hwConfig)
+	pipeline := pipelineVersion(opts, hwConfig)
 
-	notifyingStorage := segment.NewNotifyingStorage(opts.Storage, opts.Coordinator)
+	notifyingStorage := segment.NewNotifyingStorage(opts.Storage, opts.Coordinator, opts.Observer)
 
 	videoPool := transcode.NewPool(
 		opts.Coordinator,
@@ -290,6 +458,7 @@ func NewController(opts Options) *Controller {
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
 	)
 
 	audioPool := transcode.NewPool(
@@ -300,17 +469,24 @@ func NewController(opts Options) *Controller {
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
 	)
 
-	return &Controller{
-		opts:      opts,
-		playlist:  playlist.NewGenerator(opts.PathGen),
-		videoPool: videoPool,
-		audioPool: audioPool,
-		prober:    probe.NewProber(opts.Storage),
-		miscGen:   misc.NewGenerator(opts.Storage, hwConfig),
-		hwConfig:  hwConfig,
+	controller := &Controller{
+		opts:            opts,
+		playlist:        playlist.NewGenerator(opts.PathGen),
+		videoPool:       videoPool,
+		audioPool:       audioPool,
+		prober:          probe.NewProber(opts.Storage),
+		miscGen:         misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer),
+		hwConfig:        hwConfig,
+		pipelineVersion: pipeline,
 	}
+	controller.observe(ctx, domain.Event{Type: domain.EventHardwareSelected, Accelerator: hwConfig.Accelerator})
+	if hwConfig.Error != "" && hwConfig.Requested != hwConfig.Accelerator {
+		controller.observe(ctx, domain.Event{Type: domain.EventHardwareFallback, Accelerator: hwConfig.Accelerator, Error: hwConfig.Error})
+	}
+	return controller, nil
 }
 
 // HWAccelConfig returns the hardware acceleration configuration selected by the controller.
@@ -318,7 +494,21 @@ func (c *Controller) HWAccelConfig() domain.HWAccelConfig {
 	if c.hwConfig == nil {
 		return *hwaccel.NewConfig(domain.AccelNone)
 	}
-	return *c.hwConfig
+	config := *c.hwConfig
+	config.Available = append([]domain.Accelerator(nil), c.hwConfig.Available...)
+	config.DecodeFlags = append([]string(nil), c.hwConfig.DecodeFlags...)
+	config.EncodeFlags = append([]string(nil), c.hwConfig.EncodeFlags...)
+	return config
+}
+
+func (c *Controller) observe(ctx context.Context, event domain.Event) {
+	if c.opts.Observer == nil {
+		return
+	}
+	if event.Time.IsZero() {
+		event.Time = time.Now()
+	}
+	c.opts.Observer.Observe(ctx, event)
 }
 
 // Start initializes the video and audio transcoding worker pools.
@@ -355,7 +545,7 @@ func (c *Controller) Stop() {
 //
 // The returned string is a complete M3U8 playlist ready to serve to clients.
 func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (string, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
+	meta, _, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return "", fmt.Errorf("get metadata: %w", err)
 	}
@@ -363,7 +553,20 @@ func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (stri
 	videos := rendition.GenerateVideo(meta.Video)
 	audios := rendition.GenerateAudioTracks(meta.Audios)
 
-	return c.playlist.Master(sourceURL, videos, audios), nil
+	return c.playlist.Master(sourceURL, videos, audios, meta.Subtitles), nil
+}
+
+func (c *Controller) SubtitlePlaylist(ctx context.Context, sourceURL, trackID string) (string, error) {
+	meta, err := c.getMetadata(ctx, sourceURL)
+	if err != nil {
+		return "", fmt.Errorf("get metadata: %w", err)
+	}
+	for _, subtitle := range meta.Subtitles {
+		if subtitle.ID == trackID {
+			return c.playlist.Subtitle(sourceURL, trackID, meta.Duration), nil
+		}
+	}
+	return "", fmt.Errorf("subtitle track %s not found", trackID)
 }
 
 // VariantPlaylist returns the HLS media playlist for a specific rendition.
@@ -376,12 +579,18 @@ func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (stri
 // The playlist contains segment references with durations calculated from
 // the source keyframe positions. Segment URLs are generated via PathGenerator.
 func (c *Controller) VariantPlaylist(ctx context.Context, sourceURL string, streamType StreamType, renditionName string) (string, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
+	meta, _, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return "", fmt.Errorf("get metadata: %w", err)
 	}
 
 	segments := playlist.CalculateSegments(meta.Keyframes, meta.Duration, c.opts.TargetDuration)
+	if _, _, err := resolveRendition(meta, streamType, renditionName); err != nil {
+		return "", err
+	}
+	if len(segments) == 0 {
+		return "", fmt.Errorf("%w: source has no playable segments", ErrSegmentOutOfRange)
+	}
 
 	return c.playlist.Variant(sourceURL, renditionName, streamType, segments), nil
 }
@@ -405,8 +614,18 @@ func (c *Controller) VariantPlaylist(ctx context.Context, sourceURL string, stre
 // Returns the raw MPEG-TS segment data, or an error if transcoding fails
 // or times out.
 func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType StreamType, renditionName string, index int) ([]byte, error) {
+	if streamType != domain.StreamVideo && streamType != domain.StreamAudio {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidStreamType, streamType)
+	}
+	if index < 0 {
+		return nil, fmt.Errorf("%w: %d", ErrSegmentOutOfRange, index)
+	}
+	mediaKey, err := c.resolveMediaKey(ctx, sourceURL)
+	if err != nil {
+		return nil, err
+	}
 	info := domain.SegmentData{
-		SourceURL: sourceURL,
+		MediaKey:  mediaKey,
 		Index:     index,
 		Rendition: renditionName,
 		IsVideo:   streamType == domain.StreamVideo,
@@ -418,11 +637,31 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 	}
 
 	if exists {
+		c.observe(ctx, domain.Event{Type: domain.EventSegmentCacheHit, MediaKey: mediaKey, StreamType: streamType, Rendition: renditionName, Index: index})
 		return c.opts.Storage.ReadSegment(ctx, info)
 	}
+	c.observe(ctx, domain.Event{Type: domain.EventSegmentCacheMiss, MediaKey: mediaKey, StreamType: streamType, Rendition: renditionName, Index: index})
 
-	lockKey := fmt.Sprintf("segment:%s:%s:%d", sourceURL, renditionName, index)
-	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.SegmentTimeout+time.Minute)
+	meta, err := c.getMetadataWithKey(ctx, sourceURL, mediaKey)
+	if err != nil {
+		return nil, fmt.Errorf("get metadata: %w", err)
+	}
+	videoRendition, audioRendition, err := resolveRendition(meta, streamType, renditionName)
+	if err != nil {
+		return nil, err
+	}
+	allSegments := playlist.CalculateSegments(meta.Keyframes, meta.Duration, c.opts.TargetDuration)
+	if index >= len(allSegments) {
+		return nil, fmt.Errorf("%w: %d", ErrSegmentOutOfRange, index)
+	}
+	startIdx := (index / c.opts.SegmentsPerJob) * c.opts.SegmentsPerJob
+	endIdx := startIdx + c.opts.SegmentsPerJob - 1
+	if endIdx >= len(allSegments) {
+		endIdx = len(allSegments) - 1
+	}
+	jobID := deterministicJobID(mediaKey, renditionName, streamType, startIdx, endIdx)
+	lockKey := "job:" + jobID
+	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.JobTimeout+time.Minute)
 
 	if lockErr != nil {
 		if !errors.Is(lockErr, domain.ErrLockHeld) {
@@ -432,9 +671,23 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		if err != nil {
 			return nil, fmt.Errorf("wait segment: %w", err)
 		}
+		c.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: mediaKey, JobID: jobID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
+		if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+			return data, err
+		}
 		return c.waitForSegment(ctx, info, statusCh)
 	}
-	defer c.opts.Coordinator.ReleaseLock(ctx, lockKey, token)
+	releaseLock := true
+	defer func() {
+		if !releaseLock {
+			return
+		}
+		cleanup, cancel := cleanupContext()
+		defer cancel()
+		if err := c.opts.Coordinator.ReleaseLock(cleanup, lockKey, token); err != nil {
+			c.observe(cleanup, domain.Event{Type: domain.EventLockReleaseFailed, MediaKey: mediaKey, JobID: jobID, Error: err.Error()})
+		}
+	}()
 
 	exists, err = c.opts.Storage.SegmentExists(ctx, info)
 	if err != nil {
@@ -449,24 +702,118 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		return nil, fmt.Errorf("wait segment: %w", err)
 	}
 
-	if err := c.enqueueSegment(ctx, sourceURL, streamType, renditionName, index); err != nil {
+	job := c.buildJob(sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition)
+	if err := c.opts.Coordinator.Enqueue(ctx, job); err != nil {
 		return nil, fmt.Errorf("enqueue: %w", err)
 	}
+	c.observe(ctx, domain.Event{Type: domain.EventJobEnqueued, MediaKey: mediaKey, JobID: job.ID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
 
-	return c.waitForSegment(ctx, info, statusCh)
+	data, err := c.waitForSegment(ctx, info, statusCh)
+	if errors.Is(err, ErrSegmentTimeout) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		releaseLock = false
+	}
+	return data, err
 }
 
 func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus) ([]byte, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(c.opts.SegmentTimeout):
-		return nil, fmt.Errorf("timeout waiting for segment %d", info.Index)
-	case status := <-statusCh:
-		if status.State == domain.SegmentStateError {
-			return nil, fmt.Errorf("segment error: %s", status.Error)
+	timer := time.NewTimer(c.opts.SegmentTimeout)
+	defer timer.Stop()
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+				return data, err
+			}
+			return nil, fmt.Errorf("%w: segment %d", ErrSegmentTimeout, info.Index)
+		case <-poll.C:
+			if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+				return data, err
+			}
+		case status, ok := <-statusCh:
+			if !ok {
+				if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+					return data, err
+				}
+				statusCh = nil
+				continue
+			}
+			if status.State == domain.SegmentStateError {
+				c.observe(ctx, domain.Event{Type: domain.EventSegmentFailed, MediaKey: info.MediaKey, Rendition: info.Rendition, Index: info.Index, Error: status.Error})
+				return nil, fmt.Errorf("segment error: %s", status.Error)
+			}
+			data, err := c.opts.Storage.ReadSegment(ctx, info)
+			if err == nil {
+				c.observe(ctx, domain.Event{Type: domain.EventSegmentReady, MediaKey: info.MediaKey, Rendition: info.Rendition, Index: info.Index, Bytes: int64(len(data))})
+			}
+			return data, err
 		}
-		return c.opts.Storage.ReadSegment(ctx, info)
+	}
+}
+
+func (c *Controller) readStoredSegment(ctx context.Context, info domain.SegmentData) ([]byte, bool, error) {
+	exists, err := c.opts.Storage.SegmentExists(ctx, info)
+	if err != nil || !exists {
+		return nil, false, err
+	}
+	data, err := c.opts.Storage.ReadSegment(ctx, info)
+	return data, true, err
+}
+
+func resolveRendition(meta *domain.Metadata, streamType domain.StreamType, name string) (*domain.VideoRendition, *domain.AudioRendition, error) {
+	switch streamType {
+	case domain.StreamVideo:
+		for _, candidate := range rendition.GenerateVideo(meta.Video) {
+			if candidate.Name == name {
+				value := candidate
+				return &value, nil, nil
+			}
+		}
+	case domain.StreamAudio:
+		for _, candidate := range rendition.GenerateAudioTracks(meta.Audios) {
+			if candidate.Name == name {
+				value := candidate
+				return nil, &value, nil
+			}
+		}
+	default:
+		return nil, nil, fmt.Errorf("%w: %q", ErrInvalidStreamType, streamType)
+	}
+	return nil, nil, fmt.Errorf("%w: %s", ErrRenditionNotFound, name)
+}
+
+func (c *Controller) buildJob(sourceURL, mediaKey string, streamType domain.StreamType, renditionName string, index, startIdx, endIdx int, allSegments []domain.Segment, video *domain.VideoRendition, audio *domain.AudioRendition) domain.Job {
+	segments := append([]domain.Segment(nil), allSegments[startIdx:endIdx+1]...)
+	expected := make([]int, len(segments))
+	for i, segment := range segments {
+		expected[i] = segment.Index
+	}
+	var overlap *domain.Segment
+	if streamType == domain.StreamVideo && video != nil && video.Method == domain.DirectStream && startIdx > 0 {
+		value := allSegments[startIdx-1]
+		overlap = &value
+	}
+	now := time.Now()
+	return domain.Job{
+		ID:              deterministicJobID(mediaKey, renditionName, streamType, startIdx, endIdx),
+		MediaKey:        mediaKey,
+		Profile:         c.pipelineVersion,
+		SourceURL:       sourceURL,
+		Rendition:       renditionName,
+		StreamType:      streamType,
+		StartIndex:      startIdx,
+		EndIndex:        endIdx,
+		RequestedIndex:  index,
+		EnqueuedAt:      now,
+		Deadline:        now.Add(c.opts.JobTimeout),
+		Segments:        segments,
+		Overlap:         overlap,
+		ExpectedIndices: expected,
+		VideoRendition:  video,
+		AudioRendition:  audio,
 	}
 }
 
@@ -478,12 +825,13 @@ func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData
 //
 // Sprite sheets and VTT data are generated on first request and cached.
 func (c *Controller) SpriteVTT(ctx context.Context, sourceURL string) ([]byte, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
+	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
-	return c.miscGen.GetSpriteVTT(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL))
+	spriteKey := assetIdentity(mediaKey, "sprites", "160x90:5:10x10")
+	return c.miscGen.GetSpriteVTT(ctx, sourceURL, spriteKey, meta.Duration, c.spriteURL(sourceURL))
 }
 
 // Sprite returns a sprite sheet image containing multiple video thumbnails.
@@ -494,12 +842,16 @@ func (c *Controller) SpriteVTT(ctx context.Context, sourceURL string) ([]byte, e
 //
 // Returns JPEG image data.
 func (c *Controller) Sprite(ctx context.Context, sourceURL string, index int) ([]byte, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
+	if index < 0 {
+		return nil, fmt.Errorf("sprite index out of range: %d", index)
+	}
+	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
-	return c.miscGen.GetSprite(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL), index)
+	spriteKey := assetIdentity(mediaKey, "sprites", "160x90:5:10x10")
+	return c.miscGen.GetSprite(ctx, sourceURL, spriteKey, meta.Duration, c.spriteURL(sourceURL), index)
 }
 
 // SubtitleVTT extracts and returns subtitles in WebVTT format.
@@ -508,24 +860,25 @@ func (c *Controller) Sprite(ctx context.Context, sourceURL string, index int) ([
 // If the requested language is not found in the source media, an error is returned.
 //
 // Subtitles are extracted from the source on first request and cached.
-func (c *Controller) SubtitleVTT(ctx context.Context, sourceURL string, lang string) ([]byte, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
+func (c *Controller) SubtitleVTT(ctx context.Context, sourceURL string, trackID string) ([]byte, error) {
+	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
 	streamIndex := -1
-	for i, sub := range meta.Subtitles {
-		if sub.Language == lang {
-			streamIndex = i
+	for _, sub := range meta.Subtitles {
+		if sub.ID == trackID {
+			streamIndex = sub.Index
 			break
 		}
 	}
 	if streamIndex == -1 {
-		return nil, fmt.Errorf("subtitle language %s not found", lang)
+		return nil, fmt.Errorf("subtitle track %s not found", trackID)
 	}
 
-	return c.miscGen.GetSubtitles(ctx, sourceURL, streamIndex, lang)
+	subtitleKey := assetIdentity(mediaKey, "subtitle", trackID)
+	return c.miscGen.GetSubtitles(ctx, sourceURL, subtitleKey, streamIndex, trackID)
 }
 
 // Preview returns an animated GIF preview of the video.
@@ -539,13 +892,11 @@ func (c *Controller) SubtitleVTT(ctx context.Context, sourceURL string, lang str
 //
 // Returns GIF image data.
 func (c *Controller) Preview(ctx context.Context, sourceURL string, config *PreviewConfig) ([]byte, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
-	if err != nil {
-		return nil, fmt.Errorf("get metadata: %w", err)
-	}
-
 	cfg := c.opts.DefaultPreviewConfig
 	if config != nil {
+		if config.MaxFrames < 0 || config.Frameduration < 0 || config.Width < 0 {
+			return nil, ErrInvalidPreviewConfig
+		}
 		if config.MaxFrames > 0 {
 			cfg.MaxFrames = config.MaxFrames
 		}
@@ -556,25 +907,40 @@ func (c *Controller) Preview(ctx context.Context, sourceURL string, config *Prev
 			cfg.Width = config.Width
 		}
 	}
-
-	return c.miscGen.GetPreview(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL), cfg)
-}
-
-func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *ThumbnailConfig) ([]byte, error) {
-	meta, err := c.getMetadata(ctx, sourceURL)
+	if err := validatePreviewConfig(cfg); err != nil {
+		return nil, err
+	}
+	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
+	spriteKey := assetIdentity(mediaKey, "sprites", "160x90:5:10x10")
+	previewKey := assetIdentity(mediaKey, "preview", cfg)
+	return c.miscGen.GetPreview(ctx, sourceURL, spriteKey, previewKey, meta.Duration, c.spriteURL(sourceURL), cfg)
+}
+
+func (c *Controller) Thumbnail(ctx context.Context, sourceURL string, config *ThumbnailConfig) ([]byte, error) {
 	cfg := c.opts.DefaultThumbnailConfig
 	if config != nil {
+		if math.IsNaN(config.Position) || math.IsInf(config.Position, 0) || config.Position < 0 || config.Position > 1 || config.Width < 0 {
+			return nil, ErrInvalidThumbnailConfig
+		}
 		cfg.Position = config.Position
 		if config.Width > 0 {
 			cfg.Width = config.Width
 		}
 	}
+	if err := validateThumbnailConfig(cfg); err != nil {
+		return nil, err
+	}
+	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("get metadata: %w", err)
+	}
 
-	return c.miscGen.GetThumbnail(ctx, sourceURL, meta.Duration, c.spriteURL(sourceURL), cfg)
+	thumbnailKey := assetIdentity(mediaKey, "thumbnail", cfg)
+	return c.miscGen.GetThumbnail(ctx, sourceURL, thumbnailKey, meta.Duration, cfg)
 }
 
 func (c *Controller) spriteURL(sourceURL string) func(int) string {
@@ -587,24 +953,6 @@ func (c *Controller) Metadata(ctx context.Context, sourceURL string) (*Metadata,
 	return c.getMetadata(ctx, sourceURL)
 }
 
-func (c *Controller) enqueueSegment(ctx context.Context, sourceURL string, streamType StreamType, renditionName string, index int) error {
-	startIdx := (index / c.opts.SegmentsPerJob) * c.opts.SegmentsPerJob
-	endIdx := startIdx + c.opts.SegmentsPerJob - 1
-
-	jobID := deterministicJobID(sourceURL, renditionName, streamType, startIdx, endIdx)
-
-	job := domain.Job{
-		ID:         jobID,
-		SourceURL:  sourceURL,
-		Rendition:  renditionName,
-		StreamType: streamType,
-		StartIndex: startIdx,
-		EndIndex:   endIdx,
-	}
-
-	return c.opts.Coordinator.Enqueue(ctx, job)
-}
-
 func deterministicJobID(sourceURL, rendition string, streamType StreamType, startIdx, endIdx int) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s:%s:%s:%d:%d", sourceURL, rendition, streamType, startIdx, endIdx)
@@ -612,34 +960,66 @@ func deterministicJobID(sourceURL, rendition string, streamType StreamType, star
 }
 
 func (c *Controller) getMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
-	exists, err := c.opts.Storage.MetadataExists(ctx, sourceURL)
+	metadata, _, err := c.getMetadataResolved(ctx, sourceURL)
+	return metadata, err
+}
+
+func (c *Controller) getMetadataResolved(ctx context.Context, sourceURL string) (*domain.Metadata, string, error) {
+	mediaKey, err := c.resolveMediaKey(ctx, sourceURL)
+	if err != nil {
+		return nil, "", err
+	}
+	metadata, err := c.getMetadataWithKey(ctx, sourceURL, mediaKey)
+	return metadata, mediaKey, err
+}
+
+func (c *Controller) getMetadataWithKey(ctx context.Context, sourceURL, mediaKey string) (*domain.Metadata, error) {
+	exists, err := c.opts.Storage.MetadataExists(ctx, mediaKey)
 	if err != nil {
 		return nil, err
 	}
 	if exists {
-		return c.readCachedMetadata(ctx, sourceURL)
+		c.observe(ctx, domain.Event{Type: domain.EventMetadataCacheHit, MediaKey: mediaKey})
+		return c.readCachedMetadata(ctx, mediaKey)
 	}
+	c.observe(ctx, domain.Event{Type: domain.EventMetadataCacheMiss, MediaKey: mediaKey})
 
-	lockKey := fmt.Sprintf("metadata:%s", sourceURL)
-	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, 2*time.Minute)
+	lockKey := "metadata:" + mediaKey
+	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.JobTimeout+time.Minute)
 
 	if lockErr != nil {
 		if !errors.Is(lockErr, domain.ErrLockHeld) {
 			return nil, fmt.Errorf("acquire metadata lock: %w", lockErr)
 		}
-		return c.waitForMetadata(ctx, sourceURL, 2*time.Minute)
+		c.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: mediaKey})
+		return c.waitForMetadata(ctx, mediaKey, c.opts.JobTimeout)
 	}
-	defer c.opts.Coordinator.ReleaseLock(ctx, lockKey, token)
+	defer func() {
+		cleanup, cancel := cleanupContext()
+		defer cancel()
+		if err := c.opts.Coordinator.ReleaseLock(cleanup, lockKey, token); err != nil {
+			c.observe(cleanup, domain.Event{Type: domain.EventLockReleaseFailed, MediaKey: mediaKey, Error: err.Error()})
+		}
+	}()
 
-	exists, err = c.opts.Storage.MetadataExists(ctx, sourceURL)
+	exists, err = c.opts.Storage.MetadataExists(ctx, mediaKey)
 	if err != nil {
 		return nil, err
 	}
 	if exists {
-		return c.readCachedMetadata(ctx, sourceURL)
+		return c.readCachedMetadata(ctx, mediaKey)
 	}
 
-	return c.prober.Probe(ctx, sourceURL)
+	started := time.Now()
+	probeCtx, cancel := context.WithTimeout(ctx, c.opts.JobTimeout)
+	metadata, probeErr := c.prober.ProbeWithKey(probeCtx, sourceURL, mediaKey)
+	cancel()
+	event := domain.Event{Type: domain.EventMetadataProbed, MediaKey: mediaKey, Duration: time.Since(started)}
+	if probeErr != nil {
+		event.Error = probeErr.Error()
+	}
+	c.observe(ctx, event)
+	return metadata, probeErr
 }
 
 func (c *Controller) readCachedMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
@@ -665,7 +1045,7 @@ func (c *Controller) waitForMetadata(ctx context.Context, sourceURL string, time
 			return nil, ctx.Err()
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("timeout waiting for metadata")
+				return nil, ErrMetadataTimeout
 			}
 			exists, err := c.opts.Storage.MetadataExists(ctx, sourceURL)
 			if err != nil {

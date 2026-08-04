@@ -8,11 +8,8 @@ type Segment struct {
 }
 
 type SegmentData struct {
-	SourceURL string
+	MediaKey  string
 	Index     int
-	StartPTS  uint64
-	EndPTS    uint64
-	Duration  float64
 	Rendition string
 	IsVideo   bool
 }
@@ -38,12 +35,9 @@ const (
 )
 
 type PathGenerator interface {
-	MasterPlaylist(sourceURL string) string
 	VariantPlaylist(sourceURL string, rendition string, streamType StreamType) string
 	Segment(sourceURL string, rendition string, streamType StreamType, index int) string
-	SpriteVTT(sourceURL string) string
 	Sprite(sourceURL string, index int) string
+	SubtitlePlaylist(sourceURL string, trackID string) string
 	SubtitleVTT(sourceURL string, lang string) string
-	Preview(sourceURL string) string
-	Thumbnail(sourceURL string) string
 }

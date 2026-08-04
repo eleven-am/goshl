@@ -62,10 +62,20 @@ func TestNewConfigReturnsExpectedFlags(t *testing.T) {
 	if none.Accelerator != "none" || none.Encoder != "libx264" {
 		t.Fatalf("fallback config unexpected: %#v", none)
 	}
+	if !strings.Contains(none.ScaleFilter, "format=yuv420p") {
+		t.Fatalf("software output must use browser-compatible 8-bit 4:2:0 video: %s", none.ScaleFilter)
+	}
 
 	cuda := NewConfig(domain.AccelCUDA)
 	if cuda.KeyframeFlag != "-force_key_frames" {
 		t.Fatalf("unexpected CUDA keyframe flag %q", cuda.KeyframeFlag)
+	}
+	if strings.Contains(strings.Join(cuda.DecodeFlags, " "), "hwaccel_output_format") || cuda.DeviceFrames {
+		t.Fatalf("safe CUDA mode must transfer decoded frames through host memory: %#v", cuda)
+	}
+	device := NewConfigWithMode(domain.AccelCUDA, domain.DecodeDevice)
+	if !strings.Contains(strings.Join(device.DecodeFlags, " "), "hwaccel_output_format cuda") || !device.DeviceFrames {
+		t.Fatalf("device CUDA mode must retain frames on the GPU: %#v", device)
 	}
 }
 

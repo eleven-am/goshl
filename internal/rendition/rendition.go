@@ -2,6 +2,7 @@ package rendition
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
 )
@@ -38,10 +39,17 @@ func GenerateVideo(video domain.VideoStream) []domain.VideoRendition {
 		srcBitrate = estimateBitrate(srcHeight)
 	}
 
-	for _, targetHeight := range targetHeights {
-		if targetHeight > srcHeight {
-			continue
+	heights := make([]int, 0, len(targetHeights)+1)
+	if srcHeight > 0 {
+		heights = append(heights, srcHeight)
+	}
+	for _, height := range targetHeights {
+		if height < srcHeight {
+			heights = append(heights, height)
 		}
+	}
+
+	for _, targetHeight := range heights {
 
 		targetWidth := calculateWidth(srcWidth, srcHeight, targetHeight)
 		targetPixels := targetWidth * targetHeight
@@ -49,23 +57,100 @@ func GenerateVideo(video domain.VideoStream) []domain.VideoRendition {
 		ratio := float64(targetPixels) / float64(srcPixels)
 		bitrate := int(float64(srcBitrate) * ratio)
 
-		bitrate = clampBitrate(targetHeight, bitrate)
+		if targetHeight == srcHeight {
+			bitrate = srcBitrate
+		} else {
+			bitrate = clampBitrate(targetHeight, bitrate)
+		}
 
 		method := domain.Transcode
-		if directStreamCodecs[srcCodec] && targetHeight == srcHeight {
+		if directStreamCodecs[srcCodec] && targetHeight == srcHeight && directStreamCompatible(video) {
 			method = domain.DirectStream
+		}
+		level := outputLevel(targetHeight, video.FrameRate)
+		codec := videoCodecString(level)
+		if method == domain.DirectStream {
+			codec = sourceVideoCodecString(video)
+			level = video.Level
 		}
 
 		renditions = append(renditions, domain.VideoRendition{
-			Name:    fmt.Sprintf("%dp", targetHeight),
-			Width:   targetWidth,
-			Height:  targetHeight,
-			Bitrate: bitrate,
-			Method:  method,
+			Name:        fmt.Sprintf("%dp", targetHeight),
+			Width:       targetWidth,
+			Height:      targetHeight,
+			Bitrate:     bitrate,
+			PeakBitrate: int(float64(bitrate) * 1.5),
+			FrameRate:   video.FrameRate,
+			Codec:       codec,
+			Level:       level,
+			Method:      method,
 		})
 	}
 
 	return renditions
+}
+
+func directStreamCompatible(video domain.VideoStream) bool {
+	if video.Codec != "h264" || video.BitDepth != 0 && video.BitDepth != 8 {
+		return false
+	}
+	if video.Level <= 0 || video.Level > 52 {
+		return false
+	}
+	if video.Rotation != 0 {
+		return false
+	}
+	if video.SampleAspect != "" && video.SampleAspect != "1:1" && video.SampleAspect != "0:1" {
+		return false
+	}
+	if video.PixelFormat != "yuv420p" && video.PixelFormat != "yuvj420p" {
+		return false
+	}
+	if !video.StartsWithKeyframe {
+		return false
+	}
+	profile := strings.ToLower(video.Profile)
+	return profile == "baseline" || profile == "constrained baseline" || profile == "main" || profile == "high"
+}
+
+func sourceVideoCodecString(video domain.VideoStream) string {
+	profile := 100
+	switch strings.ToLower(video.Profile) {
+	case "baseline", "constrained baseline":
+		profile = 66
+	case "main":
+		profile = 77
+	}
+	level := video.Level
+	if level <= 0 {
+		level = 40
+	}
+	return fmt.Sprintf("avc1.%02x00%02x", profile, level)
+}
+
+func videoCodecString(level int) string {
+	return fmt.Sprintf("avc1.6400%02x", level)
+}
+
+func outputLevel(height int, frameRate float64) int {
+	switch {
+	case height >= 2160 && frameRate > 30:
+		return 52
+	case height >= 2160:
+		return 51
+	case height >= 1080 && frameRate > 30:
+		return 42
+	case height >= 1080:
+		return 40
+	case height >= 720 && frameRate > 30:
+		return 32
+	case height >= 720:
+		return 31
+	case height >= 480:
+		return 30
+	default:
+		return 21
+	}
 }
 
 func calculateWidth(srcWidth, srcHeight, targetHeight int) int {
@@ -120,7 +205,11 @@ func GenerateAudioTracks(audios []domain.AudioStream) []domain.AudioRendition {
 
 	for i, audio := range audios {
 		prefixNames := len(audios) > 1
-		renditions = append(renditions, generateAudio(audio, i, prefixNames, i == 0)...)
+		streamIndex := audio.Index
+		if i > 0 && streamIndex == 0 {
+			streamIndex = i
+		}
+		renditions = append(renditions, generateAudio(audio, streamIndex, prefixNames, i == 0 || audio.Default)...)
 	}
 
 	return renditions
@@ -150,11 +239,23 @@ func audioRendition(name, codec string, bitrate, channels int, method domain.Pla
 	return domain.AudioRendition{
 		Name:        name,
 		Codec:       codec,
+		CodecString: audioCodecString(codec),
 		Bitrate:     bitrate,
 		Channels:    channels,
 		Method:      method,
 		StreamIndex: streamIndex,
 		Language:    audio.Language,
 		Default:     isDefault,
+	}
+}
+
+func audioCodecString(codec string) string {
+	switch codec {
+	case "ac3":
+		return "ac-3"
+	case "eac3":
+		return "ec-3"
+	default:
+		return "mp4a.40.2"
 	}
 }

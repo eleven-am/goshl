@@ -18,6 +18,4 @@ type Coordinator interface {
 
 	AcquireLock(ctx context.Context, key string, ttl time.Duration) (token string, err error)
 	ReleaseLock(ctx context.Context, key string, token string) error
-
-	Close()
 }

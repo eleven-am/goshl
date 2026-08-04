@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.0.12] - 2026-08-04
+
+- Normalize non-zero media timestamps and preserve the complete playback timeline
+- Add versioned source, pipeline, and generated-asset cache identities with optional invalidation
+- Deduplicate segment batches and generated assets across replicas, with durable-storage polling for lost notifications
+- Add strict job contracts, output validation, deadlines, typed request errors, and structured observer events
+- Add runtime hardware pipeline validation, safe CUDA decoding, explicit device-frame mode, and visible fallback behavior
+- Generate codec-aware HLS masters for silent, audio-only, multi-codec audio, and subtitle media
+- Tighten browser direct-stream compatibility and force transcoded H.264 to High-profile `yuv420p`
+- Bound FFmpeg output, redact media credentials, sparsely sample previews, and seek thumbnails directly
+- Update `golang.org/x/image` and add real FFmpeg regression coverage
+
 ## [0.0.8] - 2025-12-14
 
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -24,10 +25,19 @@ type Pool struct {
 	storage        domain.Storage
 	cmdBuilder     *ffmpeg.CommandBuilder
 	segStorage     domain.Storage
+	jobTimeout     time.Duration
+	observer       domain.Observer
+	profile        string
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+type PoolConfig struct {
+	JobTimeout time.Duration
+	Observer   domain.Observer
+	Profile    string
 }
 
 func NewPool(
@@ -38,11 +48,19 @@ func NewPool(
 	storage domain.Storage,
 	cmdBuilder *ffmpeg.CommandBuilder,
 	segStorage domain.Storage,
+	settings ...PoolConfig,
 ) *Pool {
 	if targetDuration <= 0 {
 		targetDuration = defaultTargetDuration
 	}
 
+	config := PoolConfig{JobTimeout: 2 * time.Minute}
+	if len(settings) > 0 {
+		config = settings[0]
+		if config.JobTimeout <= 0 {
+			config.JobTimeout = 2 * time.Minute
+		}
+	}
 	return &Pool{
 		coordinator:    coordinator,
 		size:           size,
@@ -51,27 +69,26 @@ func NewPool(
 		storage:        storage,
 		cmdBuilder:     cmdBuilder,
 		segStorage:     segStorage,
+		jobTimeout:     config.JobTimeout,
+		observer:       config.Observer,
+		profile:        config.Profile,
 	}
 }
 
 func (p *Pool) Start(ctx context.Context) error {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.cancel != nil {
-		p.mu.Unlock()
 		return fmt.Errorf("pool already started")
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	p.cancel = cancel
-	p.mu.Unlock()
 
 	jobs, err := p.coordinator.Subscribe(ctx, p.streamType)
 	if err != nil {
 		cancel()
-		p.mu.Lock()
-		p.cancel = nil
-		p.mu.Unlock()
 		return fmt.Errorf("subscribe: %w", err)
 	}
+	p.cancel = cancel
 
 	for i := 0; i < p.size; i++ {
 		p.wg.Add(1)
@@ -83,17 +100,14 @@ func (p *Pool) Start(ctx context.Context) error {
 
 func (p *Pool) Stop() {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	cancel := p.cancel
-	p.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
 	p.wg.Wait()
-
-	p.mu.Lock()
 	p.cancel = nil
-	p.mu.Unlock()
 }
 
 func (p *Pool) worker(ctx context.Context, jobs <-chan domain.Job) {
@@ -113,21 +127,33 @@ func (p *Pool) worker(ctx context.Context, jobs <-chan domain.Job) {
 }
 
 func (p *Pool) processJob(ctx context.Context, job domain.Job) {
-	meta, err := p.getMetadata(ctx, job.SourceURL)
+	started := time.Now()
+	jobCtx, cancel := p.jobContext(ctx, job)
+	defer cancel()
+	if err := p.validateJob(job); err != nil {
+		p.failJob(jobCtx, job, err, started)
+		return
+	}
+	p.observe(jobCtx, domain.Event{Type: domain.EventJobStarted, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Duration: time.Since(job.EnqueuedAt)})
+	if p.segmentsExist(jobCtx, job) {
+		p.ack(job, started)
+		return
+	}
+	meta, err := p.getMetadata(jobCtx, job.MediaKey)
 	if err != nil {
-		p.publishError(ctx, job, err)
+		p.failJob(jobCtx, job, err, started)
 		return
 	}
 
-	segments := p.extractSegments(meta.Keyframes, meta.Duration, job.StartIndex, job.EndIndex)
+	segments := job.Segments
 	if len(segments) == 0 {
-		p.publishError(ctx, job, fmt.Errorf("no segments for range %d-%d", job.StartIndex, job.EndIndex))
+		p.failJob(jobCtx, job, fmt.Errorf("no segments for range %d-%d", job.StartIndex, job.EndIndex), started)
 		return
 	}
 
 	tmpDir, err := os.MkdirTemp("", "transcode-*")
 	if err != nil {
-		p.publishError(ctx, job, fmt.Errorf("create temp dir: %w", err))
+		p.failJob(jobCtx, job, fmt.Errorf("create temp dir: %w", err), started)
 		return
 	}
 	defer os.RemoveAll(tmpDir)
@@ -137,19 +163,16 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 	var args []string
 	var skipFirst bool
 	if isVideo {
-		videoRendition := p.findVideoRendition(meta, job.Rendition)
+		videoRendition := job.VideoRendition
 		if videoRendition == nil {
-			p.publishError(ctx, job, fmt.Errorf("video rendition %s not found", job.Rendition))
+			p.failJob(jobCtx, job, fmt.Errorf("video rendition %s not found", job.Rendition), started)
 			return
 		}
 
 		videoSegments := segments
-		if job.StartIndex > 0 {
-			overlapSegments := p.extractSegments(meta.Keyframes, meta.Duration, job.StartIndex-1, job.EndIndex)
-			if len(overlapSegments) > len(segments) {
-				videoSegments = overlapSegments
-				skipFirst = true
-			}
+		if job.Overlap != nil {
+			videoSegments = append([]domain.Segment{*job.Overlap}, segments...)
+			skipFirst = true
 		}
 
 		var actualSeekKeyframe float64
@@ -159,16 +182,16 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 
 		args = p.cmdBuilder.Video(ffmpeg.VideoParams{
 			InputURL:           job.SourceURL,
-			StreamIndex:        0,
+			StreamIndex:        meta.Video.Index,
 			Rendition:          *videoRendition,
 			Segments:           videoSegments,
 			OutputDir:          tmpDir,
 			ActualSeekKeyframe: actualSeekKeyframe,
 		})
 	} else {
-		audioRendition := p.findAudioRendition(meta, job.Rendition)
+		audioRendition := job.AudioRendition
 		if audioRendition == nil {
-			p.publishError(ctx, job, fmt.Errorf("audio rendition %s not found", job.Rendition))
+			p.failJob(jobCtx, job, fmt.Errorf("audio rendition %s not found", job.Rendition), started)
 			return
 		}
 		args = p.cmdBuilder.Audio(ffmpeg.AudioParams{
@@ -180,20 +203,48 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 		})
 	}
 
-	w := NewWorker(args, p.segStorage, job.SourceURL, job.Rendition, isVideo, tmpDir, skipFirst)
-	if err := w.Start(ctx); err != nil {
-		p.publishError(ctx, job, err)
+	w := NewWorker(args, p.segStorage, job.MediaKey, job.Rendition, isVideo, tmpDir, skipFirst, job.ExpectedIndices)
+	if err := w.Start(jobCtx); err != nil {
+		p.failJob(jobCtx, job, err, started)
 		return
 	}
 
-	if err := p.waitForWorker(ctx, w); err != nil {
-		p.publishError(ctx, job, err)
+	if err := p.waitForWorker(jobCtx, w); err != nil {
+		p.failJob(jobCtx, job, err, started)
 		return
 	}
 
-	if err := p.coordinator.Ack(ctx, job.ID); err != nil {
-		p.publishError(ctx, job, fmt.Errorf("ack job: %w", err))
+	p.ack(job, started)
+}
+
+func (p *Pool) validateJob(job domain.Job) error {
+	if job.ID == "" || job.MediaKey == "" || job.Profile == "" || job.SourceURL == "" || job.Rendition == "" || job.EnqueuedAt.IsZero() || job.Deadline.IsZero() {
+		return fmt.Errorf("invalid job contract: required identity is missing")
 	}
+	if p.profile != "" && job.Profile != p.profile {
+		return fmt.Errorf("invalid job contract: profile mismatch")
+	}
+	if job.StreamType != p.streamType || len(job.Segments) == 0 || len(job.ExpectedIndices) != len(job.Segments) {
+		return fmt.Errorf("invalid job contract: stream or segment range mismatch")
+	}
+	if job.StartIndex != job.Segments[0].Index || job.EndIndex != job.Segments[len(job.Segments)-1].Index || job.RequestedIndex < job.StartIndex || job.RequestedIndex > job.EndIndex {
+		return fmt.Errorf("invalid job contract: indexes are inconsistent")
+	}
+	for index, segment := range job.Segments {
+		if segment.Index != job.StartIndex+index || job.ExpectedIndices[index] != segment.Index || segment.Start < 0 || segment.End <= segment.Start || segment.Duration <= 0 || math.Abs(segment.Duration-(segment.End-segment.Start)) > 0.000001 {
+			return fmt.Errorf("invalid job contract: segment %d is inconsistent", segment.Index)
+		}
+	}
+	if p.streamType == domain.StreamVideo && job.VideoRendition == nil || p.streamType == domain.StreamAudio && job.AudioRendition == nil {
+		return fmt.Errorf("invalid job contract: rendition parameters are missing")
+	}
+	if job.VideoRendition != nil && job.VideoRendition.Name != job.Rendition || job.AudioRendition != nil && job.AudioRendition.Name != job.Rendition {
+		return fmt.Errorf("invalid job contract: rendition identity is inconsistent")
+	}
+	if job.Overlap != nil && (p.streamType != domain.StreamVideo || job.Overlap.Index != job.StartIndex-1 || math.Abs(job.Overlap.End-job.Segments[0].Start) > 0.000001) {
+		return fmt.Errorf("invalid job contract: overlap is inconsistent")
+	}
+	return nil
 }
 
 func (p *Pool) getMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
@@ -279,9 +330,15 @@ func (p *Pool) findAudioRendition(meta *domain.Metadata, name string) *domain.Au
 }
 
 func (p *Pool) publishError(ctx context.Context, job domain.Job, err error) {
+	notifyCtx := ctx
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		notifyCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
 	for i := job.StartIndex; i <= job.EndIndex; i++ {
 		info := domain.SegmentData{
-			SourceURL: job.SourceURL,
+			MediaKey:  job.MediaKey,
 			Index:     i,
 			Rendition: job.Rendition,
 			IsVideo:   p.streamType == domain.StreamVideo,
@@ -291,8 +348,62 @@ func (p *Pool) publishError(ctx context.Context, job domain.Job, err error) {
 			Error: err.Error(),
 		}
 
-		p.coordinator.NotifySegment(ctx, info, status)
+		if notifyErr := p.coordinator.NotifySegment(notifyCtx, info, status); notifyErr != nil {
+			p.observe(notifyCtx, domain.Event{Type: domain.EventSegmentNotifyFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Index: i, Error: notifyErr.Error()})
+		}
 	}
+}
+
+func (p *Pool) jobContext(ctx context.Context, job domain.Job) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(p.jobTimeout)
+	if !job.Deadline.IsZero() && job.Deadline.Before(deadline) {
+		deadline = job.Deadline
+	}
+	return context.WithDeadline(ctx, deadline)
+}
+
+func (p *Pool) segmentsExist(ctx context.Context, job domain.Job) bool {
+	for _, index := range job.ExpectedIndices {
+		info := domain.SegmentData{MediaKey: job.MediaKey, Index: index, Rendition: job.Rendition, IsVideo: job.StreamType == domain.StreamVideo}
+		exists, err := p.storage.SegmentExists(ctx, info)
+		if err != nil || !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Pool) ack(job domain.Job, started time.Time) {
+	ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = p.coordinator.Ack(ackCtx, job.ID); err == nil {
+			p.observe(ackCtx, domain.Event{Type: domain.EventJobCompleted, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Duration: time.Since(started)})
+			return
+		}
+		select {
+		case <-ackCtx.Done():
+			attempt = 3
+		case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+		}
+	}
+	p.observe(ackCtx, domain.Event{Type: domain.EventJobAckFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Error: err.Error(), Duration: time.Since(started)})
+}
+
+func (p *Pool) failJob(ctx context.Context, job domain.Job, err error, started time.Time) {
+	p.publishError(ctx, job, err)
+	p.observe(ctx, domain.Event{Type: domain.EventJobFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Error: err.Error(), Duration: time.Since(started)})
+}
+
+func (p *Pool) observe(ctx context.Context, event domain.Event) {
+	if p.observer == nil {
+		return
+	}
+	if event.Time.IsZero() {
+		event.Time = time.Now()
+	}
+	p.observer.Observe(ctx, event)
 }
 
 func findNearestKeyframe(keyframes []float64, target float64) float64 {
