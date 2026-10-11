@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.14] - 2026-10-11
+
+- chore: verify the tree before tagging a release
+- feat: add ProbeTimeout and SpriteStorage options
+- feat: generate sprite sheets from keyframes only
+
+
 ## [0.0.13] - 2026-08-04
 
 - Use NVENC-supported frame dimensions for the functional hardware pipeline self-test
