@@ -31,6 +31,7 @@ const (
 
 type Generator struct {
 	storage     domain.Storage
+	spriteStore domain.SpriteStorage
 	hwAccel     *domain.HWAccelConfig
 	sprites     singleflight.Group
 	previews    singleflight.Group
@@ -63,6 +64,7 @@ func NewGenerator(storage domain.Storage, hwAccel ...*domain.HWAccelConfig) *Gen
 
 	return &Generator{
 		storage:     storage,
+		spriteStore: storage,
 		hwAccel:     &cfg,
 		thumbWidth:  defaultThumbWidth,
 		thumbHeight: defaultThumbHeight,
@@ -72,8 +74,21 @@ func NewGenerator(storage domain.Storage, hwAccel ...*domain.HWAccelConfig) *Gen
 	}
 }
 
+func (g *Generator) SetSpriteStorage(store domain.SpriteStorage) {
+	if store != nil {
+		g.spriteStore = store
+	}
+}
+
+func (g *Generator) spriteBackend() domain.SpriteStorage {
+	if g.spriteStore != nil {
+		return g.spriteStore
+	}
+	return g.storage
+}
+
 func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string) ([]byte, error) {
-	exists, err := g.storage.SpriteVTTExists(ctx, spriteKey)
+	exists, err := g.spriteBackend().SpriteVTTExists(ctx, spriteKey)
 	if err != nil {
 		return nil, fmt.Errorf("check sprite vtt: %w", err)
 	}
@@ -84,11 +99,11 @@ func (g *Generator) GetSpriteVTT(ctx context.Context, sourceURL, spriteKey strin
 		}
 	}
 
-	return g.storage.ReadSpriteVTT(ctx, spriteKey)
+	return g.spriteBackend().ReadSpriteVTT(ctx, spriteKey)
 }
 
 func (g *Generator) GetSprite(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string, index int) ([]byte, error) {
-	exists, err := g.storage.SpriteExists(ctx, spriteKey, index)
+	exists, err := g.spriteBackend().SpriteExists(ctx, spriteKey, index)
 	if err != nil {
 		return nil, fmt.Errorf("check sprite: %w", err)
 	}
@@ -99,7 +114,7 @@ func (g *Generator) GetSprite(ctx context.Context, sourceURL, spriteKey string, 
 		}
 	}
 
-	return g.storage.ReadSprite(ctx, spriteKey, index)
+	return g.spriteBackend().ReadSprite(ctx, spriteKey, index)
 }
 
 func (g *Generator) ensureSprites(ctx context.Context, sourceURL, spriteKey string, duration float64, spriteURL func(int) string) error {
@@ -111,7 +126,7 @@ func (g *Generator) ensureSprites(ctx context.Context, sourceURL, spriteKey stri
 }
 
 func (g *Generator) spritesReady(ctx context.Context, spriteKey string, duration float64) (bool, error) {
-	vttExists, err := g.storage.SpriteVTTExists(ctx, spriteKey)
+	vttExists, err := g.spriteBackend().SpriteVTTExists(ctx, spriteKey)
 	if err != nil {
 		return false, fmt.Errorf("check sprite vtt: %w", err)
 	}
@@ -120,7 +135,7 @@ func (g *Generator) spritesReady(ctx context.Context, spriteKey string, duration
 	}
 
 	for i := 0; i < g.spriteCount(duration); i++ {
-		exists, err := g.storage.SpriteExists(ctx, spriteKey, i)
+		exists, err := g.spriteBackend().SpriteExists(ctx, spriteKey, i)
 		if err != nil {
 			return false, fmt.Errorf("check sprite %d: %w", i, err)
 		}
@@ -143,7 +158,7 @@ func (g *Generator) generateSprites(ctx context.Context, sourceURL, spriteKey st
 
 	outputPattern := filepath.Join(tmpDir, "sprite-%d.jpg")
 
-	args := g.spriteArgs(sourceURL, outputPattern)
+	args := g.spriteArgs(sourceURL, outputPattern, duration)
 
 	if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {
 		return fmt.Errorf("ffmpeg sprite generation: %w", err)
@@ -156,20 +171,20 @@ func (g *Generator) generateSprites(ctx context.Context, sourceURL, spriteKey st
 			return fmt.Errorf("read sprite %d: %w", i, err)
 		}
 
-		if err := g.storage.WriteSprite(ctx, spriteKey, i, data); err != nil {
+		if err := g.spriteBackend().WriteSprite(ctx, spriteKey, i, data); err != nil {
 			return fmt.Errorf("write sprite %d: %w", i, err)
 		}
 	}
 
 	vtt := g.generateVTT(duration, numSprites, spriteURL)
-	if err := g.storage.WriteSpriteVTT(ctx, spriteKey, vtt); err != nil {
+	if err := g.spriteBackend().WriteSpriteVTT(ctx, spriteKey, vtt); err != nil {
 		return fmt.Errorf("write sprite vtt: %w", err)
 	}
 
 	return nil
 }
 
-func (g *Generator) spriteArgs(sourceURL string, outputPattern string) []string {
+func (g *Generator) spriteArgs(sourceURL string, outputPattern string, duration float64) []string {
 	args := []string{"-nostats", "-hide_banner", "-loglevel", "warning"}
 	if g.hwAccel != nil && g.hwAccel.Accelerator == domain.AccelCUDA {
 		args = append(args, "-threads", "1")
@@ -178,8 +193,9 @@ func (g *Generator) spriteArgs(sourceURL string, outputPattern string) []string 
 		args = append(args, g.hwAccel.DecodeFlags...)
 	}
 	args = append(args,
+		"-skip_frame", "nokey",
 		"-i", sourceURL,
-		"-vf", g.spriteFilter(),
+		"-vf", g.spriteFilter(duration),
 		"-q:v", "5",
 		outputPattern,
 	)
@@ -192,8 +208,10 @@ func (g *Generator) spriteCount(duration float64) int {
 	return int(math.Ceil(float64(totalThumbs) / float64(thumbsPerSprite)))
 }
 
-func (g *Generator) spriteFilter() string {
-	filter := fmt.Sprintf("fps=1/%g,scale=%d:%d,tile=%dx%d", g.interval, g.thumbWidth, g.thumbHeight, g.cols, g.rows)
+func (g *Generator) spriteFilter(duration float64) string {
+	pad := fmt.Sprintf("tpad=stop_mode=clone:stop_duration=%g", math.Ceil(duration)+g.interval)
+	limit := fmt.Sprintf("trim=end_frame=%d", int(math.Ceil(duration/g.interval)))
+	filter := fmt.Sprintf("scale=%d:%d,%s,fps=1/%g,%s,tile=%dx%d", g.thumbWidth, g.thumbHeight, pad, g.interval, limit, g.cols, g.rows)
 	if g.hwAccel == nil {
 		return filter
 	}
@@ -204,7 +222,7 @@ func (g *Generator) spriteFilter() string {
 			return filter
 		}
 		scale := fmt.Sprintf(g.hwAccel.ScaleFilter, g.thumbWidth, g.thumbHeight)
-		return fmt.Sprintf("%s,hwdownload,format=nv12,fps=1/%g,tile=%dx%d", scale, g.interval, g.cols, g.rows)
+		return fmt.Sprintf("%s,hwdownload,format=nv12,%s,fps=1/%g,%s,tile=%dx%d", scale, pad, g.interval, limit, g.cols, g.rows)
 	default:
 		return filter
 	}
@@ -345,7 +363,7 @@ func (g *Generator) generatePreview(ctx context.Context, spriteKey string, durat
 	for _, index := range indices {
 		spriteIndex := index / thumbsPerSprite
 		if spriteIndex != loadedSprite {
-			spriteData, err := g.storage.ReadSprite(ctx, spriteKey, spriteIndex)
+			spriteData, err := g.spriteBackend().ReadSprite(ctx, spriteKey, spriteIndex)
 			if err != nil {
 				return nil, fmt.Errorf("read sprite %d: %w", spriteIndex, err)
 			}

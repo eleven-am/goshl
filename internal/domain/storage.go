@@ -31,3 +31,13 @@ type Storage interface {
 	ReadThumbnail(ctx context.Context, assetKey string) ([]byte, error)
 	ThumbnailExists(ctx context.Context, assetKey string) (bool, error)
 }
+
+type SpriteStorage interface {
+	WriteSprite(ctx context.Context, assetKey string, index int, data []byte) error
+	ReadSprite(ctx context.Context, assetKey string, index int) ([]byte, error)
+	SpriteExists(ctx context.Context, assetKey string, index int) (bool, error)
+
+	WriteSpriteVTT(ctx context.Context, assetKey string, data []byte) error
+	ReadSpriteVTT(ctx context.Context, assetKey string) ([]byte, error)
+	SpriteVTTExists(ctx context.Context, assetKey string) (bool, error)
+}

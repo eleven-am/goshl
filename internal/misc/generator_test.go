@@ -493,7 +493,7 @@ func TestSpriteFilterUsesHardwareDownloadForGPUFrames(t *testing.T) {
 		DeviceFrames: true,
 	})
 
-	filter := g.spriteFilter()
+	filter := g.spriteFilter(100)
 	for _, want := range []string{"scale_cuda=160:90:format=nv12", "hwdownload", "tile=10x10"} {
 		if !strings.Contains(filter, want) {
 			t.Fatalf("expected %q in filter %q", want, filter)
@@ -509,7 +509,7 @@ func TestSpriteArgsLimitCUDAThreads(t *testing.T) {
 		DeviceFrames: true,
 	})
 
-	args := g.spriteArgs("input.mp4", "sprite-%d.jpg")
+	args := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
 
 	threadsIndex := indexOf(args, "-threads")
 	inputIndex := indexOf(args, "-i")
@@ -524,7 +524,7 @@ func TestSpriteArgsLimitCUDAThreads(t *testing.T) {
 func TestSpriteArgsDoesNotLimitCPUThreads(t *testing.T) {
 	g := NewGenerator(&stubStorage{})
 
-	args := g.spriteArgs("input.mp4", "sprite-%d.jpg")
+	args := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
 
 	if indexOf(args, "-threads") != -1 {
 		t.Fatalf("expected cpu sprite args not to include -threads, got %v", args)
