@@ -138,6 +138,7 @@ type stubCoordinator struct {
 	lockErr       error
 	subErrByType  map[domain.StreamType]error
 	lockCalls     []string
+	lockTTLs      []time.Duration
 	releaseCalls  []string
 	onAcquireLock func(key string)
 	onWaitSegment func(info domain.SegmentData)
@@ -180,6 +181,7 @@ func (c *stubCoordinator) sendWaitStatus(status domain.SegmentStatus) {
 }
 func (c *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	c.lockCalls = append(c.lockCalls, key)
+	c.lockTTLs = append(c.lockTTLs, ttl)
 	if c.onAcquireLock != nil {
 		c.onAcquireLock(key)
 	}

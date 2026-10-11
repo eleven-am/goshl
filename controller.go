@@ -75,6 +75,8 @@ type (
 	// (filesystem, S3, Redis, etc.).
 	Storage = domain.Storage
 
+	SpriteStorage = domain.SpriteStorage
+
 	// Coordinator manages the distributed transcoding workflow. It handles job
 	// queuing across worker pools and notifies waiting clients when segments
 	// become available. For single-instance deployments, an in-memory implementation
@@ -271,6 +273,10 @@ type Options struct {
 
 	JobTimeout time.Duration
 
+	ProbeTimeout time.Duration
+
+	SpriteStorage SpriteStorage
+
 	CacheVersion string
 
 	SourceRevision SourceRevisionResolver
@@ -300,6 +306,9 @@ func (o *Options) setDefaults() {
 	}
 	if o.JobTimeout == 0 {
 		o.JobTimeout = 2 * time.Minute
+	}
+	if o.ProbeTimeout == 0 {
+		o.ProbeTimeout = o.JobTimeout
 	}
 	if o.HWAccelDecodeMode == "" {
 		o.HWAccelDecodeMode = domain.DecodeSafe
@@ -337,7 +346,7 @@ func (o *Options) validateError() error {
 	if o.PathGen == nil {
 		return fmt.Errorf("%w: PathGen is required", ErrInvalidOptions)
 	}
-	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
+	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.ProbeTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 {
@@ -353,7 +362,7 @@ func (o *Options) validateError() error {
 }
 
 func (o *Options) validateResolvedError() error {
-	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.TargetDuration <= 0 {
+	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.ProbeTimeout <= 0 || o.TargetDuration <= 0 {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob <= 0 || o.VideoPoolSize <= 0 || o.AudioPoolSize <= 0 {
@@ -472,13 +481,16 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
 	)
 
+	miscGen := misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer)
+	miscGen.SetSpriteStorage(opts.SpriteStorage)
+
 	controller := &Controller{
 		opts:            opts,
 		playlist:        playlist.NewGenerator(opts.PathGen),
 		videoPool:       videoPool,
 		audioPool:       audioPool,
 		prober:          probe.NewProber(opts.Storage),
-		miscGen:         misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer),
+		miscGen:         miscGen,
 		hwConfig:        hwConfig,
 		pipelineVersion: pipeline,
 	}
@@ -985,14 +997,14 @@ func (c *Controller) getMetadataWithKey(ctx context.Context, sourceURL, mediaKey
 	c.observe(ctx, domain.Event{Type: domain.EventMetadataCacheMiss, MediaKey: mediaKey})
 
 	lockKey := "metadata:" + mediaKey
-	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.JobTimeout+time.Minute)
+	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.ProbeTimeout+time.Minute)
 
 	if lockErr != nil {
 		if !errors.Is(lockErr, domain.ErrLockHeld) {
 			return nil, fmt.Errorf("acquire metadata lock: %w", lockErr)
 		}
 		c.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: mediaKey})
-		return c.waitForMetadata(ctx, mediaKey, c.opts.JobTimeout)
+		return c.waitForMetadata(ctx, mediaKey, c.opts.ProbeTimeout)
 	}
 	defer func() {
 		cleanup, cancel := cleanupContext()
@@ -1011,7 +1023,7 @@ func (c *Controller) getMetadataWithKey(ctx context.Context, sourceURL, mediaKey
 	}
 
 	started := time.Now()
-	probeCtx, cancel := context.WithTimeout(ctx, c.opts.JobTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, c.opts.ProbeTimeout)
 	metadata, probeErr := c.prober.ProbeWithKey(probeCtx, sourceURL, mediaKey)
 	cancel()
 	event := domain.Event{Type: domain.EventMetadataProbed, MediaKey: mediaKey, Duration: time.Since(started)}
