@@ -18,6 +18,10 @@ version:
 
 _do_release:
 	@if [ -z "$(NEW_VERSION)" ]; then echo "Error: NEW_VERSION not set"; exit 1; fi; \
+	if [ -n "$$(git status --porcelain)" ]; then echo "Error: uncommitted changes; commit them before releasing"; exit 1; fi; \
+	if [ -n "$$(gofmt -l .)" ]; then echo "Error: gofmt reports unformatted files"; exit 1; fi; \
+	go vet ./... || exit 1; \
+	go test -race ./... || exit 1; \
 	PREV_TAG=$$(git describe --tags --abbrev=0 2>/dev/null || echo ""); \
 	DATE=$$(date +%Y-%m-%d); \
 	if [ -z "$$PREV_TAG" ]; then \
