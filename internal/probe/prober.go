@@ -11,7 +11,9 @@ import (
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/localpath"
 	"github.com/eleven-am/goshl/internal/mediaexec"
+	"github.com/eleven-am/goshl/internal/probe/mp4index"
 )
 
 type Prober struct {
@@ -61,7 +63,7 @@ func (p *Prober) ProbeWithKey(ctx context.Context, sourceURL, mediaKey string) (
 }
 
 func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error) {
-	streams, err := p.probeStreams(ctx, url)
+	streams, formatName, err := p.probeStreams(ctx, url)
 	if err != nil {
 		return nil, err
 	}
@@ -71,9 +73,13 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 
 	var keyframes []float64
 	if streams.Video.Codec != "" {
-		keyframes, err = p.probeKeyframes(ctx, url, streams.Video.Index)
-		if err != nil {
-			return nil, err
+		var indexed bool
+		keyframes, indexed = p.indexKeyframes(url, formatName, streams.Video.Index)
+		if !indexed {
+			keyframes, err = p.probeKeyframes(ctx, url, streams.Video.Index)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -125,8 +131,9 @@ type ffprobeStream struct {
 }
 
 type ffprobeFormat struct {
-	StartTime string `json:"start_time"`
-	Duration  string `json:"duration"`
+	FormatName string `json:"format_name"`
+	StartTime  string `json:"start_time"`
+	Duration   string `json:"duration"`
 }
 
 type ffprobeDisp struct {
@@ -139,7 +146,7 @@ type ffprobeSideData struct {
 	Rotation int `json:"rotation"`
 }
 
-func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata, error) {
+func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata, string, error) {
 	output, err := mediaexec.Output(ctx, "ffprobe",
 		"-v", "error",
 		"-show_format",
@@ -148,12 +155,12 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 		url,
 	)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var ff ffprobeOutput
 	if err := json.Unmarshal(output, &ff); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	metadata := &domain.Metadata{}
@@ -216,7 +223,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 		}
 	}
 
-	return metadata, nil
+	return metadata, ff.Format.FormatName, nil
 }
 
 func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int) ([]float64, error) {
@@ -260,6 +267,30 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int
 	}
 
 	return keyframes, nil
+}
+
+func (p *Prober) indexKeyframes(url, formatName string, streamIndex int) ([]float64, bool) {
+	if !isISOBaseFormat(formatName) {
+		return nil, false
+	}
+	path, local := localpath.Resolve(url)
+	if !local {
+		return nil, false
+	}
+	keyframes, err := mp4index.Keyframes(path, streamIndex)
+	if err != nil {
+		return nil, false
+	}
+	return keyframes, true
+}
+
+func isISOBaseFormat(formatName string) bool {
+	for _, name := range strings.Split(formatName, ",") {
+		if name == "mp4" || name == "mov" {
+			return true
+		}
+	}
+	return false
 }
 
 func selectVideoStream(streams []ffprobeStream) int {

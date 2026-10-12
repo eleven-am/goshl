@@ -2,10 +2,13 @@ package probe
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/eleven-am/goshl/internal/domain"
@@ -346,3 +349,216 @@ fi
 
 exit 1
 `
+
+func ffprobeCallLog(t *testing.T) string {
+	t.Helper()
+	real, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe is unavailable")
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\necho \"$*\" >> " + logPath + "\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ffprobe"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func packetPassCount(t *testing.T, logPath string) int {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(data), "show_entries")
+}
+
+func makeMedia(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	full := append([]string{"-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "6", "-c:v", "libx264", "-g", "25", "-sc_threshold", "0"}, args...)
+	full = append(full, path)
+	if data, err := exec.Command("ffmpeg", full...).CombinedOutput(); err != nil {
+		t.Fatalf("create %s: %v: %s", name, err, data)
+	}
+	return path
+}
+
+func referenceKeyframes(t *testing.T, path string, meta *domain.Metadata) []float64 {
+	t.Helper()
+	raw, err := NewProber(&stubStorage{}).probeKeyframes(context.Background(), path, meta.Video.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return normalizeKeyframes(raw, meta.StartTime, meta.Duration)
+}
+
+func TestProbe_MP4UsesHeaderIndexAndMatchesPacketScan(t *testing.T) {
+	logPath := ffprobeCallLog(t)
+	path := makeMedia(t, "indexed.mp4", "-bf", "2", "-movflags", "+faststart")
+
+	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if got := packetPassCount(t, logPath); got != 0 {
+		t.Fatalf("packet pass ran %d times for an indexable mp4", got)
+	}
+	want := referenceKeyframes(t, path, meta)
+	if len(want) == 0 || len(meta.Keyframes) != len(want) {
+		t.Fatalf("keyframes %v, want %v", meta.Keyframes, want)
+	}
+	for i := range want {
+		if meta.Keyframes[i] != want[i] {
+			t.Fatalf("keyframes %v, want %v", meta.Keyframes, want)
+		}
+	}
+	if !meta.Video.StartsWithKeyframe {
+		t.Fatal("expected StartsWithKeyframe")
+	}
+}
+
+func TestProbe_FileURLUsesHeaderIndex(t *testing.T) {
+	logPath := ffprobeCallLog(t)
+	path := makeMedia(t, "indexed.mp4")
+
+	if _, err := NewProber(&stubStorage{}).Probe(context.Background(), "file://"+path); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if got := packetPassCount(t, logPath); got != 0 {
+		t.Fatalf("packet pass ran %d times for a file:// mp4", got)
+	}
+}
+
+func TestProbe_FallsBackToPacketScan(t *testing.T) {
+	logPath := ffprobeCallLog(t)
+	dir := t.TempDir()
+	mp4 := makeMedia(t, "source.mp4")
+
+	cases := map[string]string{
+		"matroska":   makeMedia(t, "a.mkv"),
+		"fragmented": makeMedia(t, "frag.mp4", "-movflags", "frag_keyframe+empty_moov"),
+		"mpegts":     makeMedia(t, "a.ts"),
+	}
+	trimmed := filepath.Join(dir, "trimmed.mp4")
+	if data, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "1.3", "-i", mp4, "-c", "copy", trimmed).CombinedOutput(); err != nil {
+		t.Fatalf("trim: %v: %s", err, data)
+	}
+	cases["unaligned edit list"] = trimmed
+
+	for name, path := range cases {
+		name, path := name, path
+		t.Run(name, func(t *testing.T) {
+			before := packetPassCount(t, logPath)
+			meta, err := NewProber(&stubStorage{}).Probe(context.Background(), path)
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if got := packetPassCount(t, logPath) - before; got != 1 {
+				t.Fatalf("expected exactly one packet pass, got %d", got)
+			}
+			if len(meta.Keyframes) == 0 {
+				t.Fatal("fallback produced no keyframes")
+			}
+		})
+	}
+}
+
+func TestProbe_MissingHeaderIndexFallsBack(t *testing.T) {
+	logPath := ffprobeCallLog(t)
+	path := makeMedia(t, "plain.mp4")
+	prober := NewProber(&stubStorage{})
+
+	if _, ok := prober.indexKeyframes("https://example.com/video.mp4", "mov,mp4,m4a,3gp,3g2,mj2", 0); ok {
+		t.Fatal("remote source must not use the header index")
+	}
+	if _, ok := prober.indexKeyframes(path, "matroska,webm", 0); ok {
+		t.Fatal("non-mp4 container must not use the header index")
+	}
+	if _, ok := prober.indexKeyframes(filepath.Join(filepath.Dir(path), "missing.mp4"), "mov,mp4,m4a,3gp,3g2,mj2", 0); ok {
+		t.Fatal("unreadable source must fall back")
+	}
+	if _, ok := prober.indexKeyframes(path, "mov,mp4,m4a,3gp,3g2,mj2", 7); ok {
+		t.Fatal("missing trak must fall back")
+	}
+	if packetPassCount(t, logPath) != 0 {
+		t.Fatal("indexKeyframes must not run ffprobe")
+	}
+}
+
+func TestProbe_EmptyEditOddTimescaleMatchesPacketScan(t *testing.T) {
+	logPath := ffprobeCallLog(t)
+	variants := map[string]struct {
+		inputs     []string
+		maps       []string
+		wantStarts *bool
+	}{
+		"with audio": {
+			inputs: []string{"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"},
+			maps:   []string{"-map", "0:v", "-map", "1:a", "-c:a", "aac"},
+		},
+		"video only": {wantStarts: boolPtr(true)},
+	}
+	for name, variant := range variants {
+		variant := variant
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "odd.mp4")
+			args := []string{"-hide_banner", "-loglevel", "error", "-y", "-itsoffset", "0.084", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24000/1001"}
+			args = append(args, variant.inputs...)
+			args = append(args, "-t", "6")
+			args = append(args, variant.maps...)
+			args = append(args, "-c:v", "libx264", "-g", "24", "-sc_threshold", "0", "-video_track_timescale", "11988", path)
+			if data, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
+				t.Fatalf("create fixture: %v: %s", err, data)
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := strings.Index(string(data), "elst")
+			if at < 0 || data[at+4] != 0 {
+				t.Fatal("version 0 elst not found")
+			}
+			binary.BigEndian.PutUint32(data[at+12:], 84)
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			before := packetPassCount(t, logPath)
+			meta, err := NewProber(&stubStorage{}).Probe(context.Background(), path)
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if packetPassCount(t, logPath) != before {
+				t.Fatal("packet pass ran for an indexable mp4")
+			}
+			want := referenceKeyframes(t, path, meta)
+			if len(meta.Keyframes) != len(want) {
+				t.Fatalf("keyframes %v, want %v", meta.Keyframes, want)
+			}
+			for i := range want {
+				if meta.Keyframes[i] != want[i] {
+					t.Fatalf("keyframe %d: %v, want %v", i, meta.Keyframes[i], want[i])
+				}
+			}
+			wantStarts := len(want) > 0 && math.Abs(want[0]) < 0.000001
+			if meta.Video.StartsWithKeyframe != wantStarts {
+				t.Fatalf("StartsWithKeyframe %v, want %v", meta.Video.StartsWithKeyframe, wantStarts)
+			}
+			if variant.wantStarts != nil && meta.Video.StartsWithKeyframe != *variant.wantStarts {
+				t.Fatalf("StartsWithKeyframe %v, want %v (keyframes %v, start %v)", meta.Video.StartsWithKeyframe, *variant.wantStarts, meta.Keyframes, meta.StartTime)
+			}
+		})
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }
