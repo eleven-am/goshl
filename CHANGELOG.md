@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.15] - 2026-10-12
+
+- feat: read MP4 keyframes from the moov header
+
+
 ## [0.0.14] - 2026-10-11
 
 - chore: verify the tree before tagging a release
