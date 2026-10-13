@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/h264level"
 )
 
 type Generator struct {
@@ -141,7 +142,7 @@ func writeVideoVariant(b *strings.Builder, pathGen domain.PathGenerator, sourceU
 	}
 	peak += group.MaxBandwidth
 	codec := video.Codec
-	if codec == "" {
+	if video.Method != domain.DirectStream || codec == "" {
 		codec = videoCodecString(video)
 	}
 	codecs := codec
@@ -232,25 +233,9 @@ func defaultFlag(isDefault bool) string {
 
 func videoCodecString(video domain.VideoRendition) string {
 	level := video.Level
-	if level <= 0 {
-		switch {
-		case video.Height >= 2160 && video.FrameRate > 30:
-			level = 52
-		case video.Height >= 2160:
-			level = 51
-		case video.Height >= 1080 && video.FrameRate > 30:
-			level = 42
-		case video.Height >= 1080:
-			level = 40
-		case video.Height >= 720 && video.FrameRate > 30:
-			level = 32
-		case video.Height >= 720:
-			level = 31
-		case video.Height >= 480:
-			level = 30
-		default:
-			level = 21
-		}
+	minimumLevel := h264level.Minimum(video.Width, video.Height, video.FrameRate, video.PeakBitrate)
+	if level < minimumLevel {
+		level = minimumLevel
 	}
 	return fmt.Sprintf("avc1.6400%02x", level)
 }

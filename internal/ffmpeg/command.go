@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/h264level"
 )
 
 type StreamParams struct {
@@ -112,49 +113,14 @@ func (b *CommandBuilder) videoEncodeArgs(p VideoParams) []string {
 	}
 
 	segmentTimes := formatKeyframeTimes(p.Segments)
-	level := p.Rendition.Level
-	if level <= 0 {
-		level = outputLevel(p.Rendition.Height, p.Rendition.FrameRate)
-	}
-
-	args := append([]string(nil), b.HWAccel.EncodeFlags...)
-
-	args = append(args,
-		"-vf", fmt.Sprintf(b.HWAccel.ScaleFilter, p.Rendition.Width, p.Rendition.Height),
-		"-profile:v", "high",
-		"-level:v", fmt.Sprintf("%.1f", float64(level)/10),
-		"-b:v", fmt.Sprintf("%d", p.Rendition.Bitrate),
-		"-maxrate", fmt.Sprintf("%d", int(float64(p.Rendition.Bitrate)*1.5)),
-		"-bufsize", fmt.Sprintf("%d", p.Rendition.Bitrate*5),
-		b.HWAccel.KeyframeFlag, segmentTimes,
-	)
+	args := b.transcodeVideoArgs(p.Rendition)
+	args = append(args, b.HWAccel.KeyframeFlag, segmentTimes)
 
 	if b.HWAccel.Accelerator == domain.AccelCUDA {
 		args = append(args, "-forced-idr", "1")
 	}
 
 	return args
-}
-
-func outputLevel(height int, frameRate float64) int {
-	switch {
-	case height >= 2160 && frameRate > 30:
-		return 52
-	case height >= 2160:
-		return 51
-	case height >= 1080 && frameRate > 30:
-		return 42
-	case height >= 1080:
-		return 40
-	case height >= 720 && frameRate > 30:
-		return 32
-	case height >= 720:
-		return 31
-	case height >= 480:
-		return 30
-	default:
-		return 21
-	}
 }
 
 func (b *CommandBuilder) Audio(p AudioParams) []string {
@@ -281,16 +247,7 @@ func (b *CommandBuilder) videoStreamEncodeArgs(p VideoStreamParams) []string {
 		return []string{"-c:v", "copy"}
 	}
 
-	args := make([]string, len(b.HWAccel.EncodeFlags))
-	copy(args, b.HWAccel.EncodeFlags)
-
-	args = append(args,
-		"-vf", fmt.Sprintf(b.HWAccel.ScaleFilter, p.Rendition.Width, p.Rendition.Height),
-		"-profile:v", "high",
-		"-b:v", fmt.Sprintf("%d", p.Rendition.Bitrate),
-		"-maxrate", fmt.Sprintf("%d", int(float64(p.Rendition.Bitrate)*1.5)),
-		"-bufsize", fmt.Sprintf("%d", p.Rendition.Bitrate*5),
-	)
+	args := b.transcodeVideoArgs(p.Rendition)
 
 	if len(p.KeyframeTimes) > 0 {
 		times := make([]string, len(p.KeyframeTimes))
@@ -305,6 +262,28 @@ func (b *CommandBuilder) videoStreamEncodeArgs(p VideoStreamParams) []string {
 	}
 
 	return args
+}
+
+func (b *CommandBuilder) transcodeVideoArgs(rendition domain.VideoRendition) []string {
+	peakBitrate := rendition.PeakBitrate
+	if peakBitrate <= 0 {
+		peakBitrate = int(float64(rendition.Bitrate) * 1.5)
+	}
+	level := rendition.Level
+	minimumLevel := h264level.Minimum(rendition.Width, rendition.Height, rendition.FrameRate, peakBitrate)
+	if level < minimumLevel {
+		level = minimumLevel
+	}
+
+	args := append([]string(nil), b.HWAccel.EncodeFlags...)
+	return append(args,
+		"-vf", fmt.Sprintf(b.HWAccel.ScaleFilter, rendition.Width, rendition.Height),
+		"-profile:v", "high",
+		"-level:v", fmt.Sprintf("%.1f", float64(level)/10),
+		"-b:v", fmt.Sprintf("%d", rendition.Bitrate),
+		"-maxrate", fmt.Sprintf("%d", peakBitrate),
+		"-bufsize", fmt.Sprintf("%d", rendition.Bitrate*5),
+	)
 }
 
 func (b *CommandBuilder) AudioStream(p AudioStreamParams) []string {

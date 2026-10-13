@@ -66,7 +66,7 @@ func TestGenerator_MasterIncludesAudioGroupsAndVariants(t *testing.T) {
 		t.Fatalf("expected a default rendition in each codec-compatible group: %s", out)
 	}
 
-	if !strings.Contains(out, "CODECS=\"avc1.640028,mp4a.40.2\"") {
+	if !strings.Contains(out, "CODECS=\"avc1.64002a,mp4a.40.2\"") {
 		t.Fatalf("expected 1080p codec string: %s", out)
 	}
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/h264level"
 )
 
 type bounds struct {
@@ -67,7 +68,8 @@ func GenerateVideo(video domain.VideoStream) []domain.VideoRendition {
 		if directStreamCodecs[srcCodec] && targetHeight == srcHeight && directStreamCompatible(video) {
 			method = domain.DirectStream
 		}
-		level := outputLevel(targetHeight, video.FrameRate)
+		peakBitrate := int(float64(bitrate) * 1.5)
+		level := h264level.Minimum(targetWidth, targetHeight, video.FrameRate, peakBitrate)
 		codec := videoCodecString(level)
 		if method == domain.DirectStream {
 			codec = sourceVideoCodecString(video)
@@ -79,7 +81,7 @@ func GenerateVideo(video domain.VideoStream) []domain.VideoRendition {
 			Width:       targetWidth,
 			Height:      targetHeight,
 			Bitrate:     bitrate,
-			PeakBitrate: int(float64(bitrate) * 1.5),
+			PeakBitrate: peakBitrate,
 			FrameRate:   video.FrameRate,
 			Codec:       codec,
 			Level:       level,
@@ -130,27 +132,6 @@ func sourceVideoCodecString(video domain.VideoStream) string {
 
 func videoCodecString(level int) string {
 	return fmt.Sprintf("avc1.6400%02x", level)
-}
-
-func outputLevel(height int, frameRate float64) int {
-	switch {
-	case height >= 2160 && frameRate > 30:
-		return 52
-	case height >= 2160:
-		return 51
-	case height >= 1080 && frameRate > 30:
-		return 42
-	case height >= 1080:
-		return 40
-	case height >= 720 && frameRate > 30:
-		return 32
-	case height >= 720:
-		return 31
-	case height >= 480:
-		return 30
-	default:
-		return 21
-	}
 }
 
 func calculateWidth(srcWidth, srcHeight, targetHeight int) int {
