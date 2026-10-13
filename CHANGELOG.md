@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.16] - 2026-10-13
+
+- fix: derive valid H.264 levels for renditions
+
+
 ## [0.0.15] - 2026-10-12
 
 - feat: read MP4 keyframes from the moov header
