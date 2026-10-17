@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.18] - 2026-10-17
+
+- feat: add Controller.SubtitlesVTT to extract several subtitle tracks in one ffmpeg invocation
+- fix: reject bitmap subtitle codecs per track and honour cancellation when extracting subtitles
+
 ## [0.0.17] - 2026-10-17
 
 - fix: keep a job's lock until the job finishes and let later segment requests wait on it

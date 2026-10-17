@@ -900,6 +900,11 @@ func (c *Controller) Sprite(ctx context.Context, sourceURL string, index int) ([
 	return c.miscGen.GetSprite(ctx, sourceURL, spriteKey, meta.Duration, c.spriteURL(sourceURL), index)
 }
 
+type SubtitleResult struct {
+	Data []byte
+	Err  error
+}
+
 // SubtitleVTT extracts and returns subtitles in WebVTT format.
 //
 // The lang parameter specifies the subtitle track language code (e.g., "en", "es").
@@ -907,24 +912,50 @@ func (c *Controller) Sprite(ctx context.Context, sourceURL string, index int) ([
 //
 // Subtitles are extracted from the source on first request and cached.
 func (c *Controller) SubtitleVTT(ctx context.Context, sourceURL string, trackID string) ([]byte, error) {
+	results, err := c.SubtitlesVTT(ctx, sourceURL, []string{trackID})
+	if err != nil {
+		return nil, err
+	}
+	result := results[trackID]
+	return result.Data, result.Err
+}
+
+func (c *Controller) SubtitlesVTT(ctx context.Context, sourceURL string, trackIDs []string) (map[string]SubtitleResult, error) {
 	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
 
-	streamIndex := -1
-	for _, sub := range meta.Subtitles {
-		if sub.ID == trackID {
-			streamIndex = sub.Index
-			break
+	results := make(map[string]SubtitleResult, len(trackIDs))
+	jobs := make([]misc.SubtitleJob, 0, len(trackIDs))
+	for _, trackID := range trackIDs {
+		var found *domain.SubtitleStream
+		for i := range meta.Subtitles {
+			if meta.Subtitles[i].ID == trackID {
+				found = &meta.Subtitles[i]
+				break
+			}
 		}
-	}
-	if streamIndex == -1 {
-		return nil, fmt.Errorf("subtitle track %s not found", trackID)
+		if found == nil {
+			results[trackID] = SubtitleResult{Err: fmt.Errorf("subtitle track %s not found", trackID)}
+			continue
+		}
+		jobs = append(jobs, misc.SubtitleJob{
+			Key:         assetIdentity(mediaKey, "subtitle", trackID),
+			TrackID:     trackID,
+			StreamIndex: found.Index,
+			Codec:       found.Codec,
+		})
 	}
 
-	subtitleKey := assetIdentity(mediaKey, "subtitle", trackID)
-	return c.miscGen.GetSubtitles(ctx, sourceURL, subtitleKey, streamIndex, trackID)
+	outcomes, err := c.miscGen.GetSubtitlesBatch(ctx, sourceURL, jobs)
+	if err != nil {
+		return nil, err
+	}
+	for trackID, outcome := range outcomes {
+		results[trackID] = SubtitleResult{Data: outcome.Data, Err: outcome.Err}
+	}
+	return results, nil
 }
 
 // Preview returns an animated GIF preview of the video.
