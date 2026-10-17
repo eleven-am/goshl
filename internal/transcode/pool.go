@@ -3,6 +3,7 @@ package transcode
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -17,6 +18,8 @@ import (
 
 const defaultTargetDuration = 6.0
 
+var ErrJobAbandoned = errors.New("job abandoned: no remaining waiters")
+
 type Pool struct {
 	coordinator    domain.Coordinator
 	size           int
@@ -28,6 +31,11 @@ type Pool struct {
 	jobTimeout     time.Duration
 	observer       domain.Observer
 	profile        string
+	onJobDone      func(jobID string)
+
+	runMu     sync.Mutex
+	running   map[string]context.CancelCauseFunc
+	abandoned map[string]struct{}
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -38,6 +46,7 @@ type PoolConfig struct {
 	JobTimeout time.Duration
 	Observer   domain.Observer
 	Profile    string
+	OnJobDone  func(jobID string)
 }
 
 func NewPool(
@@ -72,6 +81,48 @@ func NewPool(
 		jobTimeout:     config.JobTimeout,
 		observer:       config.Observer,
 		profile:        config.Profile,
+		onJobDone:      config.OnJobDone,
+		running:        make(map[string]context.CancelCauseFunc),
+		abandoned:      make(map[string]struct{}),
+	}
+}
+
+func (p *Pool) CancelJob(jobID string) {
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
+	if cancel, ok := p.running[jobID]; ok {
+		cancel(ErrJobAbandoned)
+		return
+	}
+	p.abandoned[jobID] = struct{}{}
+}
+
+func (p *Pool) ReviveJob(jobID string) {
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
+	delete(p.abandoned, jobID)
+}
+
+func (p *Pool) beginJob(jobID string, cancel context.CancelCauseFunc) (started bool, abandoned bool) {
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
+	if _, ok := p.running[jobID]; ok {
+		return false, false
+	}
+	p.running[jobID] = cancel
+	if _, ok := p.abandoned[jobID]; ok {
+		delete(p.abandoned, jobID)
+		return true, true
+	}
+	return true, false
+}
+
+func (p *Pool) endJob(jobID string) {
+	p.runMu.Lock()
+	delete(p.running, jobID)
+	p.runMu.Unlock()
+	if p.onJobDone != nil {
+		p.onJobDone(jobID)
 	}
 }
 
@@ -128,7 +179,17 @@ func (p *Pool) worker(ctx context.Context, jobs <-chan domain.Job) {
 
 func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 	started := time.Now()
-	jobCtx, cancel := p.jobContext(ctx, job)
+	baseCtx, cancelCause := context.WithCancelCause(ctx)
+	defer cancelCause(nil)
+	begun, abandoned := p.beginJob(job.ID, cancelCause)
+	if !begun {
+		return
+	}
+	defer p.endJob(job.ID)
+	if abandoned {
+		return
+	}
+	jobCtx, cancel := p.jobContext(baseCtx, job)
 	defer cancel()
 	if err := p.validateJob(job); err != nil {
 		p.failJob(jobCtx, job, err, started)
@@ -392,7 +453,9 @@ func (p *Pool) ack(job domain.Job, started time.Time) {
 }
 
 func (p *Pool) failJob(ctx context.Context, job domain.Job, err error, started time.Time) {
-	p.publishError(ctx, job, err)
+	if !errors.Is(context.Cause(ctx), ErrJobAbandoned) {
+		p.publishError(ctx, job, err)
+	}
 	p.observe(ctx, domain.Event{Type: domain.EventJobFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Error: err.Error(), Duration: time.Since(started)})
 }
 

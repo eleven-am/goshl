@@ -15,6 +15,8 @@ const (
 	EventSegmentCacheMiss    EventType = "segment.cache.miss"
 	EventLockWait            EventType = "segment.lock.wait"
 	EventJobEnqueued         EventType = "job.enqueued"
+	EventJobJoined           EventType = "job.joined"
+	EventJobAbandoned        EventType = "job.abandoned"
 	EventJobStarted          EventType = "job.started"
 	EventJobCompleted        EventType = "job.completed"
 	EventJobFailed           EventType = "job.failed"

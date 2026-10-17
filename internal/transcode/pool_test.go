@@ -325,3 +325,70 @@ func TestWaitForWorkerReturnsWorkerError(t *testing.T) {
 		t.Fatalf("expected worker error, got %v", err)
 	}
 }
+
+func TestPoolProcessJobSkipsJobAlreadyRunning(t *testing.T) {
+	coord := &stubCoordinator{}
+	done := 0
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{OnJobDone: func(string) { done++ }})
+	if started, _ := pool.beginJob("job", func(error) {}); !started {
+		t.Fatal("expected first begin to start")
+	}
+
+	pool.processJob(context.Background(), domain.Job{ID: "job"})
+
+	if done != 0 || len(coord.acks) != 0 || len(coord.publishes) != 0 {
+		t.Fatalf("duplicate must be skipped without side effects: done=%d acks=%d publishes=%d", done, len(coord.acks), len(coord.publishes))
+	}
+}
+
+func TestPoolCancelJobCancelsRunningJobWithAbandonedCause(t *testing.T) {
+	pool := NewPool(&stubCoordinator{}, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	pool.beginJob("job", cancel)
+
+	pool.CancelJob("job")
+
+	if !errors.Is(context.Cause(ctx), ErrJobAbandoned) {
+		t.Fatalf("expected abandoned cause, got %v", context.Cause(ctx))
+	}
+}
+
+func TestPoolSkipsQueuedJobAbandonedBeforeStart(t *testing.T) {
+	coord := &stubCoordinator{}
+	var finished []string
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{OnJobDone: func(id string) { finished = append(finished, id) }})
+
+	pool.CancelJob("job")
+	pool.processJob(context.Background(), domain.Job{ID: "job"})
+
+	if len(coord.acks) != 0 || len(coord.publishes) != 0 {
+		t.Fatalf("abandoned queued job must not ack or publish errors")
+	}
+	if len(finished) != 1 || finished[0] != "job" {
+		t.Fatalf("expected done callback once, got %v", finished)
+	}
+}
+
+func TestPoolReviveJobClearsAbandonedMark(t *testing.T) {
+	pool := NewPool(&stubCoordinator{}, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool.CancelJob("job")
+	pool.ReviveJob("job")
+
+	started, abandoned := pool.beginJob("job", func(error) {})
+	if !started || abandoned {
+		t.Fatalf("revived job must start normally, started=%v abandoned=%v", started, abandoned)
+	}
+}
+
+func TestFailJobDoesNotPublishErrorsForAbandonedJob(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := &Pool{coordinator: coord, streamType: domain.StreamVideo}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(ErrJobAbandoned)
+
+	pool.failJob(ctx, domain.Job{Rendition: "1080p", StartIndex: 0, EndIndex: 3}, ErrJobAbandoned, time.Now())
+
+	if len(coord.publishes) != 0 {
+		t.Fatalf("abandoned job must not poison segment status, got %d publishes", len(coord.publishes))
+	}
+}

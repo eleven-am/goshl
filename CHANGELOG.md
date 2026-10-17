@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.17] - 2026-10-17
+
+- fix: keep a job's lock until the job finishes and let later segment requests wait on it
+- fix: anchor transcode jobs at the requested segment without overlapping neighbouring jobs
+- feat: cancel jobs whose last waiter left after AbandonGrace
+- feat: add job.joined and job.abandoned events and segment ready latency
+
 ## [0.0.16] - 2026-10-13
 
 - fix: derive valid H.264 levels for renditions

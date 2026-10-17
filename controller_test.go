@@ -145,6 +145,8 @@ type stubCoordinator struct {
 }
 
 func (c *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.enqueued = append(c.enqueued, job)
 	return nil
 }
@@ -180,8 +182,10 @@ func (c *stubCoordinator) sendWaitStatus(status domain.SegmentStatus) {
 	c.waitSegmentChan() <- status
 }
 func (c *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
+	c.mu.Lock()
 	c.lockCalls = append(c.lockCalls, key)
 	c.lockTTLs = append(c.lockTTLs, ttl)
+	c.mu.Unlock()
 	if c.onAcquireLock != nil {
 		c.onAcquireLock(key)
 	}
@@ -191,6 +195,8 @@ func (c *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.
 	return uuid.New().String(), nil
 }
 func (c *stubCoordinator) ReleaseLock(ctx context.Context, key string, token string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.releaseCalls = append(c.releaseCalls, key)
 	return nil
 }
@@ -345,7 +351,7 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 	if len(coord.enqueued) != 1 {
 		t.Fatalf("expected enqueue, got %d", len(coord.enqueued))
 	}
-	if coord.enqueued[0].StartIndex != 0 || coord.enqueued[0].EndIndex != 1 {
+	if coord.enqueued[0].StartIndex != 1 || coord.enqueued[0].EndIndex != 1 {
 		t.Fatalf("unexpected job indices: %#v", coord.enqueued[0])
 	}
 }
@@ -556,8 +562,12 @@ func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
 	if !strings.HasPrefix(coord.lockCalls[0], "job:") {
 		t.Fatalf("expected canonical job lock key, got %q", coord.lockCalls[0])
 	}
+	if len(coord.releaseCalls) != 0 {
+		t.Fatalf("lock must be held while the job runs, got %d releases", len(coord.releaseCalls))
+	}
+	svc.finishFlight(coord.enqueued[0].ID)
 	if len(coord.releaseCalls) != 1 {
-		t.Fatalf("expected 1 release call, got %d", len(coord.releaseCalls))
+		t.Fatalf("expected 1 release call after job finished, got %d", len(coord.releaseCalls))
 	}
 }
 
@@ -752,6 +762,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 	}()
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 	firstJobID := coord.enqueued[0].ID
+	svc.finishFlight(firstJobID)
 
 	coord.enqueued = nil
 	coord.waitCh = make(chan domain.SegmentStatus, 1)
@@ -879,24 +890,241 @@ func TestSegmentContinuesPollingAfterNotificationChannelCloses(t *testing.T) {
 	}
 }
 
-func TestSegmentLocksCanonicalBatch(t *testing.T) {
+func seekTestController(t *testing.T, store *stubStorage, coord *stubCoordinator, opts Options) *Controller {
+	t.Helper()
+	meta := &domain.Metadata{Duration: 60, Keyframes: []float64{0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60}, Video: domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, PixelFormat: "yuv420p", Profile: "High", Level: 40}}
+	metaBytes, _ := json.Marshal(meta)
+	store.metaData = metaBytes
+	store.metaExists = true
+	if store.segments == nil {
+		store.segments = map[int][]byte{}
+	}
+	opts.Storage = store
+	opts.Coordinator = coord
+	opts.PathGen = stubPathGen{}
+	return NewController(opts)
+}
+
+func TestSegmentSequentialRequestsInsideOneJobEnqueueOnce(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	meta := &domain.Metadata{Duration: 30, Keyframes: []float64{0, 6, 12, 18, 24, 30}, Video: domain.VideoStream{Codec: "h264", Width: 1920, Height: 1080, PixelFormat: "yuv420p", Profile: "High", Level: 40}}
-	metaBytes, _ := json.Marshal(meta)
-	store := &stubStorage{metaData: metaBytes, metaExists: true, segments: map[int][]byte{}}
 	coord := &stubCoordinator{}
-	svc := NewController(Options{Storage: store, Coordinator: coord, PathGen: stubPathGen{}})
+	svc := seekTestController(t, &stubStorage{}, coord, Options{})
 
-	for _, index := range []int{1, 2} {
+	for index := 0; index < 4; index++ {
 		coord.waitCh = make(chan domain.SegmentStatus, 1)
 		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
 		_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", index)
 	}
 
-	if len(coord.lockCalls) != 2 || coord.lockCalls[0] != coord.lockCalls[1] {
-		t.Fatalf("segments in one batch must use one lock identity: %#v", coord.lockCalls)
+	if len(coord.enqueued) != 1 {
+		t.Fatalf("expected exactly 1 enqueue for 4 requests in one job range, got %d", len(coord.enqueued))
+	}
+	if len(coord.lockCalls) != 1 {
+		t.Fatalf("expected exactly 1 lock acquisition, got %d", len(coord.lockCalls))
+	}
+	if len(coord.releaseCalls) != 0 {
+		t.Fatalf("lock must be held until the job finishes, got %d releases", len(coord.releaseCalls))
+	}
+	svc.finishFlight(coord.enqueued[0].ID)
+	if len(coord.releaseCalls) != 1 {
+		t.Fatalf("expected the lock released when the job finished, got %d", len(coord.releaseCalls))
+	}
+}
+
+func TestSegmentEnqueuesAgainAfterJobFinished(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	coord := &stubCoordinator{}
+	svc := seekTestController(t, &stubStorage{}, coord, Options{})
+
+	for round := 0; round < 2; round++ {
+		coord.waitCh = make(chan domain.SegmentStatus, 1)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
+		svc.finishFlight(coord.enqueued[round].ID)
+	}
+
+	if len(coord.enqueued) != 2 {
+		t.Fatalf("expected a fresh enqueue after the first job finished, got %d", len(coord.enqueued))
+	}
+}
+
+func TestSegmentAnchorsJobAtRequestedIndex(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	coord := &stubCoordinator{}
+	svc := seekTestController(t, &stubStorage{}, coord, Options{})
+	coord.waitCh = make(chan domain.SegmentStatus, 1)
+	coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 3)
+
+	if len(coord.enqueued) != 1 {
+		t.Fatalf("expected 1 enqueue, got %d", len(coord.enqueued))
+	}
+	job := coord.enqueued[0]
+	if job.StartIndex != 3 || job.EndIndex != 6 || job.RequestedIndex != 3 {
+		t.Fatalf("job must start at the requested segment, got %d-%d requested %d", job.StartIndex, job.EndIndex, job.RequestedIndex)
+	}
+	if job.Segments[0].Index != 3 || len(job.ExpectedIndices) != 4 {
+		t.Fatalf("unexpected job segments: %#v", job.ExpectedIndices)
+	}
+}
+
+func TestSegmentJobStopsBeforeExistingSegments(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	coord := &stubCoordinator{}
+	store := &stubStorage{segments: map[int][]byte{5: []byte("cached")}}
+	svc := seekTestController(t, store, coord, Options{})
+	coord.waitCh = make(chan domain.SegmentStatus, 1)
+	coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+
+	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 3)
+
+	job := coord.enqueued[0]
+	if job.StartIndex != 3 || job.EndIndex != 4 {
+		t.Fatalf("job must not overlap existing segment 5, got %d-%d", job.StartIndex, job.EndIndex)
+	}
+}
+
+func TestSegmentJobStopsBeforeNeighbouringFlight(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	coord := &stubCoordinator{}
+	svc := seekTestController(t, &stubStorage{}, coord, Options{})
+
+	for _, index := range []int{5, 3} {
+		coord.waitCh = make(chan domain.SegmentStatus, 1)
+		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
+		_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", index)
+	}
+
+	if len(coord.enqueued) != 2 {
+		t.Fatalf("expected 2 enqueues, got %d", len(coord.enqueued))
+	}
+	if coord.enqueued[0].StartIndex != 5 || coord.enqueued[0].EndIndex != 8 {
+		t.Fatalf("unexpected first job: %d-%d", coord.enqueued[0].StartIndex, coord.enqueued[0].EndIndex)
+	}
+	if coord.enqueued[1].StartIndex != 3 || coord.enqueued[1].EndIndex != 4 {
+		t.Fatalf("second job must stop before the in-flight job, got %d-%d", coord.enqueued[1].StartIndex, coord.enqueued[1].EndIndex)
+	}
+}
+
+type abandonRecorder struct {
+	mu     sync.Mutex
+	jobIDs []string
+}
+
+func (r *abandonRecorder) Observe(ctx context.Context, event domain.Event) {
+	if event.Type != domain.EventJobAbandoned {
+		return
+	}
+	r.mu.Lock()
+	r.jobIDs = append(r.jobIDs, event.JobID)
+	r.mu.Unlock()
+}
+
+func (r *abandonRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.jobIDs)
+}
+
+func TestSegmentAbandonsJobAfterLastWaiterLeaves(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	recorder := &abandonRecorder{}
+	coord := &stubCoordinator{}
+	svc := seekTestController(t, &stubStorage{}, coord, Options{AbandonGrace: 60 * time.Millisecond, Observer: recorder})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Segment(ctx, "file:///media", domain.StreamVideo, "1080p", 2)
+		done <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		coord.mu.Lock()
+		queued := len(coord.enqueued)
+		coord.mu.Unlock()
+		if queued == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("job was never enqueued")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if recorder.count() != 0 {
+		t.Fatalf("job must survive the grace period")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if recorder.count() != 1 {
+		t.Fatalf("expected the job abandoned once after the grace period, got %d", recorder.count())
+	}
+}
+
+func TestSegmentRejoinWithinGraceKeepsJob(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	recorder := &abandonRecorder{}
+	coord := &stubCoordinator{}
+	svc := seekTestController(t, &stubStorage{}, coord, Options{AbandonGrace: 150 * time.Millisecond, Observer: recorder})
+
+	first, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Segment(first, "file:///media", domain.StreamVideo, "1080p", 2)
+		firstDone <- err
+	}()
+	for {
+		coord.mu.Lock()
+		queued := len(coord.enqueued)
+		coord.mu.Unlock()
+		if queued == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancelFirst()
+	<-firstDone
+
+	second, cancelSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := svc.Segment(second, "file:///media", domain.StreamVideo, "1080p", 3)
+		secondDone <- err
+	}()
+
+	time.Sleep(400 * time.Millisecond)
+	if recorder.count() != 0 {
+		t.Fatalf("a rejoined job must not be abandoned while a waiter remains")
+	}
+	coord.mu.Lock()
+	enqueued := len(coord.enqueued)
+	coord.mu.Unlock()
+	if enqueued != 1 {
+		t.Fatalf("rejoin must not enqueue again, got %d", enqueued)
+	}
+
+	cancelSecond()
+	<-secondDone
+	time.Sleep(400 * time.Millisecond)
+	if recorder.count() != 1 {
+		t.Fatalf("expected abandon after the last waiter left, got %d", recorder.count())
 	}
 }
 

@@ -193,7 +193,9 @@ const (
 
 	EventLockWait = domain.EventLockWait
 
-	EventJobEnqueued = domain.EventJobEnqueued
+	EventJobEnqueued  = domain.EventJobEnqueued
+	EventJobJoined    = domain.EventJobJoined
+	EventJobAbandoned = domain.EventJobAbandoned
 
 	EventJobStarted = domain.EventJobStarted
 
@@ -273,6 +275,12 @@ type Options struct {
 
 	JobTimeout time.Duration
 
+	// AbandonGrace is how long a running job survives after its last waiter
+	// leaves before it is cancelled. A waiter that joins within the grace
+	// period keeps the job alive.
+	// Default: 3 seconds.
+	AbandonGrace time.Duration
+
 	ProbeTimeout time.Duration
 
 	SpriteStorage SpriteStorage
@@ -306,6 +314,9 @@ func (o *Options) setDefaults() {
 	}
 	if o.JobTimeout == 0 {
 		o.JobTimeout = 2 * time.Minute
+	}
+	if o.AbandonGrace == 0 {
+		o.AbandonGrace = 3 * time.Second
 	}
 	if o.ProbeTimeout == 0 {
 		o.ProbeTimeout = o.JobTimeout
@@ -346,7 +357,7 @@ func (o *Options) validateError() error {
 	if o.PathGen == nil {
 		return fmt.Errorf("%w: PathGen is required", ErrInvalidOptions)
 	}
-	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.ProbeTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
+	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.AbandonGrace < 0 || o.ProbeTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 {
@@ -362,7 +373,7 @@ func (o *Options) validateError() error {
 }
 
 func (o *Options) validateResolvedError() error {
-	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.ProbeTimeout <= 0 || o.TargetDuration <= 0 {
+	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.AbandonGrace <= 0 || o.ProbeTimeout <= 0 || o.TargetDuration <= 0 {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob <= 0 || o.VideoPoolSize <= 0 || o.AudioPoolSize <= 0 {
@@ -405,6 +416,7 @@ type Controller struct {
 	miscGen         *misc.Generator
 	hwConfig        *domain.HWAccelConfig
 	pipelineVersion string
+	flights         *flightRegistry
 }
 
 // NewController creates a new Controller with the given options.
@@ -459,6 +471,9 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 
 	notifyingStorage := segment.NewNotifyingStorage(opts.Storage, opts.Coordinator, opts.Observer)
 
+	var controller *Controller
+	onJobDone := func(jobID string) { controller.finishFlight(jobID) }
+
 	videoPool := transcode.NewPool(
 		opts.Coordinator,
 		opts.VideoPoolSize,
@@ -467,7 +482,7 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
-		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline, OnJobDone: onJobDone},
 	)
 
 	audioPool := transcode.NewPool(
@@ -478,13 +493,13 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
-		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline, OnJobDone: onJobDone},
 	)
 
 	miscGen := misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer)
 	miscGen.SetSpriteStorage(opts.SpriteStorage)
 
-	controller := &Controller{
+	controller = &Controller{
 		opts:            opts,
 		playlist:        playlist.NewGenerator(opts.PathGen),
 		videoPool:       videoPool,
@@ -493,6 +508,7 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 		miscGen:         miscGen,
 		hwConfig:        hwConfig,
 		pipelineVersion: pipeline,
+		flights:         newFlightRegistry(),
 	}
 	controller.observe(ctx, domain.Event{Type: domain.EventHardwareSelected, Accelerator: hwConfig.Accelerator})
 	if hwConfig.Error != "" && hwConfig.Requested != hwConfig.Accelerator {
@@ -666,16 +682,44 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 	if index >= len(allSegments) {
 		return nil, fmt.Errorf("%w: %d", ErrSegmentOutOfRange, index)
 	}
-	startIdx := (index / c.opts.SegmentsPerJob) * c.opts.SegmentsPerJob
-	endIdx := startIdx + c.opts.SegmentsPerJob - 1
+	endIdx := index + c.opts.SegmentsPerJob - 1
 	if endIdx >= len(allSegments) {
 		endIdx = len(allSegments) - 1
 	}
-	jobID := deterministicJobID(mediaKey, renditionName, streamType, startIdx, endIdx)
+	for next := index + 1; next <= endIdx; next++ {
+		nextInfo := info
+		nextInfo.Index = next
+		nextExists, err := c.opts.Storage.SegmentExists(ctx, nextInfo)
+		if err != nil {
+			return nil, fmt.Errorf("check segment: %w", err)
+		}
+		if nextExists {
+			endIdx = next - 1
+			break
+		}
+	}
+
+	requested := time.Now()
+	existing, created := c.joinFlight(mediaKey, streamType, renditionName, index, endIdx)
+	if existing != nil {
+		defer c.leaveFlight(existing)
+		statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
+		if err != nil {
+			return nil, fmt.Errorf("wait segment: %w", err)
+		}
+		c.observe(ctx, domain.Event{Type: domain.EventJobJoined, MediaKey: mediaKey, JobID: existing.jobID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: existing.start, EndIndex: existing.end})
+		if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+			return data, err
+		}
+		return c.waitForSegment(ctx, info, statusCh, requested)
+	}
+	defer c.leaveFlight(created)
+	startIdx, endIdx, jobID := created.start, created.end, created.jobID
 	lockKey := "job:" + jobID
 	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.JobTimeout+time.Minute)
 
 	if lockErr != nil {
+		c.finishFlight(jobID)
 		if !errors.Is(lockErr, domain.ErrLockHeld) {
 			return nil, fmt.Errorf("acquire segment lock: %w", lockErr)
 		}
@@ -687,47 +731,37 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 			return data, err
 		}
-		return c.waitForSegment(ctx, info, statusCh)
+		return c.waitForSegment(ctx, info, statusCh, requested)
 	}
-	releaseLock := true
-	defer func() {
-		if !releaseLock {
-			return
-		}
-		cleanup, cancel := cleanupContext()
-		defer cancel()
-		if err := c.opts.Coordinator.ReleaseLock(cleanup, lockKey, token); err != nil {
-			c.observe(cleanup, domain.Event{Type: domain.EventLockReleaseFailed, MediaKey: mediaKey, JobID: jobID, Error: err.Error()})
-		}
-	}()
+	c.setFlightLock(created, lockKey, token)
 
 	exists, err = c.opts.Storage.SegmentExists(ctx, info)
 	if err != nil {
+		c.finishFlight(jobID)
 		return nil, fmt.Errorf("check segment: %w", err)
 	}
 	if exists {
+		c.finishFlight(jobID)
 		return c.opts.Storage.ReadSegment(ctx, info)
 	}
 
 	statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
 	if err != nil {
+		c.finishFlight(jobID)
 		return nil, fmt.Errorf("wait segment: %w", err)
 	}
 
 	job := c.buildJob(sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition)
 	if err := c.opts.Coordinator.Enqueue(ctx, job); err != nil {
+		c.finishFlight(jobID)
 		return nil, fmt.Errorf("enqueue: %w", err)
 	}
 	c.observe(ctx, domain.Event{Type: domain.EventJobEnqueued, MediaKey: mediaKey, JobID: job.ID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
 
-	data, err := c.waitForSegment(ctx, info, statusCh)
-	if errors.Is(err, ErrSegmentTimeout) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		releaseLock = false
-	}
-	return data, err
+	return c.waitForSegment(ctx, info, statusCh, requested)
 }
 
-func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus) ([]byte, error) {
+func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus, requested time.Time) ([]byte, error) {
 	timer := time.NewTimer(c.opts.SegmentTimeout)
 	defer timer.Stop()
 	poll := time.NewTicker(100 * time.Millisecond)
@@ -759,7 +793,7 @@ func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData
 			}
 			data, err := c.opts.Storage.ReadSegment(ctx, info)
 			if err == nil {
-				c.observe(ctx, domain.Event{Type: domain.EventSegmentReady, MediaKey: info.MediaKey, Rendition: info.Rendition, Index: info.Index, Bytes: int64(len(data))})
+				c.observe(ctx, domain.Event{Type: domain.EventSegmentReady, MediaKey: info.MediaKey, Rendition: info.Rendition, Index: info.Index, Bytes: int64(len(data)), Duration: time.Since(requested)})
 			}
 			return data, err
 		}
