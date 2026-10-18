@@ -133,7 +133,7 @@ func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bo
 type stubCoordinator struct {
 	mu            sync.Mutex
 	enqueued      []domain.Job
-	subCh         chan domain.Job
+	subCh         chan domain.JobDelivery
 	waitCh        chan domain.SegmentStatus
 	lockErr       error
 	subErrByType  map[domain.StreamType]error
@@ -150,17 +150,26 @@ func (c *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
 	c.enqueued = append(c.enqueued, job)
 	return nil
 }
-func (c *stubCoordinator) Subscribe(ctx context.Context, streamType domain.StreamType) (<-chan domain.Job, error) {
+func (c *stubCoordinator) Subscribe(ctx context.Context, streamType domain.StreamType, profile string) (<-chan domain.JobDelivery, error) {
 	if c.subErrByType != nil && c.subErrByType[streamType] != nil {
 		return nil, c.subErrByType[streamType]
 	}
 	if c.subCh == nil {
-		c.subCh = make(chan domain.Job)
+		c.subCh = make(chan domain.JobDelivery)
 		close(c.subCh)
 	}
 	return c.subCh, nil
 }
-func (c *stubCoordinator) Ack(ctx context.Context, jobID string) error { return nil }
+func (c *stubCoordinator) Renew(ctx context.Context, receipt string, ttl time.Duration) error {
+	return nil
+}
+func (c *stubCoordinator) Ack(ctx context.Context, receipt string) error { return nil }
+func (c *stubCoordinator) SettleJob(ctx context.Context, receipt string, status domain.JobStatus) error {
+	return nil
+}
+func (c *stubCoordinator) WaitJob(ctx context.Context, runID string) (<-chan domain.JobStatus, error) {
+	return make(chan domain.JobStatus), nil
+}
 func (c *stubCoordinator) NotifySegment(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
 	return nil
 }
@@ -180,6 +189,26 @@ func (c *stubCoordinator) waitSegmentChan() chan domain.SegmentStatus {
 }
 func (c *stubCoordinator) sendWaitStatus(status domain.SegmentStatus) {
 	c.waitSegmentChan() <- status
+}
+func (c *stubCoordinator) AcquireJob(ctx context.Context, jobID, runID string, ttl time.Duration) (string, string, error) {
+	key := "job:" + jobID
+	c.mu.Lock()
+	c.lockCalls = append(c.lockCalls, key)
+	c.lockTTLs = append(c.lockTTLs, ttl)
+	c.mu.Unlock()
+	if c.onAcquireLock != nil {
+		c.onAcquireLock(key)
+	}
+	if c.lockErr != nil {
+		return "", "active-run", c.lockErr
+	}
+	return uuid.New().String(), runID, nil
+}
+func (c *stubCoordinator) ReleaseJob(ctx context.Context, jobID, runID, token string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseCalls = append(c.releaseCalls, "job:"+jobID)
+	return nil
 }
 func (c *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	c.mu.Lock()
@@ -565,7 +594,7 @@ func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
 	if len(coord.releaseCalls) != 0 {
 		t.Fatalf("lock must be held while the job runs, got %d releases", len(coord.releaseCalls))
 	}
-	svc.finishFlight(coord.enqueued[0].ID)
+	svc.finishFlightRun(coord.enqueued[0].ID, coord.enqueued[0].RunID)
 	if len(coord.releaseCalls) != 1 {
 		t.Fatalf("expected 1 release call after job finished, got %d", len(coord.releaseCalls))
 	}
@@ -762,7 +791,8 @@ func TestDeterministicJobIDs(t *testing.T) {
 	}()
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 	firstJobID := coord.enqueued[0].ID
-	svc.finishFlight(firstJobID)
+	firstJobRunID := coord.enqueued[0].RunID
+	svc.finishFlightRun(firstJobID, firstJobRunID)
 
 	coord.enqueued = nil
 	coord.waitCh = make(chan domain.SegmentStatus, 1)
@@ -927,7 +957,7 @@ func TestSegmentSequentialRequestsInsideOneJobEnqueueOnce(t *testing.T) {
 	if len(coord.releaseCalls) != 0 {
 		t.Fatalf("lock must be held until the job finishes, got %d releases", len(coord.releaseCalls))
 	}
-	svc.finishFlight(coord.enqueued[0].ID)
+	svc.finishFlightRun(coord.enqueued[0].ID, coord.enqueued[0].RunID)
 	if len(coord.releaseCalls) != 1 {
 		t.Fatalf("expected the lock released when the job finished, got %d", len(coord.releaseCalls))
 	}
@@ -944,7 +974,7 @@ func TestSegmentEnqueuesAgainAfterJobFinished(t *testing.T) {
 		coord.waitCh = make(chan domain.SegmentStatus, 1)
 		coord.waitCh <- domain.SegmentStatus{State: domain.SegmentStateReady}
 		_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
-		svc.finishFlight(coord.enqueued[round].ID)
+		svc.finishFlightRun(coord.enqueued[round].ID, coord.enqueued[round].RunID)
 	}
 
 	if len(coord.enqueued) != 2 {
@@ -1037,7 +1067,7 @@ func (r *abandonRecorder) count() int {
 	return len(r.jobIDs)
 }
 
-func TestSegmentAbandonsJobAfterLastWaiterLeaves(t *testing.T) {
+func TestSegmentKeepsClusterJobAfterLocalWaiterLeaves(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
@@ -1071,12 +1101,12 @@ func TestSegmentAbandonsJobAfterLastWaiterLeaves(t *testing.T) {
 		t.Fatalf("job must survive the grace period")
 	}
 	time.Sleep(250 * time.Millisecond)
-	if recorder.count() != 1 {
-		t.Fatalf("expected the job abandoned once after the grace period, got %d", recorder.count())
+	if recorder.count() != 0 {
+		t.Fatalf("local waiter departure must not abandon cluster work, got %d events", recorder.count())
 	}
 }
 
-func TestSegmentRejoinWithinGraceKeepsJob(t *testing.T) {
+func TestSegmentRejoinKeepsExistingClusterJob(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
@@ -1123,8 +1153,8 @@ func TestSegmentRejoinWithinGraceKeepsJob(t *testing.T) {
 	cancelSecond()
 	<-secondDone
 	time.Sleep(400 * time.Millisecond)
-	if recorder.count() != 1 {
-		t.Fatalf("expected abandon after the last waiter left, got %d", recorder.count())
+	if recorder.count() != 0 {
+		t.Fatalf("local waiters must not abandon cluster work, got %d events", recorder.count())
 	}
 }
 
@@ -1259,8 +1289,9 @@ func TestBuildJobUsesOverlapOnlyForDirectStream(t *testing.T) {
 	}
 	direct := domain.VideoRendition{Name: "source", Method: domain.DirectStream}
 	transcoded := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
-	directJob := controller.buildJob("source", "key", StreamVideo, direct.Name, 1, 1, 2, segments, &direct, nil)
-	transcodedJob := controller.buildJob("source", "key", StreamVideo, transcoded.Name, 1, 1, 2, segments, &transcoded, nil)
+	deadline := time.Now().Add(time.Minute)
+	directJob := controller.buildJob("run-direct", deadline, "source", "key", StreamVideo, direct.Name, 1, 1, 2, segments, &direct, nil)
+	transcodedJob := controller.buildJob("run-transcoded", deadline, "source", "key", StreamVideo, transcoded.Name, 1, 1, 2, segments, &transcoded, nil)
 	if directJob.Overlap == nil {
 		t.Fatalf("direct stream must retain the preceding GOP boundary")
 	}

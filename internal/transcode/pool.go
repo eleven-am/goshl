@@ -18,7 +18,8 @@ import (
 
 const defaultTargetDuration = 6.0
 
-var ErrJobAbandoned = errors.New("job abandoned: no remaining waiters")
+var ErrDeliveryLeaseLost = errors.New("job delivery lease lost")
+var ErrJobExpired = errors.New("job deadline expired")
 
 type Pool struct {
 	coordinator    domain.Coordinator
@@ -31,11 +32,9 @@ type Pool struct {
 	jobTimeout     time.Duration
 	observer       domain.Observer
 	profile        string
-	onJobDone      func(jobID string)
 
-	runMu     sync.Mutex
-	running   map[string]context.CancelCauseFunc
-	abandoned map[string]struct{}
+	runMu   sync.Mutex
+	running map[string]context.CancelCauseFunc
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -46,7 +45,39 @@ type PoolConfig struct {
 	JobTimeout time.Duration
 	Observer   domain.Observer
 	Profile    string
-	OnJobDone  func(jobID string)
+}
+
+type leaseSettlement struct {
+	mu         sync.Mutex
+	settling   bool
+	renewalErr error
+}
+
+func (s *leaseSettlement) begin() {
+	s.mu.Lock()
+	s.settling = true
+	s.mu.Unlock()
+}
+
+func (s *leaseSettlement) deferRenewalFailure(err error) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.settling {
+		return false
+	}
+	if s.renewalErr == nil {
+		s.renewalErr = err
+	}
+	return true
+}
+
+func (s *leaseSettlement) finish(settled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if settled {
+		return nil
+	}
+	return s.renewalErr
 }
 
 func NewPool(
@@ -81,49 +112,24 @@ func NewPool(
 		jobTimeout:     config.JobTimeout,
 		observer:       config.Observer,
 		profile:        config.Profile,
-		onJobDone:      config.OnJobDone,
 		running:        make(map[string]context.CancelCauseFunc),
-		abandoned:      make(map[string]struct{}),
 	}
 }
 
-func (p *Pool) CancelJob(jobID string) {
+func (p *Pool) beginJob(runID string, cancel context.CancelCauseFunc) bool {
 	p.runMu.Lock()
 	defer p.runMu.Unlock()
-	if cancel, ok := p.running[jobID]; ok {
-		cancel(ErrJobAbandoned)
-		return
+	if _, ok := p.running[runID]; ok {
+		return false
 	}
-	p.abandoned[jobID] = struct{}{}
+	p.running[runID] = cancel
+	return true
 }
 
-func (p *Pool) ReviveJob(jobID string) {
+func (p *Pool) endJob(runID string) {
 	p.runMu.Lock()
-	defer p.runMu.Unlock()
-	delete(p.abandoned, jobID)
-}
-
-func (p *Pool) beginJob(jobID string, cancel context.CancelCauseFunc) (started bool, abandoned bool) {
-	p.runMu.Lock()
-	defer p.runMu.Unlock()
-	if _, ok := p.running[jobID]; ok {
-		return false, false
-	}
-	p.running[jobID] = cancel
-	if _, ok := p.abandoned[jobID]; ok {
-		delete(p.abandoned, jobID)
-		return true, true
-	}
-	return true, false
-}
-
-func (p *Pool) endJob(jobID string) {
-	p.runMu.Lock()
-	delete(p.running, jobID)
+	delete(p.running, runID)
 	p.runMu.Unlock()
-	if p.onJobDone != nil {
-		p.onJobDone(jobID)
-	}
 }
 
 func (p *Pool) Start(ctx context.Context) error {
@@ -134,7 +140,7 @@ func (p *Pool) Start(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
-	jobs, err := p.coordinator.Subscribe(ctx, p.streamType)
+	jobs, err := p.coordinator.Subscribe(ctx, p.streamType, p.profile)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("subscribe: %w", err)
@@ -161,60 +167,99 @@ func (p *Pool) Stop() {
 	p.cancel = nil
 }
 
-func (p *Pool) worker(ctx context.Context, jobs <-chan domain.Job) {
+func (p *Pool) worker(ctx context.Context, jobs <-chan domain.JobDelivery) {
 	defer p.wg.Done()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case job, ok := <-jobs:
+		case delivery, ok := <-jobs:
 			if !ok {
 				return
 			}
-			p.processJob(ctx, job)
+			p.processJob(ctx, delivery)
 		}
 	}
 }
 
-func (p *Pool) processJob(ctx context.Context, job domain.Job) {
+func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
+	job := delivery.Job
 	started := time.Now()
 	baseCtx, cancelCause := context.WithCancelCause(ctx)
 	defer cancelCause(nil)
-	begun, abandoned := p.beginJob(job.ID, cancelCause)
-	if !begun {
+	if !p.beginJob(job.RunID, cancelCause) {
 		return
 	}
-	defer p.endJob(job.ID)
-	if abandoned {
+	defer p.endJob(job.RunID)
+	if err := p.validateDelivery(delivery); err != nil {
+		if delivery.Receipt != "" && job.ID != "" && job.RunID != "" {
+			p.failJob(context.Background(), delivery, err, started)
+		} else if delivery.Receipt != "" {
+			p.ack(delivery, started, domain.EventJobFailed)
+		}
+		return
+	}
+	if !job.Deadline.After(time.Now()) {
+		p.failJob(context.Background(), delivery, ErrJobExpired, started)
 		return
 	}
 	jobCtx, cancel := p.jobContext(baseCtx, job)
 	defer cancel()
-	if err := p.validateJob(job); err != nil {
-		p.failJob(jobCtx, job, err, started)
+	leaseTTL := p.leaseTTL(job)
+	if err := p.coordinator.Renew(jobCtx, delivery.Receipt, leaseTTL); err != nil {
+		p.observe(jobCtx, domain.Event{Type: domain.EventJobLeaseFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Error: err.Error(), Duration: time.Since(started)})
 		return
+	}
+	leaseCtx, stopLease := context.WithCancel(baseCtx)
+	leaseDone := make(chan struct{})
+	settlement := &leaseSettlement{}
+	go func() {
+		defer close(leaseDone)
+		p.renewLease(leaseCtx, delivery, leaseTTL, cancelCause, started, settlement)
+	}()
+	var stopLeaseOnce sync.Once
+	finishLease := func() {
+		stopLeaseOnce.Do(func() {
+			stopLease()
+			<-leaseDone
+		})
+	}
+	defer finishLease()
+	finishSettlement := func(settled bool) {
+		finishLease()
+		if err := settlement.finish(settled); err != nil {
+			p.reportLeaseFailure(delivery, err, cancelCause, started)
+		}
+	}
+	fail := func(err error) {
+		settlement.begin()
+		finishSettlement(p.failJob(jobCtx, delivery, err, started))
+	}
+	complete := func() {
+		settlement.begin()
+		finishSettlement(p.completeJob(delivery, started))
 	}
 	p.observe(jobCtx, domain.Event{Type: domain.EventJobStarted, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Duration: time.Since(job.EnqueuedAt)})
 	if p.segmentsExist(jobCtx, job) {
-		p.ack(job, started)
+		complete()
 		return
 	}
 	meta, err := p.getMetadata(jobCtx, job.MediaKey)
 	if err != nil {
-		p.failJob(jobCtx, job, err, started)
+		fail(err)
 		return
 	}
 
 	segments := job.Segments
 	if len(segments) == 0 {
-		p.failJob(jobCtx, job, fmt.Errorf("no segments for range %d-%d", job.StartIndex, job.EndIndex), started)
+		fail(fmt.Errorf("no segments for range %d-%d", job.StartIndex, job.EndIndex))
 		return
 	}
 
 	tmpDir, err := os.MkdirTemp("", "transcode-*")
 	if err != nil {
-		p.failJob(jobCtx, job, fmt.Errorf("create temp dir: %w", err), started)
+		fail(fmt.Errorf("create temp dir: %w", err))
 		return
 	}
 	defer os.RemoveAll(tmpDir)
@@ -226,7 +271,7 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 	if isVideo {
 		videoRendition := job.VideoRendition
 		if videoRendition == nil {
-			p.failJob(jobCtx, job, fmt.Errorf("video rendition %s not found", job.Rendition), started)
+			fail(fmt.Errorf("video rendition %s not found", job.Rendition))
 			return
 		}
 
@@ -252,7 +297,7 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 	} else {
 		audioRendition := job.AudioRendition
 		if audioRendition == nil {
-			p.failJob(jobCtx, job, fmt.Errorf("audio rendition %s not found", job.Rendition), started)
+			fail(fmt.Errorf("audio rendition %s not found", job.Rendition))
 			return
 		}
 		args = p.cmdBuilder.Audio(ffmpeg.AudioParams{
@@ -266,20 +311,65 @@ func (p *Pool) processJob(ctx context.Context, job domain.Job) {
 
 	w := NewWorker(args, p.segStorage, job.MediaKey, job.Rendition, isVideo, tmpDir, skipFirst, job.ExpectedIndices)
 	if err := w.Start(jobCtx); err != nil {
-		p.failJob(jobCtx, job, err, started)
+		fail(err)
 		return
 	}
 
 	if err := p.waitForWorker(jobCtx, w); err != nil {
-		p.failJob(jobCtx, job, err, started)
+		fail(err)
 		return
 	}
 
-	p.ack(job, started)
+	complete()
+}
+
+func (p *Pool) validateDelivery(delivery domain.JobDelivery) error {
+	if delivery.Receipt == "" {
+		return fmt.Errorf("invalid job contract: delivery receipt is missing")
+	}
+	return p.validateJob(delivery.Job)
+}
+
+func (p *Pool) leaseTTL(job domain.Job) time.Duration {
+	ttl := time.Until(job.Deadline) + 15*time.Second
+	if ttl > 30*time.Second {
+		ttl = 30 * time.Second
+	}
+	if ttl < 15*time.Second {
+		ttl = 15 * time.Second
+	}
+	return ttl
+}
+
+func (p *Pool) renewLease(ctx context.Context, delivery domain.JobDelivery, ttl time.Duration, cancel context.CancelCauseFunc, started time.Time, settlement *leaseSettlement) {
+	ticker := time.NewTicker(ttl / 3)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			renewCtx, stop := context.WithTimeout(ctx, ttl/3)
+			err := p.coordinator.Renew(renewCtx, delivery.Receipt, ttl)
+			stop()
+			if err != nil {
+				if !settlement.deferRenewalFailure(err) {
+					p.reportLeaseFailure(delivery, err, cancel, started)
+				}
+				return
+			}
+		}
+	}
+}
+
+func (p *Pool) reportLeaseFailure(delivery domain.JobDelivery, err error, cancel context.CancelCauseFunc, started time.Time) {
+	job := delivery.Job
+	p.observe(context.Background(), domain.Event{Type: domain.EventJobLeaseFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Error: err.Error(), Duration: time.Since(started)})
+	cancel(fmt.Errorf("%w: %v", ErrDeliveryLeaseLost, err))
 }
 
 func (p *Pool) validateJob(job domain.Job) error {
-	if job.ID == "" || job.MediaKey == "" || job.Profile == "" || job.SourceURL == "" || job.Rendition == "" || job.EnqueuedAt.IsZero() || job.Deadline.IsZero() {
+	if job.ID == "" || job.RunID == "" || job.MediaKey == "" || job.Profile == "" || job.SourceURL == "" || job.Rendition == "" || job.EnqueuedAt.IsZero() || job.Deadline.IsZero() {
 		return fmt.Errorf("invalid job contract: required identity is missing")
 	}
 	if p.profile != "" && job.Profile != p.profile {
@@ -390,31 +480,6 @@ func (p *Pool) findAudioRendition(meta *domain.Metadata, name string) *domain.Au
 	return nil
 }
 
-func (p *Pool) publishError(ctx context.Context, job domain.Job, err error) {
-	notifyCtx := ctx
-	var cancel context.CancelFunc
-	if ctx.Err() != nil {
-		notifyCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-	}
-	for i := job.StartIndex; i <= job.EndIndex; i++ {
-		info := domain.SegmentData{
-			MediaKey:  job.MediaKey,
-			Index:     i,
-			Rendition: job.Rendition,
-			IsVideo:   p.streamType == domain.StreamVideo,
-		}
-		status := domain.SegmentStatus{
-			State: domain.SegmentStateError,
-			Error: err.Error(),
-		}
-
-		if notifyErr := p.coordinator.NotifySegment(notifyCtx, info, status); notifyErr != nil {
-			p.observe(notifyCtx, domain.Event{Type: domain.EventSegmentNotifyFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Index: i, Error: notifyErr.Error()})
-		}
-	}
-}
-
 func (p *Pool) jobContext(ctx context.Context, job domain.Job) (context.Context, context.CancelFunc) {
 	deadline := time.Now().Add(p.jobTimeout)
 	if !job.Deadline.IsZero() && job.Deadline.Before(deadline) {
@@ -434,13 +499,14 @@ func (p *Pool) segmentsExist(ctx context.Context, job domain.Job) bool {
 	return true
 }
 
-func (p *Pool) ack(job domain.Job, started time.Time) {
+func (p *Pool) ack(delivery domain.JobDelivery, started time.Time, eventType domain.EventType) {
+	job := delivery.Job
 	ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		if err = p.coordinator.Ack(ackCtx, job.ID); err == nil {
-			p.observe(ackCtx, domain.Event{Type: domain.EventJobCompleted, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Duration: time.Since(started)})
+		if err = p.coordinator.Ack(ackCtx, delivery.Receipt); err == nil {
+			p.observe(ackCtx, domain.Event{Type: eventType, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Duration: time.Since(started)})
 			return
 		}
 		select {
@@ -452,11 +518,45 @@ func (p *Pool) ack(job domain.Job, started time.Time) {
 	p.observe(ackCtx, domain.Event{Type: domain.EventJobAckFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Error: err.Error(), Duration: time.Since(started)})
 }
 
-func (p *Pool) failJob(ctx context.Context, job domain.Job, err error, started time.Time) {
-	if !errors.Is(context.Cause(ctx), ErrJobAbandoned) {
-		p.publishError(ctx, job, err)
+func (p *Pool) settleJob(delivery domain.JobDelivery, state domain.JobState, message string) error {
+	job := delivery.Job
+	status := domain.JobStatus{JobID: job.ID, RunID: job.RunID, State: state, Error: message}
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = p.coordinator.SettleJob(ctx, delivery.Receipt, status)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+		}
 	}
-	p.observe(ctx, domain.Event{Type: domain.EventJobFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Error: err.Error(), Duration: time.Since(started)})
+	p.observe(context.Background(), domain.Event{Type: domain.EventJobSettleFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, Error: err.Error()})
+	return err
+}
+
+func (p *Pool) completeJob(delivery domain.JobDelivery, started time.Time) bool {
+	job := delivery.Job
+	if p.settleJob(delivery, domain.JobStateCompleted, "") == nil {
+		p.observe(context.Background(), domain.Event{Type: domain.EventJobCompleted, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Duration: time.Since(started)})
+		return true
+	}
+	return false
+}
+
+func (p *Pool) failJob(ctx context.Context, delivery domain.JobDelivery, err error, started time.Time) bool {
+	job := delivery.Job
+	cause := context.Cause(ctx)
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, ErrDeliveryLeaseLost) {
+		return false
+	}
+	if p.settleJob(delivery, domain.JobStateFailed, err.Error()) == nil {
+		p.observe(context.Background(), domain.Event{Type: domain.EventJobFailed, MediaKey: job.MediaKey, JobID: job.ID, StreamType: job.StreamType, Rendition: job.Rendition, StartIndex: job.StartIndex, EndIndex: job.EndIndex, Error: err.Error(), Duration: time.Since(started)})
+		return true
+	}
+	return false
 }
 
 func (p *Pool) observe(ctx context.Context, event domain.Event) {

@@ -90,21 +90,39 @@ type Storage interface {
 
 Manages job distribution and segment notifications. For single-instance deployments, an in-memory implementation works. For distributed setups, use something like Redis.
 
-Jobs are concrete, versioned work contracts. A coordinator must preserve every `Job` field unchanged. Enqueue and acknowledgement operations should be idempotent by `Job.ID`; notifications may be transient because Goshl also verifies durable storage while waiting.
+Jobs are concrete, versioned work contracts. A coordinator must preserve every `Job` field unchanged. Enqueue is idempotent by `Job.RunID`. Each delivery has an opaque receipt so settlement cannot affect another execution of the same deterministic batch.
 
 ```go
 type Coordinator interface {
     Enqueue(ctx context.Context, job Job) error
-    Subscribe(ctx context.Context, streamType StreamType) (<-chan Job, error)
-    Ack(ctx context.Context, jobID string) error
+    Subscribe(ctx context.Context, streamType StreamType, profile string) (<-chan JobDelivery, error)
+    Renew(ctx context.Context, receipt string, ttl time.Duration) error
+    Ack(ctx context.Context, receipt string) error
+
+    SettleJob(ctx context.Context, receipt string, status JobStatus) error
+    WaitJob(ctx context.Context, runID string) (<-chan JobStatus, error)
 
     NotifySegment(ctx context.Context, info SegmentData, status SegmentStatus) error
     WaitSegment(ctx context.Context, info SegmentData) (<-chan SegmentStatus, error)
 
+    AcquireJob(ctx context.Context, jobID string, runID string, ttl time.Duration) (token string, activeRunID string, err error)
+    ReleaseJob(ctx context.Context, jobID string, runID string, token string) error
     AcquireLock(ctx context.Context, key string, ttl time.Duration) (token string, err error)
     ReleaseLock(ctx context.Context, key string, token string) error
 }
 ```
+
+`Subscribe` is a competing-consumer subscription scoped to both stream type and pipeline profile. A job must only be delivered to a worker subscribed to its exact `Job.Profile`. Every delivery needs a unique receipt and an initial lease of at least five seconds. `Renew` extends that exact delivery, `Ack` discards only that receipt, and an unacknowledged delivery becomes available again after its lease expires. Redelivery invalidates the previous receipt so its worker can no longer renew or settle the delivery.
+
+`Job.ID` is the deterministic batch identity used for locking. `Job.RunID` identifies one execution of that batch and is the queue idempotency key. Job status is keyed by `RunID`, must fan out to all current waiters, and the latest status must be replayed to a late waiter.
+
+`AcquireJob` atomically acquires the deterministic batch lock and registers its run ID. When the lock is already held, it returns `ErrLockHeld` together with the active run ID. This lets every replica subscribe to the same durable job lifecycle. `ReleaseJob` must compare the job ID, run ID, and token before clearing the lock or active run.
+
+`SettleJob` must atomically validate the active receipt, persist its terminal status, and remove the delivery. It must be idempotent when retried with the same receipt and status. The receipt-to-status settlement record must remain available until at least one minute after `Job.Deadline`. This prevents a crash between status publication and acknowledgement from redelivering terminal work. `Ack` is reserved for malformed deliveries that cannot supply a valid run status.
+
+Job status must remain replayable until at least one minute after `Job.Deadline`. Segment status is only a transient readiness hint and must not replay notifications. Failures travel through run scoped job status. `WaitJob` and `WaitSegment` must unregister their subscribers when the supplied context ends. Goshl does not cancel a cluster job merely because one replica has no local waiters; another replica may still need it.
+
+Terminal job states are immutable. A coordinator must not replace a terminal state.
 
 ### PathGenerator
 

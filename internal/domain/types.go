@@ -4,6 +4,7 @@ import "time"
 
 type Job struct {
 	ID              string
+	RunID           string
 	MediaKey        string
 	Profile         string
 	SourceURL       string
@@ -19,6 +20,26 @@ type Job struct {
 	ExpectedIndices []int
 	VideoRendition  *VideoRendition
 	AudioRendition  *AudioRendition
+}
+
+type JobDelivery struct {
+	Job     Job
+	Receipt string
+}
+
+type JobState string
+
+const (
+	JobStateCompleted JobState = "completed"
+	JobStateFailed    JobState = "failed"
+	JobStateCancelled JobState = "cancelled"
+)
+
+type JobStatus struct {
+	JobID string
+	RunID string
+	State JobState
+	Error string
 }
 
 type SegmentState int

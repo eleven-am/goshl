@@ -39,11 +39,6 @@ func (s *NotifyingStorage) SetMetadata(ctx context.Context, sourceURL string, da
 
 func (s *NotifyingStorage) WriteSegment(ctx context.Context, info domain.SegmentData, data []byte) error {
 	if err := s.storage.WriteSegment(ctx, info, data); err != nil {
-		status := domain.SegmentStatus{
-			State: domain.SegmentStateError,
-			Error: err.Error(),
-		}
-		s.coordinator.NotifySegment(ctx, info, status)
 		return fmt.Errorf("storage write: %w", err)
 	}
 
