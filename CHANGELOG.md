@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.19] - 2026-10-18
+
+- fix: scope distributed job completion and settlement to unique runs and delivery receipts
+- fix: renew worker delivery leases, atomically settle terminal work, and redeliver interrupted jobs
+- fix: keep cluster work alive when only one replica loses its local waiters
+- fix: route workers by pipeline profile and replay terminal failures to segment callers
+
 ## [0.0.18] - 2026-10-17
 
 - feat: add Controller.SubtitlesVTT to extract several subtitle tracks in one ffmpeg invocation

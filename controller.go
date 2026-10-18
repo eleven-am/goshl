@@ -99,6 +99,12 @@ type (
 	// Job represents a transcoding task for a range of segments.
 	Job = domain.Job
 
+	JobDelivery = domain.JobDelivery
+
+	JobState = domain.JobState
+
+	JobStatus = domain.JobStatus
+
 	// PreviewConfig configures animated preview generation parameters.
 	PreviewConfig = domain.PreviewConfig
 
@@ -171,6 +177,12 @@ const (
 
 	SegmentStateError = domain.SegmentStateError
 
+	JobStateCompleted = domain.JobStateCompleted
+
+	JobStateFailed = domain.JobStateFailed
+
+	JobStateCancelled = domain.JobStateCancelled
+
 	DecodeSafe = domain.DecodeSafe
 
 	DecodeDevice = domain.DecodeDevice
@@ -204,6 +216,10 @@ const (
 	EventJobFailed = domain.EventJobFailed
 
 	EventJobAckFailed = domain.EventJobAckFailed
+
+	EventJobLeaseFailed = domain.EventJobLeaseFailed
+
+	EventJobSettleFailed = domain.EventJobSettleFailed
 
 	EventSegmentReady = domain.EventSegmentReady
 
@@ -275,10 +291,7 @@ type Options struct {
 
 	JobTimeout time.Duration
 
-	// AbandonGrace is how long a running job survives after its last waiter
-	// leaves before it is cancelled. A waiter that joins within the grace
-	// period keeps the job alive.
-	// Default: 3 seconds.
+	// AbandonGrace is retained for source compatibility.
 	AbandonGrace time.Duration
 
 	ProbeTimeout time.Duration
@@ -314,9 +327,6 @@ func (o *Options) setDefaults() {
 	}
 	if o.JobTimeout == 0 {
 		o.JobTimeout = 2 * time.Minute
-	}
-	if o.AbandonGrace == 0 {
-		o.AbandonGrace = 3 * time.Second
 	}
 	if o.ProbeTimeout == 0 {
 		o.ProbeTimeout = o.JobTimeout
@@ -357,7 +367,7 @@ func (o *Options) validateError() error {
 	if o.PathGen == nil {
 		return fmt.Errorf("%w: PathGen is required", ErrInvalidOptions)
 	}
-	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.AbandonGrace < 0 || o.ProbeTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
+	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.ProbeTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 {
@@ -373,7 +383,7 @@ func (o *Options) validateError() error {
 }
 
 func (o *Options) validateResolvedError() error {
-	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.AbandonGrace <= 0 || o.ProbeTimeout <= 0 || o.TargetDuration <= 0 {
+	if o.SegmentTimeout <= 0 || o.JobTimeout <= 0 || o.ProbeTimeout <= 0 || o.TargetDuration <= 0 {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob <= 0 || o.VideoPoolSize <= 0 || o.AudioPoolSize <= 0 {
@@ -471,9 +481,6 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 
 	notifyingStorage := segment.NewNotifyingStorage(opts.Storage, opts.Coordinator, opts.Observer)
 
-	var controller *Controller
-	onJobDone := func(jobID string) { controller.finishFlight(jobID) }
-
 	videoPool := transcode.NewPool(
 		opts.Coordinator,
 		opts.VideoPoolSize,
@@ -482,7 +489,7 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
-		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline, OnJobDone: onJobDone},
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
 	)
 
 	audioPool := transcode.NewPool(
@@ -493,13 +500,13 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
-		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline, OnJobDone: onJobDone},
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
 	)
 
 	miscGen := misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer)
 	miscGen.SetSpriteStorage(opts.SpriteStorage)
 
-	controller = &Controller{
+	controller := &Controller{
 		opts:            opts,
 		playlist:        playlist.NewGenerator(opts.PathGen),
 		videoPool:       videoPool,
@@ -557,8 +564,8 @@ func (c *Controller) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the transcoding worker pools.
-// It waits for any in-progress transcoding jobs to complete before returning.
+// Stop cancels local transcoding workers and waits for them to exit.
+// Interrupted deliveries remain unacknowledged so the coordinator can redeliver them.
 // Always call Stop when shutting down to prevent resource leaks.
 func (c *Controller) Stop() {
 	c.videoPool.Stop()
@@ -702,8 +709,9 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 	requested := time.Now()
 	existing, created := c.joinFlight(mediaKey, streamType, renditionName, index, endIdx)
 	if existing != nil {
-		defer c.leaveFlight(existing)
-		statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
+		waitCtx, stopWaiting := context.WithCancel(ctx)
+		defer stopWaiting()
+		statusCh, err := c.opts.Coordinator.WaitSegment(waitCtx, info)
 		if err != nil {
 			return nil, fmt.Errorf("wait segment: %w", err)
 		}
@@ -711,19 +719,20 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 			return data, err
 		}
-		return c.waitForSegment(ctx, info, statusCh, requested)
+		return c.waitForSegment(ctx, info, statusCh, existing, nil, existing.runID, requested)
 	}
-	defer c.leaveFlight(created)
 	startIdx, endIdx, jobID := created.start, created.end, created.jobID
-	lockKey := "job:" + jobID
-	token, lockErr := c.opts.Coordinator.AcquireLock(ctx, lockKey, c.opts.JobTimeout+time.Minute)
+	lockTTL := time.Until(created.deadline) + time.Minute
+	token, activeRunID, lockErr := c.opts.Coordinator.AcquireJob(ctx, jobID, created.runID, lockTTL)
 
 	if lockErr != nil {
-		c.finishFlight(jobID)
+		c.finishFlight(created)
 		if !errors.Is(lockErr, domain.ErrLockHeld) {
 			return nil, fmt.Errorf("acquire segment lock: %w", lockErr)
 		}
-		statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
+		waitCtx, stopWaiting := context.WithCancel(ctx)
+		defer stopWaiting()
+		statusCh, err := c.opts.Coordinator.WaitSegment(waitCtx, info)
 		if err != nil {
 			return nil, fmt.Errorf("wait segment: %w", err)
 		}
@@ -731,41 +740,69 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 			return data, err
 		}
-		return c.waitForSegment(ctx, info, statusCh, requested)
+		if activeRunID == "" {
+			return nil, fmt.Errorf("active run missing for locked job %s", jobID)
+		}
+		jobWaitCtx, stopJobWaiting := context.WithCancel(ctx)
+		defer stopJobWaiting()
+		jobStatusCh, err := c.opts.Coordinator.WaitJob(jobWaitCtx, activeRunID)
+		if err != nil {
+			return nil, fmt.Errorf("wait active job: %w", err)
+		}
+		return c.waitForSegment(ctx, info, statusCh, nil, jobStatusCh, activeRunID, requested)
 	}
-	c.setFlightLock(created, lockKey, token)
+	if !c.setFlightLock(created, token) {
+		c.releaseFlightLocks([]*flight{created})
+		return nil, fmt.Errorf("%w: segment %d", ErrSegmentTimeout, info.Index)
+	}
 
 	exists, err = c.opts.Storage.SegmentExists(ctx, info)
 	if err != nil {
-		c.finishFlight(jobID)
+		c.finishFlight(created)
 		return nil, fmt.Errorf("check segment: %w", err)
 	}
 	if exists {
-		c.finishFlight(jobID)
+		c.finishFlight(created)
 		return c.opts.Storage.ReadSegment(ctx, info)
 	}
 
-	statusCh, err := c.opts.Coordinator.WaitSegment(ctx, info)
+	waitCtx, stopWaiting := context.WithCancel(ctx)
+	defer stopWaiting()
+	statusCh, err := c.opts.Coordinator.WaitSegment(waitCtx, info)
 	if err != nil {
-		c.finishFlight(jobID)
+		c.finishFlight(created)
 		return nil, fmt.Errorf("wait segment: %w", err)
 	}
+	jobWatchCtx, jobWatchCancel := context.WithCancel(context.Background())
+	jobStatusCh, err := c.opts.Coordinator.WaitJob(jobWatchCtx, created.runID)
+	if err != nil {
+		jobWatchCancel()
+		c.finishFlight(created)
+		return nil, fmt.Errorf("wait job: %w", err)
+	}
+	if !c.setFlightWatch(created, jobWatchCancel) {
+		return nil, fmt.Errorf("%w: segment %d", ErrSegmentTimeout, info.Index)
+	}
 
-	job := c.buildJob(sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition)
+	job := c.buildJob(created.runID, created.deadline, sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition)
+	go c.watchFlight(created, jobStatusCh)
 	if err := c.opts.Coordinator.Enqueue(ctx, job); err != nil {
-		c.finishFlight(jobID)
 		return nil, fmt.Errorf("enqueue: %w", err)
 	}
 	c.observe(ctx, domain.Event{Type: domain.EventJobEnqueued, MediaKey: mediaKey, JobID: job.ID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
 
-	return c.waitForSegment(ctx, info, statusCh, requested)
+	return c.waitForSegment(ctx, info, statusCh, created, nil, created.runID, requested)
 }
 
-func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus, requested time.Time) ([]byte, error) {
+func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus, f *flight, jobStatusCh <-chan domain.JobStatus, runID string, requested time.Time) ([]byte, error) {
 	timer := time.NewTimer(c.opts.SegmentTimeout)
 	defer timer.Stop()
 	poll := time.NewTicker(100 * time.Millisecond)
 	defer poll.Stop()
+	var terminal <-chan struct{}
+	if f != nil {
+		terminal = f.done
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -779,6 +816,37 @@ func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData
 			if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 				return data, err
 			}
+		case <-terminal:
+			if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+				return data, err
+			}
+			status, found := c.flightTerminal(f)
+			if found && status.State == domain.JobStateFailed {
+				return nil, fmt.Errorf("segment error: %s", status.Error)
+			}
+			if found && status.State == domain.JobStateCancelled {
+				return nil, fmt.Errorf("segment job cancelled: %s", status.Error)
+			}
+			return nil, fmt.Errorf("segment %d was not produced", info.Index)
+		case status, ok := <-jobStatusCh:
+			if !ok {
+				jobStatusCh = nil
+				continue
+			}
+			if status.RunID != runID {
+				continue
+			}
+			switch status.State {
+			case domain.JobStateFailed:
+				return nil, fmt.Errorf("segment error: %s", status.Error)
+			case domain.JobStateCancelled:
+				return nil, fmt.Errorf("segment job cancelled: %s", status.Error)
+			case domain.JobStateCompleted:
+				if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
+					return data, err
+				}
+				return nil, fmt.Errorf("segment %d was not produced", info.Index)
+			}
 		case status, ok := <-statusCh:
 			if !ok {
 				if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
@@ -787,9 +855,8 @@ func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData
 				statusCh = nil
 				continue
 			}
-			if status.State == domain.SegmentStateError {
-				c.observe(ctx, domain.Event{Type: domain.EventSegmentFailed, MediaKey: info.MediaKey, Rendition: info.Rendition, Index: info.Index, Error: status.Error})
-				return nil, fmt.Errorf("segment error: %s", status.Error)
+			if status.State != domain.SegmentStateReady {
+				continue
 			}
 			data, err := c.opts.Storage.ReadSegment(ctx, info)
 			if err == nil {
@@ -831,7 +898,7 @@ func resolveRendition(meta *domain.Metadata, streamType domain.StreamType, name 
 	return nil, nil, fmt.Errorf("%w: %s", ErrRenditionNotFound, name)
 }
 
-func (c *Controller) buildJob(sourceURL, mediaKey string, streamType domain.StreamType, renditionName string, index, startIdx, endIdx int, allSegments []domain.Segment, video *domain.VideoRendition, audio *domain.AudioRendition) domain.Job {
+func (c *Controller) buildJob(runID string, deadline time.Time, sourceURL, mediaKey string, streamType domain.StreamType, renditionName string, index, startIdx, endIdx int, allSegments []domain.Segment, video *domain.VideoRendition, audio *domain.AudioRendition) domain.Job {
 	segments := append([]domain.Segment(nil), allSegments[startIdx:endIdx+1]...)
 	expected := make([]int, len(segments))
 	for i, segment := range segments {
@@ -845,6 +912,7 @@ func (c *Controller) buildJob(sourceURL, mediaKey string, streamType domain.Stre
 	now := time.Now()
 	return domain.Job{
 		ID:              deterministicJobID(mediaKey, renditionName, streamType, startIdx, endIdx),
+		RunID:           runID,
 		MediaKey:        mediaKey,
 		Profile:         c.pipelineVersion,
 		SourceURL:       sourceURL,
@@ -854,7 +922,7 @@ func (c *Controller) buildJob(sourceURL, mediaKey string, streamType domain.Stre
 		EndIndex:        endIdx,
 		RequestedIndex:  index,
 		EnqueuedAt:      now,
-		Deadline:        now.Add(c.opts.JobTimeout),
+		Deadline:        deadline,
 		Segments:        segments,
 		Overlap:         overlap,
 		ExpectedIndices: expected,

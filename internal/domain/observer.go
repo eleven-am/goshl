@@ -21,6 +21,8 @@ const (
 	EventJobCompleted        EventType = "job.completed"
 	EventJobFailed           EventType = "job.failed"
 	EventJobAckFailed        EventType = "job.ack.failed"
+	EventJobLeaseFailed      EventType = "job.lease.failed"
+	EventJobSettleFailed     EventType = "job.settle.failed"
 	EventSegmentReady        EventType = "segment.ready"
 	EventSegmentFailed       EventType = "segment.failed"
 	EventSegmentNotifyFailed EventType = "segment.notify.failed"

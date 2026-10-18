@@ -71,13 +71,43 @@ Generated-asset keys are namespaced beneath the media key so `DeleteMedia` can r
 `Job` is now a concrete, versioned work contract containing:
 
 - Opaque media and pipeline identities.
+- A run identity for one execution of a deterministic batch.
 - The executable source URL.
 - Exact segment boundaries and expected output indexes.
 - Concrete video or audio rendition parameters.
 - Enqueue time and execution deadline.
 - Direct-stream overlap information when required.
 
-Coordinators must serialize and restore every field without recalculating it. Enqueue and acknowledgement operations should be idempotent by `Job.ID`.
+Coordinators must serialize and restore every field without recalculating it. Enqueue must be idempotent by `Job.RunID`.
+
+Worker subscriptions now include the pipeline profile:
+
+```go
+deliveries, err := coordinator.Subscribe(ctx, goshl.StreamVideo, pipelineProfile)
+```
+
+The coordinator must route a job only to a subscriber whose stream type and profile both match the job. This prevents a software, CUDA, VideoToolbox, VAAPI, or QSV worker from consuming work produced for another pipeline.
+
+Job lifecycle is run scoped:
+
+```go
+status, err := coordinator.WaitJob(ctx, job.RunID)
+err = coordinator.SettleJob(ctx, delivery.Receipt, goshl.JobStatus{
+    JobID: job.ID,
+    RunID: job.RunID,
+    State: goshl.JobStateCompleted,
+})
+```
+
+`WaitJob` must fan out status changes to every waiter and replay the latest state to late subscribers. `SettleJob` must atomically validate the active receipt, retain terminal state until at least one minute after `Job.Deadline`, and remove the delivery. The receipt-to-status settlement record must be retained for the same period so repeating the same settlement remains idempotent. Terminal states are `completed`, `failed`, and `cancelled`. Waiting subscribers must be removed when their context ends.
+
+Terminal states are immutable and must not be replaced.
+
+Job delivery now returns `JobDelivery`, which contains the job and an opaque receipt. Coordinators must give each delivery an initial lease of at least five seconds, renew only the specified receipt through `Renew`, atomically finish valid work through `SettleJob`, and redeliver after an unrenewed lease expires. `Ack` only discards malformed deliveries that cannot publish valid run status. Receipts must never be shared across deliveries or runs, and redelivery must invalidate the previous receipt.
+
+`AcquireJob` must atomically acquire the deterministic batch lock and register the proposed run ID. If the lock is held, it must return `ErrLockHeld` and the active run ID. `ReleaseJob` must clear the mapping only when the job ID, run ID, and token all match. Segment status is only a transient readiness hint and must not be replayed. Failures are delivered through run scoped job status.
+
+Goshl no longer cancels work when the last waiter on one process leaves. Local waiter counts cannot prove that no other replica needs the same batch. Hosts that need abandonment cancellation must implement distributed waiter leases before requesting cancellation.
 
 Workers reject jobs produced for a different pipeline profile. Upgrade producers and workers together, and drain or remove old queued jobs before directing traffic to the new version. Do not run old and new Goshl workers against the same active queue during migration.
 
@@ -160,6 +190,10 @@ Master playlists now distinguish audio codec and channel groups, include aggrega
 ## Operational behavior
 
 - Segment locks use the canonical batch identity across replicas.
+- Job status uses the run identity so a new execution cannot inherit stale terminal state.
+- Workers receive jobs only from queues matching their pipeline profile.
+- Remote terminal states close the originating flight and release its distributed lock.
+- Local waiter departure does not cancel shared cluster work.
 - Waiting requests recheck durable storage and tolerate missed or closed notification channels.
 - Stored segments remain successful when notification or acknowledgement delivery fails.
 - Jobs have hard execution deadlines.
@@ -174,6 +208,10 @@ Master playlists now distinguish audio codec and channel groups, include aggrega
 - Store opaque media and asset keys exactly as supplied.
 - Add `SubtitlePlaylist` routing and use subtitle track IDs.
 - Update coordinator job serialization for every current `Job` field.
+- Route `Subscribe` by both stream type and pipeline profile.
+- Implement durable, replayable `WaitJob` and atomic `SettleJob` lifecycle state.
+- Implement atomic active-run registration through `AcquireJob` and `ReleaseJob`.
+- Deliver jobs with unique receipts and implement receipt-scoped `Renew`, `SettleJob`, and malformed-delivery `Ack`.
 - Drain old jobs and deploy all producers and workers on the same Goshl version.
 - Configure `SourceRevision` for remote or signed sources.
 - Decide between strict hardware failure and `AllowHardwareFallback`.

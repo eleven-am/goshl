@@ -11,24 +11,45 @@ import (
 )
 
 type stubCoordinator struct {
-	publishes []domain.SegmentStatus
-	subErr    error
-	acks      []string
+	publishes    []domain.SegmentStatus
+	jobPublishes []domain.JobStatus
+	subErr       error
+	acks         []string
+	profiles     []string
+	jobErr       error
+	renewErr     error
+	renews       []string
 }
 
 func (s *stubCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
 	return nil
 }
-func (s *stubCoordinator) Subscribe(ctx context.Context, streamType domain.StreamType) (<-chan domain.Job, error) {
+func (s *stubCoordinator) Subscribe(ctx context.Context, streamType domain.StreamType, profile string) (<-chan domain.JobDelivery, error) {
+	s.profiles = append(s.profiles, profile)
 	if s.subErr != nil {
 		return nil, s.subErr
 	}
-	ch := make(chan domain.Job)
+	ch := make(chan domain.JobDelivery)
 	close(ch)
 	return ch, nil
 }
-func (s *stubCoordinator) Ack(ctx context.Context, jobID string) error {
-	s.acks = append(s.acks, jobID)
+func (s *stubCoordinator) Renew(ctx context.Context, receipt string, ttl time.Duration) error {
+	s.renews = append(s.renews, receipt)
+	return s.renewErr
+}
+func (s *stubCoordinator) SettleJob(ctx context.Context, receipt string, status domain.JobStatus) error {
+	s.jobPublishes = append(s.jobPublishes, status)
+	if s.jobErr != nil {
+		return s.jobErr
+	}
+	s.acks = append(s.acks, receipt)
+	return nil
+}
+func (s *stubCoordinator) WaitJob(ctx context.Context, runID string) (<-chan domain.JobStatus, error) {
+	return make(chan domain.JobStatus), nil
+}
+func (s *stubCoordinator) Ack(ctx context.Context, receipt string) error {
+	s.acks = append(s.acks, receipt)
 	return nil
 }
 func (s *stubCoordinator) NotifySegment(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
@@ -39,6 +60,12 @@ func (s *stubCoordinator) WaitSegment(ctx context.Context, info domain.SegmentDa
 	ch := make(chan domain.SegmentStatus)
 	close(ch)
 	return ch, nil
+}
+func (s *stubCoordinator) AcquireJob(ctx context.Context, jobID, runID string, ttl time.Duration) (string, string, error) {
+	return uuid.New().String(), runID, nil
+}
+func (s *stubCoordinator) ReleaseJob(ctx context.Context, jobID, runID, token string) error {
+	return nil
 }
 func (s *stubCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	return uuid.New().String(), nil
@@ -95,23 +122,6 @@ func TestFindVideoAndAudioRenditions(t *testing.T) {
 	}
 }
 
-func TestPublishErrorSendsRange(t *testing.T) {
-	coord := &stubCoordinator{}
-	p := &Pool{coordinator: coord, streamType: domain.StreamVideo}
-	job := domain.Job{Rendition: "1080p", StartIndex: 2, EndIndex: 4}
-
-	p.publishError(context.Background(), job, assertErr("boom"))
-
-	if len(coord.publishes) != 3 {
-		t.Fatalf("expected publish per segment, got %d", len(coord.publishes))
-	}
-	for _, status := range coord.publishes {
-		if status.State != domain.SegmentStateError || status.Error == "" {
-			t.Fatalf("status missing error: %#v", status)
-		}
-	}
-}
-
 type assertErr string
 
 func (e assertErr) Error() string { return string(e) }
@@ -132,6 +142,7 @@ func TestValidateJobRejectsMixedPipelineProfile(t *testing.T) {
 	pool := &Pool{streamType: domain.StreamVideo, profile: "worker-profile"}
 	job := domain.Job{
 		ID:              "job",
+		RunID:           "run",
 		MediaKey:        "media",
 		Profile:         "other-profile",
 		SourceURL:       "source",
@@ -157,7 +168,7 @@ func TestValidateJobRejectsMixedPipelineProfile(t *testing.T) {
 
 func TestPoolStartAndStop(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "pipeline-a"})
 
 	ctx := context.Background()
 	if err := pool.Start(ctx); err != nil {
@@ -170,6 +181,9 @@ func TestPoolStartAndStop(t *testing.T) {
 		t.Fatalf("restart after stop should work: %v", err)
 	}
 	pool.Stop()
+	if len(coord.profiles) != 2 || coord.profiles[0] != "pipeline-a" || coord.profiles[1] != "pipeline-a" {
+		t.Fatalf("subscriptions must be scoped to the worker profile: %v", coord.profiles)
+	}
 }
 
 func TestPoolStartSubscribeFailureCanRetry(t *testing.T) {
@@ -328,67 +342,118 @@ func TestWaitForWorkerReturnsWorkerError(t *testing.T) {
 
 func TestPoolProcessJobSkipsJobAlreadyRunning(t *testing.T) {
 	coord := &stubCoordinator{}
-	done := 0
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{OnJobDone: func(string) { done++ }})
-	if started, _ := pool.beginJob("job", func(error) {}); !started {
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	if started := pool.beginJob("run", func(error) {}); !started {
 		t.Fatal("expected first begin to start")
 	}
 
-	pool.processJob(context.Background(), domain.Job{ID: "job"})
-
-	if done != 0 || len(coord.acks) != 0 || len(coord.publishes) != 0 {
-		t.Fatalf("duplicate must be skipped without side effects: done=%d acks=%d publishes=%d", done, len(coord.acks), len(coord.publishes))
-	}
-}
-
-func TestPoolCancelJobCancelsRunningJobWithAbandonedCause(t *testing.T) {
-	pool := NewPool(&stubCoordinator{}, 1, domain.StreamVideo, 6.0, nil, nil, nil)
-	ctx, cancel := context.WithCancelCause(context.Background())
-	pool.beginJob("job", cancel)
-
-	pool.CancelJob("job")
-
-	if !errors.Is(context.Cause(ctx), ErrJobAbandoned) {
-		t.Fatalf("expected abandoned cause, got %v", context.Cause(ctx))
-	}
-}
-
-func TestPoolSkipsQueuedJobAbandonedBeforeStart(t *testing.T) {
-	coord := &stubCoordinator{}
-	var finished []string
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{OnJobDone: func(id string) { finished = append(finished, id) }})
-
-	pool.CancelJob("job")
-	pool.processJob(context.Background(), domain.Job{ID: "job"})
+	pool.processJob(context.Background(), domain.JobDelivery{Job: domain.Job{ID: "job", RunID: "run"}, Receipt: "receipt"})
 
 	if len(coord.acks) != 0 || len(coord.publishes) != 0 {
-		t.Fatalf("abandoned queued job must not ack or publish errors")
-	}
-	if len(finished) != 1 || finished[0] != "job" {
-		t.Fatalf("expected done callback once, got %v", finished)
+		t.Fatalf("duplicate must be skipped without side effects: acks=%d publishes=%d", len(coord.acks), len(coord.publishes))
 	}
 }
 
-func TestPoolReviveJobClearsAbandonedMark(t *testing.T) {
-	pool := NewPool(&stubCoordinator{}, 1, domain.StreamVideo, 6.0, nil, nil, nil)
-	pool.CancelJob("job")
-	pool.ReviveJob("job")
-
-	started, abandoned := pool.beginJob("job", func(error) {})
-	if !started || abandoned {
-		t.Fatalf("revived job must start normally, started=%v abandoned=%v", started, abandoned)
-	}
-}
-
-func TestFailJobDoesNotPublishErrorsForAbandonedJob(t *testing.T) {
+func TestFailJobLeavesDeliveryPendingDuringShutdown(t *testing.T) {
 	coord := &stubCoordinator{}
 	pool := &Pool{coordinator: coord, streamType: domain.StreamVideo}
 	ctx, cancel := context.WithCancelCause(context.Background())
-	cancel(ErrJobAbandoned)
+	cancel(context.Canceled)
 
-	pool.failJob(ctx, domain.Job{Rendition: "1080p", StartIndex: 0, EndIndex: 3}, ErrJobAbandoned, time.Now())
+	pool.failJob(ctx, domain.JobDelivery{Job: domain.Job{Rendition: "1080p", StartIndex: 0, EndIndex: 3}, Receipt: "receipt"}, context.Canceled, time.Now())
 
 	if len(coord.publishes) != 0 {
-		t.Fatalf("abandoned job must not poison segment status, got %d publishes", len(coord.publishes))
+		t.Fatalf("shutdown must not poison segment status, got %d publishes", len(coord.publishes))
+	}
+	if len(coord.acks) != 0 || len(coord.jobPublishes) != 0 {
+		t.Fatalf("shutdown must leave the delivery pending: acks=%d statuses=%v", len(coord.acks), coord.jobPublishes)
+	}
+}
+
+func TestTerminalSettlementFailureLeavesJobPending(t *testing.T) {
+	coord := &stubCoordinator{jobErr: errors.New("coordinator unavailable")}
+	pool := &Pool{coordinator: coord, streamType: domain.StreamVideo}
+	delivery := domain.JobDelivery{Job: domain.Job{ID: "job", RunID: "run", Rendition: "1080p", StartIndex: 0, EndIndex: 0}, Receipt: "receipt"}
+
+	pool.completeJob(delivery, time.Now())
+
+	if len(coord.acks) != 0 {
+		t.Fatalf("job must remain pending when terminal status cannot be persisted: %v", coord.acks)
+	}
+	if len(coord.jobPublishes) != 3 {
+		t.Fatalf("expected three terminal status attempts, got %d", len(coord.jobPublishes))
+	}
+}
+
+func TestCompletedJobSettlesDeliveryReceipt(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := &Pool{coordinator: coord, streamType: domain.StreamVideo}
+	delivery := domain.JobDelivery{Job: domain.Job{ID: "batch", RunID: "run"}, Receipt: "delivery-receipt"}
+	pool.completeJob(delivery, time.Now())
+	if len(coord.acks) != 1 || coord.acks[0] != delivery.Receipt {
+		t.Fatalf("expected receipt-scoped acknowledgement, got %v", coord.acks)
+	}
+}
+
+func TestInitialLeaseFailureLeavesDeliveryPending(t *testing.T) {
+	coord := &stubCoordinator{renewErr: errors.New("lease unavailable")}
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile"})
+	delivery := domain.JobDelivery{
+		Receipt: "receipt",
+		Job: domain.Job{
+			ID:              "batch",
+			RunID:           "run",
+			MediaKey:        "media",
+			Profile:         "profile",
+			SourceURL:       "source",
+			Rendition:       "720p",
+			StreamType:      domain.StreamVideo,
+			StartIndex:      0,
+			EndIndex:        0,
+			RequestedIndex:  0,
+			EnqueuedAt:      time.Now(),
+			Deadline:        time.Now().Add(time.Minute),
+			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
+			ExpectedIndices: []int{0},
+			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
+		},
+	}
+	pool.processJob(context.Background(), delivery)
+	if len(coord.acks) != 0 || len(coord.jobPublishes) != 0 {
+		t.Fatalf("lease failure must leave delivery pending: acks=%v statuses=%v", coord.acks, coord.jobPublishes)
+	}
+}
+
+func TestExpiredDeliveryPublishesFailureAndSettles(t *testing.T) {
+	coord := &stubCoordinator{}
+	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile"})
+	delivery := domain.JobDelivery{
+		Receipt: "expired-receipt",
+		Job: domain.Job{
+			ID:              "batch",
+			RunID:           "expired-run",
+			MediaKey:        "media",
+			Profile:         "profile",
+			SourceURL:       "source",
+			Rendition:       "720p",
+			StreamType:      domain.StreamVideo,
+			StartIndex:      0,
+			EndIndex:        0,
+			RequestedIndex:  0,
+			EnqueuedAt:      time.Now().Add(-time.Minute),
+			Deadline:        time.Now().Add(-time.Second),
+			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
+			ExpectedIndices: []int{0},
+			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
+		},
+	}
+
+	pool.processJob(context.Background(), delivery)
+
+	if len(coord.jobPublishes) != 1 || coord.jobPublishes[0].State != domain.JobStateFailed || coord.jobPublishes[0].Error != ErrJobExpired.Error() {
+		t.Fatalf("expired delivery did not publish one terminal failure: %#v", coord.jobPublishes)
+	}
+	if len(coord.acks) != 1 || coord.acks[0] != delivery.Receipt {
+		t.Fatalf("expired delivery was not acknowledged: %v", coord.acks)
 	}
 }

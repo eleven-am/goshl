@@ -111,7 +111,7 @@ func TestTranscodeDeadlineIgnoresProbeTimeout(t *testing.T) {
 	controller := &Controller{opts: Options{JobTimeout: time.Minute, ProbeTimeout: 10 * time.Minute}, pipelineVersion: "test"}
 	segments := []domain.Segment{{Index: 0, Start: 0, End: 6}}
 	video := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
-	job := controller.buildJob("source", "key", StreamVideo, video.Name, 0, 0, 0, segments, &video, nil)
+	job := controller.buildJob("run", time.Now().Add(time.Minute), "source", "key", StreamVideo, video.Name, 0, 0, 0, segments, &video, nil)
 	if remaining := time.Until(job.Deadline); remaining > time.Minute || remaining < 50*time.Second {
 		t.Fatalf("expected deadline near JobTimeout, got %v", remaining)
 	}

@@ -91,11 +91,20 @@ type stubPubSub struct {
 func (p *stubPubSub) Enqueue(ctx context.Context, job domain.Job) error {
 	return nil
 }
-func (p *stubPubSub) Subscribe(ctx context.Context, streamType domain.StreamType) (<-chan domain.Job, error) {
+func (p *stubPubSub) Subscribe(ctx context.Context, streamType domain.StreamType, profile string) (<-chan domain.JobDelivery, error) {
 	return nil, nil
 }
-func (p *stubPubSub) Ack(ctx context.Context, jobID string) error {
+func (p *stubPubSub) Renew(ctx context.Context, receipt string, ttl time.Duration) error {
 	return nil
+}
+func (p *stubPubSub) Ack(ctx context.Context, receipt string) error {
+	return nil
+}
+func (p *stubPubSub) SettleJob(ctx context.Context, receipt string, status domain.JobStatus) error {
+	return nil
+}
+func (p *stubPubSub) WaitJob(ctx context.Context, runID string) (<-chan domain.JobStatus, error) {
+	return make(chan domain.JobStatus), nil
 }
 func (p *stubPubSub) NotifySegment(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
 	p.publishes = append(p.publishes, struct {
@@ -106,6 +115,12 @@ func (p *stubPubSub) NotifySegment(ctx context.Context, info domain.SegmentData,
 }
 func (p *stubPubSub) WaitSegment(ctx context.Context, info domain.SegmentData) (<-chan domain.SegmentStatus, error) {
 	return nil, nil
+}
+func (p *stubPubSub) AcquireJob(ctx context.Context, jobID, runID string, ttl time.Duration) (string, string, error) {
+	return "token", runID, nil
+}
+func (p *stubPubSub) ReleaseJob(ctx context.Context, jobID, runID, token string) error {
+	return nil
 }
 func (p *stubPubSub) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	return uuid.New().String(), nil
@@ -137,7 +152,7 @@ func TestNotifyingStoragePublishesReadyOnSuccess(t *testing.T) {
 	}
 }
 
-func TestNotifyingStoragePublishesErrorWhenStorageFails(t *testing.T) {
+func TestNotifyingStorageLeavesFailureToRunScopedJobStatus(t *testing.T) {
 	storage := &stubStorage{err: errors.New("boom")}
 	pubsub := &stubPubSub{}
 	n := NewNotifyingStorage(storage, pubsub)
@@ -148,12 +163,8 @@ func TestNotifyingStoragePublishesErrorWhenStorageFails(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 
-	if len(pubsub.publishes) != 1 {
-		t.Fatalf("expected 1 publish, got %d", len(pubsub.publishes))
-	}
-	pub := pubsub.publishes[0]
-	if pub.status.State != domain.SegmentStateError || pub.status.Error == "" {
-		t.Fatalf("expected error status, got %#v", pub.status)
+	if len(pubsub.publishes) != 0 {
+		t.Fatalf("write failures must not publish unscoped segment status: %#v", pubsub.publishes)
 	}
 }
 
