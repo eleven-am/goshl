@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.20] - 2026-10-19
+
+- perf: extract progressive MP4 text subtitles from indexed byte ranges when first requested
+- feat: support indexed `mov_text`/`tx3g` and `wvtt` conversion to cached WebVTT
+- fix: retain the FFmpeg subtitle path for unsupported formats and layouts
+
 ## [0.0.19] - 2026-10-18
 
 - fix: scope distributed job completion and settlement to unique runs and delivery receipts

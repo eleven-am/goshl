@@ -22,6 +22,7 @@ import (
 	"github.com/disintegration/imaging"
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/mediaexec"
+	"github.com/eleven-am/goshl/internal/subtitle"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -368,6 +369,38 @@ func batchKey(jobs []SubtitleJob) string {
 }
 
 func (g *Generator) extractSubtitleBatch(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error {
+	tracks := make([]subtitle.Track, 0, len(jobs))
+	for _, job := range jobs {
+		tracks = append(tracks, subtitle.Track{ID: job.TrackID, StreamIndex: job.StreamIndex, Codec: job.Codec})
+	}
+	indexed, err := subtitle.ExtractBatch(ctx, sourceURL, tracks)
+	if err == nil {
+		remaining := make([]SubtitleJob, 0, len(jobs))
+		for _, job := range jobs {
+			outcome := indexed[job.TrackID]
+			if !outcome.Supported {
+				remaining = append(remaining, job)
+				continue
+			}
+			if outcome.Err != nil {
+				failures[job.TrackID] = outcome.Err
+				continue
+			}
+			if err := g.storage.WriteSubtitleVTT(ctx, job.Key, job.TrackID, outcome.Data); err != nil {
+				failures[job.TrackID] = fmt.Errorf("write subtitle vtt: %w", err)
+			}
+		}
+		jobs = remaining
+	} else if !errors.Is(err, subtitle.ErrUnsupported) {
+		return fmt.Errorf("indexed subtitle extraction: %w", err)
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+	return g.extractSubtitleBatchFFmpeg(ctx, sourceURL, jobs, failures)
+}
+
+func (g *Generator) extractSubtitleBatchFFmpeg(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error {
 	dir, err := os.MkdirTemp("", "goshl-subtitles-")
 	if err != nil {
 		return fmt.Errorf("create subtitle workdir: %w", err)

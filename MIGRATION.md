@@ -136,6 +136,8 @@ playlist, err := controller.SubtitlePlaylist(ctx, sourceURL, "subtitle-3")
 webVTT, err := controller.SubtitleVTT(ctx, sourceURL, "subtitle-3")
 ```
 
+No interface changes are required for indexed subtitle extraction. Progressive MP4 sources with `mov_text`/`tx3g` or `wvtt` tracks now use local random access or HTTP range requests when a subtitle is first requested. The result is written with the existing `Storage.WriteSubtitleVTT` method and reused normally. Remote media endpoints should support single byte ranges and return `206 Partial Content` with an accurate `Content-Range`; sources without that support use the existing FFmpeg path.
+
 ## Controller construction
 
 Use the error-returning constructor in applications:

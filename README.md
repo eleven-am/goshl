@@ -14,7 +14,7 @@ goshl takes a video file and serves it as an HLS stream. It:
 - Caches segments after transcoding
 - Generates multiple quality levels based on source resolution
 - Extracts thumbnail sprites for seek previews
-- Extracts subtitles to WebVTT
+- Extracts subtitles to WebVTT only when a client first requests a track
 
 Segments are only transcoded when a client requests them. A 2-hour video doesn't need to finish transcoding before playback can start.
 
@@ -160,6 +160,10 @@ sprite, err := controller.Sprite(ctx, sourceURL, 0)
 playlist, err := controller.SubtitlePlaylist(ctx, sourceURL, "subtitle-3")
 subs, err := controller.SubtitleVTT(ctx, sourceURL, "subtitle-3")
 ```
+
+For progressive MP4 sources, Goshl reads the MP4 index and fetches only the bytes belonging to requested `mov_text`/`tx3g` or `wvtt` subtitle samples. Local files use random access and HTTP sources use validated byte-range requests. The generated WebVTT is stored through `Storage`, so later requests do not reopen the source.
+
+Unsupported containers, fragmented MP4 layouts, subtitle codecs, and HTTP servers without byte-range support continue through the FFmpeg fallback. Subtitle extraction remains request driven; probing and ingest do not extract subtitle payloads.
 
 ## Options
 

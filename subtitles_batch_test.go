@@ -3,11 +3,16 @@ package goshl
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -194,6 +199,64 @@ func TestSubtitlesVTTSkipsCachedTracks(t *testing.T) {
 	}
 }
 
+func TestSubtitlesVTTIndexesProgressiveMP4AndCachesResult(t *testing.T) {
+	path := makeIndexedSubtitleFixture(t)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var requests atomic.Int64
+	var transferred atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		start, end, ok := subtitleTestRange(request.Header.Get("Range"))
+		if !ok || start < 0 || end >= int64(len(content)) {
+			http.Error(writer, "invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		requests.Add(1)
+		transferred.Add(end - start + 1)
+		writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write(content[start : end+1])
+	}))
+	defer server.Close()
+
+	metadata, err := json.Marshal(&domain.Metadata{Subtitles: []domain.SubtitleStream{{
+		Index: 1,
+		ID:    "english",
+		Codec: "mov_text",
+	}}})
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	storage := &keyedSubtitleStorage{stubStorage: &stubStorage{metaData: metadata, metaExists: true}}
+	service := NewController(Options{Storage: storage, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}})
+	sourceURL := server.URL + "/captions.mp4"
+
+	first, err := service.SubtitleVTT(t.Context(), sourceURL, "english")
+	if err != nil {
+		t.Fatalf("first subtitle request: %v", err)
+	}
+	if !strings.Contains(string(first), "Indexed subtitle") {
+		t.Fatalf("first subtitle response = %q", first)
+	}
+	requestCount := requests.Load()
+	if requestCount == 0 || transferred.Load() >= 1<<20 {
+		t.Fatalf("indexed request used %d requests and %d of %d bytes", requestCount, transferred.Load(), len(content))
+	}
+
+	second, err := service.SubtitleVTT(t.Context(), sourceURL, "english")
+	if err != nil {
+		t.Fatalf("cached subtitle request: %v", err)
+	}
+	if string(second) != string(first) {
+		t.Fatalf("cached response differs: %q != %q", second, first)
+	}
+	if requests.Load() != requestCount {
+		t.Fatalf("cached request accessed source: requests changed from %d to %d", requestCount, requests.Load())
+	}
+}
+
 func TestSubtitlesVTTUnknownTrackIsReported(t *testing.T) {
 	installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2))
@@ -261,4 +324,48 @@ func TestSubtitlesVTTCancellationKillsFFmpeg(t *testing.T) {
 	if err := syscall.Kill(pid, 0); err == nil {
 		t.Fatalf("ffmpeg process %d still running", pid)
 	}
+}
+
+func makeIndexedSubtitleFixture(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is unavailable")
+	}
+	dir := t.TempDir()
+	subtitlePath := filepath.Join(dir, "captions.srt")
+	mediaPath := filepath.Join(dir, "captions.mp4")
+	if err := os.WriteFile(subtitlePath, []byte("1\n00:00:00,250 --> 00:00:01,250\nIndexed subtitle\n"), 0o600); err != nil {
+		t.Fatalf("write subtitle fixture: %v", err)
+	}
+	command := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "color=c=black:s=320x180:r=25:d=2",
+		"-i", subtitlePath,
+		"-map", "0:v", "-map", "1:s",
+		"-c:v", "libx264", "-c:s", "mov_text",
+		"-movflags", "+faststart", "-t", "2", mediaPath,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build subtitle fixture: %v: %s", err, output)
+	}
+	if err := os.Truncate(mediaPath, 32<<20); err != nil {
+		t.Fatalf("pad subtitle fixture: %v", err)
+	}
+	return mediaPath
+}
+
+func subtitleTestRange(value string) (int64, int64, bool) {
+	if !strings.HasPrefix(value, "bytes=") {
+		return 0, 0, false
+	}
+	parts := strings.Split(strings.TrimPrefix(value, "bytes="), "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	end, err := strconv.ParseInt(parts[1], 10, 64)
+	return start, end, err == nil && start <= end
 }
