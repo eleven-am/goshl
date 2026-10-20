@@ -296,6 +296,8 @@ type Options struct {
 
 	ProbeTimeout time.Duration
 
+	GenerationTimeout time.Duration
+
 	SpriteStorage SpriteStorage
 
 	CacheVersion string
@@ -330,6 +332,9 @@ func (o *Options) setDefaults() {
 	}
 	if o.ProbeTimeout == 0 {
 		o.ProbeTimeout = o.JobTimeout
+	}
+	if o.GenerationTimeout == 0 {
+		o.GenerationTimeout = 10 * time.Minute
 	}
 	if o.HWAccelDecodeMode == "" {
 		o.HWAccelDecodeMode = domain.DecodeSafe
@@ -367,7 +372,7 @@ func (o *Options) validateError() error {
 	if o.PathGen == nil {
 		return fmt.Errorf("%w: PathGen is required", ErrInvalidOptions)
 	}
-	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.ProbeTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
+	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.ProbeTimeout < 0 || o.GenerationTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
 	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 {
@@ -505,6 +510,7 @@ func NewControllerWithContext(ctx context.Context, opts Options) (*Controller, e
 
 	miscGen := misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer)
 	miscGen.SetSpriteStorage(opts.SpriteStorage)
+	miscGen.SetGenerationTimeout(opts.GenerationTimeout)
 
 	controller := &Controller{
 		opts:            opts,

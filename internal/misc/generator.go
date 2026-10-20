@@ -32,6 +32,8 @@ const (
 	defaultInterval    = 5.0
 	defaultCols        = 10
 	defaultRows        = 10
+
+	defaultGenerationTimeout = 10 * time.Minute
 )
 
 type Generator struct {
@@ -44,6 +46,9 @@ type Generator struct {
 	subtitles   singleflight.Group
 	coordinator domain.Coordinator
 	observer    domain.Observer
+
+	generationTimeout time.Duration
+	extractSubtitles  func(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error
 
 	thumbWidth  int
 	thumbHeight int
@@ -327,9 +332,7 @@ func (g *Generator) GetSubtitlesBatch(ctx context.Context, sourceURL string, job
 	}
 
 	failures := make(map[string]error)
-	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
-	err := g.coordinateGeneration(runCtx, batchKey(pending), func(readyCtx context.Context) (bool, error) {
+	err := g.generateOnce(ctx, &g.subtitles, batchKey(pending), func(readyCtx context.Context) (bool, error) {
 		for _, job := range pending {
 			ok, err := g.storage.SubtitleVTTExists(readyCtx, job.Key, job.TrackID)
 			if err != nil || !ok {
@@ -338,7 +341,7 @@ func (g *Generator) GetSubtitlesBatch(ctx context.Context, sourceURL string, job
 		}
 		return true, nil
 	}, func(genCtx context.Context) error {
-		return g.extractSubtitleBatch(genCtx, sourceURL, pending, failures)
+		return g.runSubtitleExtraction(genCtx, sourceURL, pending, failures)
 	})
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -366,6 +369,13 @@ func batchKey(jobs []SubtitleJob) string {
 	sort.Strings(keys)
 	sum := sha256.Sum256([]byte(strings.Join(keys, "\x01")))
 	return "subtitles:" + hex.EncodeToString(sum[:])
+}
+
+func (g *Generator) runSubtitleExtraction(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error {
+	if g.extractSubtitles != nil {
+		return g.extractSubtitles(ctx, sourceURL, jobs, failures)
+	}
+	return g.extractSubtitleBatch(ctx, sourceURL, jobs, failures)
 }
 
 func (g *Generator) extractSubtitleBatch(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error {
@@ -600,7 +610,7 @@ func (g *Generator) thumbnailArgs(sourceURL string, duration float64, config dom
 
 func (g *Generator) generateOnce(ctx context.Context, group *singleflight.Group, key string, ready func(context.Context) (bool, error), generate func(context.Context) error) error {
 	result := group.DoChan(key, func() (any, error) {
-		runCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		runCtx, cancel := context.WithTimeout(context.Background(), g.timeout())
 		defer cancel()
 		return nil, g.coordinateGeneration(runCtx, key, ready, generate)
 	})
@@ -621,41 +631,63 @@ func (g *Generator) coordinateGeneration(ctx context.Context, key string, ready 
 		return generate(ctx)
 	}
 	lockKey := "asset:" + key
-	token, err := g.coordinator.AcquireLock(ctx, lockKey, 11*time.Minute)
-	if err != nil {
-		if !errors.Is(err, domain.ErrLockHeld) {
-			return fmt.Errorf("acquire asset lock: %w", err)
+	ttl := g.timeout() + time.Minute
+	runLocked := func(token string) error {
+		defer func() {
+			cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if releaseErr := g.coordinator.ReleaseLock(cleanup, lockKey, token); releaseErr != nil {
+				g.observe(cleanup, domain.Event{Type: domain.EventLockReleaseFailed, MediaKey: key, Error: releaseErr.Error()})
+			}
+		}()
+		isReady, err := ready(ctx)
+		if err != nil || isReady {
+			return err
 		}
-		g.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: key})
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-ticker.C:
-				isReady, readyErr := ready(ctx)
-				if readyErr != nil {
-					return readyErr
-				}
-				if isReady {
-					return nil
-				}
+		return generate(ctx)
+	}
+	token, err := g.coordinator.AcquireLock(ctx, lockKey, ttl)
+	if err == nil {
+		return runLocked(token)
+	}
+	if !errors.Is(err, domain.ErrLockHeld) {
+		return fmt.Errorf("acquire asset lock: %w", err)
+	}
+	g.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: key})
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			isReady, readyErr := ready(ctx)
+			if readyErr != nil {
+				return readyErr
+			}
+			if isReady {
+				return nil
+			}
+			token, err := g.coordinator.AcquireLock(ctx, lockKey, ttl)
+			if err == nil {
+				return runLocked(token)
+			}
+			if !errors.Is(err, domain.ErrLockHeld) {
+				return fmt.Errorf("acquire asset lock: %w", err)
 			}
 		}
 	}
-	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if releaseErr := g.coordinator.ReleaseLock(cleanup, lockKey, token); releaseErr != nil {
-			g.observe(cleanup, domain.Event{Type: domain.EventLockReleaseFailed, MediaKey: key, Error: releaseErr.Error()})
-		}
-	}()
-	isReady, err := ready(ctx)
-	if err != nil || isReady {
-		return err
+}
+
+func (g *Generator) timeout() time.Duration {
+	if g.generationTimeout > 0 {
+		return g.generationTimeout
 	}
-	return generate(ctx)
+	return defaultGenerationTimeout
+}
+
+func (g *Generator) SetGenerationTimeout(timeout time.Duration) {
+	g.generationTimeout = timeout
 }
 
 func (g *Generator) observe(ctx context.Context, event domain.Event) {

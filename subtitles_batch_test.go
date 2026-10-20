@@ -86,11 +86,17 @@ exit 0
 
 func newSubtitleController(t *testing.T, subs []domain.SubtitleStream) *Controller {
 	t.Helper()
+	return newSubtitleControllerWithTimeout(t, subs, 0)
+}
+
+func newSubtitleControllerWithTimeout(t *testing.T, subs []domain.SubtitleStream, generationTimeout time.Duration) *Controller {
+	t.Helper()
 	metaBytes, _ := json.Marshal(&domain.Metadata{Subtitles: subs})
 	return NewController(Options{
-		Storage:     &keyedSubtitleStorage{stubStorage: &stubStorage{metaData: metaBytes, metaExists: true}},
-		Coordinator: &stubCoordinator{},
-		PathGen:     stubPathGen{},
+		Storage:           &keyedSubtitleStorage{stubStorage: &stubStorage{metaData: metaBytes, metaExists: true}},
+		Coordinator:       &stubCoordinator{},
+		PathGen:           stubPathGen{},
+		GenerationTimeout: generationTimeout,
 	})
 }
 
@@ -283,10 +289,10 @@ func TestSubtitleVTTUsesBatchPath(t *testing.T) {
 	}
 }
 
-func TestSubtitlesVTTCancellationKillsFFmpeg(t *testing.T) {
+func TestSubtitlesVTTCallerCancelDetachesAndGenerationTimeoutKillsFFmpeg(t *testing.T) {
 	_, pidPath := installSubtitleFFmpeg(t)
 	t.Setenv("FAKE_HANG", "1")
-	svc := newSubtitleController(t, textTracks(2, 4))
+	svc := newSubtitleControllerWithTimeout(t, textTracks(2, 4), 1500*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -321,9 +327,17 @@ func TestSubtitlesVTTCancellationKillsFFmpeg(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("batch did not return after cancel")
 	}
-	if err := syscall.Kill(pid, 0); err == nil {
-		t.Fatalf("ffmpeg process %d still running", pid)
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("ffmpeg process %d died on caller cancel", pid)
 	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("ffmpeg process %d still running after generation timeout", pid)
 }
 
 func makeIndexedSubtitleFixture(t *testing.T) string {
