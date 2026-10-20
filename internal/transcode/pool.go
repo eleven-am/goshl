@@ -283,7 +283,11 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 
 		var actualSeekKeyframe float64
 		if videoRendition.Method == domain.DirectStream && len(videoSegments) > 0 {
-			actualSeekKeyframe = findNearestKeyframe(meta.Keyframes, videoSegments[0].Start)
+			actualSeekKeyframe, err = p.cmdBuilder.SeekLanding(jobCtx, job.SourceURL, videoSegments[0].Start, meta.Video.Index)
+			if err != nil {
+				fail(err)
+				return
+			}
 		}
 
 		args = p.cmdBuilder.Video(ffmpeg.VideoParams{
@@ -567,26 +571,4 @@ func (p *Pool) observe(ctx context.Context, event domain.Event) {
 		event.Time = time.Now()
 	}
 	p.observer.Observe(ctx, event)
-}
-
-func findNearestKeyframe(keyframes []float64, target float64) float64 {
-	if len(keyframes) == 0 {
-		return 0
-	}
-
-	var prevKeyframe float64
-	var result float64
-	for _, kf := range keyframes {
-		if kf <= target+0.001 {
-			prevKeyframe = result
-			result = kf
-		} else {
-			break
-		}
-	}
-
-	if prevKeyframe > 0 && target-result < 0.01 {
-		return prevKeyframe
-	}
-	return result
 }

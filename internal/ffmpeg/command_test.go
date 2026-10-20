@@ -200,3 +200,39 @@ func assertTimestampsPreservedAfterSeek(t *testing.T, joined string) {
 		t.Fatalf("seek output must preserve the media timeline: %s", joined)
 	}
 }
+
+func TestParseFramecrcFirstPTS(t *testing.T) {
+	output := "#format: frame checksums\n#version: 2\n#hash: CRC32\n#tb 0: 1/12800\n#media_type 0: video\n#stream#, dts,        pts, duration,     size, crc\n0,      25600,      25600,      512,     1234, 0xdeadbeef\n"
+	got, err := parseFramecrcFirstPTS(output)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != 2.0 {
+		t.Fatalf("expected 2.0, got %v", got)
+	}
+}
+
+func TestParseFramecrcFirstPTSRejectsMissingPacket(t *testing.T) {
+	if _, err := parseFramecrcFirstPTS("#tb 0: 1/25\n#stream#, dts, pts, duration, size, crc\n"); err == nil {
+		t.Fatal("expected error when no packet was written")
+	}
+}
+
+func TestParseFramecrcFirstPTSRejectsMalformedPacket(t *testing.T) {
+	if _, err := parseFramecrcFirstPTS("#tb 0: 1/25\n0, x, y, 1, 2, 0x0\n"); err == nil {
+		t.Fatal("expected error for malformed pts")
+	}
+}
+
+func TestSeekLandingSharesSeekInputPrefixWithVideo(t *testing.T) {
+	prefix := strings.Join(seekInputArgs("input.mp4", 4), " ")
+	args := NewCommandBuilder(testHW).Video(VideoParams{
+		InputURL:  "input.mp4",
+		Rendition: domain.VideoRendition{Method: domain.DirectStream},
+		Segments:  []domain.Segment{{Index: 2, Start: 4, End: 6}},
+		OutputDir: "/tmp/out",
+	})
+	if !strings.Contains(strings.Join(args, " "), prefix) {
+		t.Fatalf("Video args must contain %q: %v", prefix, args)
+	}
+}

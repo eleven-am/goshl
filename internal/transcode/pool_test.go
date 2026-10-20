@@ -91,14 +91,6 @@ func TestExtractSegmentsRespectsRangeAndDuration(t *testing.T) {
 	}
 }
 
-func TestFindNearestKeyframePrefersPreviousWhenVeryClose(t *testing.T) {
-	keyframes := []float64{5, 10, 15}
-	got := findNearestKeyframe(keyframes, 10.005)
-	if got != 5 {
-		t.Fatalf("expected fallback to previous keyframe, got %v", got)
-	}
-}
-
 func TestFindVideoAndAudioRenditions(t *testing.T) {
 	p := &Pool{}
 	meta := &domain.Metadata{Video: domain.VideoStream{Width: 1920, Height: 1080, Bitrate: 5_000_000}, Audios: []domain.AudioStream{{Codec: "aac", Channels: 2, Bitrate: 128_000}, {Codec: "ac3", Channels: 6, Bitrate: 640_000}}}
@@ -223,13 +215,6 @@ func TestPoolStopWithoutStart(t *testing.T) {
 	pool.Stop()
 }
 
-func TestFindNearestKeyframeEmptySlice(t *testing.T) {
-	got := findNearestKeyframe([]float64{}, 5.0)
-	if got != 0 {
-		t.Fatalf("expected 0 for empty keyframes, got %v", got)
-	}
-}
-
 func TestExtractSegmentsEmptyKeyframes(t *testing.T) {
 	p := &Pool{}
 	segments := p.extractSegments([]float64{}, 10, 0, 5)
@@ -281,30 +266,6 @@ func TestExtractSegmentsOutOfRange(t *testing.T) {
 
 	if len(segments) != 0 {
 		t.Fatalf("expected 0 segments for out-of-range indices, got %d", len(segments))
-	}
-}
-
-func TestFindNearestKeyframeExactMatch(t *testing.T) {
-	keyframes := []float64{0, 5, 10, 15}
-	got := findNearestKeyframe(keyframes, 10.5)
-	if got != 10 {
-		t.Fatalf("expected 10 for target 10.5, got %v", got)
-	}
-}
-
-func TestFindNearestKeyframeBetweenKeys(t *testing.T) {
-	keyframes := []float64{0, 5, 10, 15}
-	got := findNearestKeyframe(keyframes, 7)
-	if got != 5 {
-		t.Fatalf("expected 5 for target 7, got %v", got)
-	}
-}
-
-func TestFindNearestKeyframeTargetPastAll(t *testing.T) {
-	keyframes := []float64{0, 5, 10}
-	got := findNearestKeyframe(keyframes, 20)
-	if got != 10 {
-		t.Fatalf("expected 10 for target past all, got %v", got)
 	}
 }
 

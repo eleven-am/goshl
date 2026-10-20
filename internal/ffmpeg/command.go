@@ -1,12 +1,15 @@
 package ffmpeg
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/h264level"
+	"github.com/eleven-am/goshl/internal/mediaexec"
 )
 
 type StreamParams struct {
@@ -68,9 +71,8 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 		args = append(args, b.HWAccel.DecodeFlags...)
 	}
 
+	args = append(args, seekInputArgs(p.InputURL, startSeg.Start)...)
 	args = append(args,
-		"-ss", fmt.Sprintf("%.6f", startSeg.Start),
-		"-i", p.InputURL,
 		"-to", fmt.Sprintf("%.6f", endSeg.End),
 		"-copyts",
 		"-start_at_zero",
@@ -82,7 +84,7 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 	args = append(args, b.videoEncodeArgs(p)...)
 
 	var segmentTimes string
-	if p.Rendition.Method == domain.DirectStream && p.ActualSeekKeyframe > 0 {
+	if p.Rendition.Method == domain.DirectStream {
 		segmentTimes = formatSegmentTimesWithOffset(p.Segments, p.ActualSeekKeyframe)
 	} else {
 		segmentTimes = formatSegmentTimes(p.Segments)
@@ -105,6 +107,71 @@ func (b *CommandBuilder) Video(p VideoParams) []string {
 	args = append(args, outputPattern)
 
 	return args
+}
+
+func seekInputArgs(inputURL string, start float64) []string {
+	return []string{"-ss", fmt.Sprintf("%.6f", start), "-i", inputURL}
+}
+
+func (b *CommandBuilder) SeekLanding(ctx context.Context, inputURL string, start float64, streamIndex int) (float64, error) {
+	args := []string{"-nostats", "-hide_banner", "-loglevel", "error"}
+	args = append(args, seekInputArgs(inputURL, start)...)
+	args = append(args,
+		"-map", fmt.Sprintf("0:%d", streamIndex),
+		"-c", "copy",
+		"-frames:v", "1",
+		"-copyts",
+		"-start_at_zero",
+		"-f", "framecrc",
+		"-",
+	)
+
+	out, err := mediaexec.Output(ctx, "ffmpeg", args...)
+	if err != nil {
+		return 0, fmt.Errorf("seek landing: %w", err)
+	}
+
+	landing, err := parseFramecrcFirstPTS(string(out))
+	if err != nil {
+		return 0, fmt.Errorf("seek landing: %w", err)
+	}
+	return landing, nil
+}
+
+func parseFramecrcFirstPTS(output string) (float64, error) {
+	var timebase float64
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#tb 0:") {
+			num, den, ok := strings.Cut(strings.TrimSpace(strings.TrimPrefix(line, "#tb 0:")), "/")
+			if !ok {
+				return 0, fmt.Errorf("malformed timebase %q", line)
+			}
+			n, nErr := strconv.ParseFloat(num, 64)
+			d, dErr := strconv.ParseFloat(den, 64)
+			if nErr != nil || dErr != nil || d == 0 {
+				return 0, fmt.Errorf("malformed timebase %q", line)
+			}
+			timebase = n / d
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) < 3 || timebase == 0 {
+			return 0, fmt.Errorf("malformed packet line %q", line)
+		}
+		pts, err := strconv.ParseInt(strings.TrimSpace(fields[2]), 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("malformed packet pts %q: %w", line, err)
+		}
+		return float64(pts) * timebase, nil
+	}
+	return 0, fmt.Errorf("no packet at seek position")
 }
 
 func (b *CommandBuilder) videoEncodeArgs(p VideoParams) []string {
