@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.22] - 2026-10-20
+
+- fix(transcode): measure the seek landing for direct-stream jobs so copied segments align with the playlist
+
+
 ## [0.0.21] - 2026-10-20
 
 - fix(misc): subtitle batches survive caller cancel, lock waiters take over, configurable generation timeout
