@@ -309,6 +309,8 @@ type Options struct {
 	HWAccelDecodeMode DecodeMode
 
 	AllowHardwareFallback bool
+
+	OmitSubtitleRenditions bool
 }
 
 func (o *Options) setDefaults() {
@@ -594,7 +596,12 @@ func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (stri
 	videos := rendition.GenerateVideo(meta.Video)
 	audios := rendition.GenerateAudioTracks(meta.Audios)
 
-	return c.playlist.Master(sourceURL, videos, audios, meta.Subtitles), nil
+	subtitles := meta.Subtitles
+	if c.opts.OmitSubtitleRenditions {
+		subtitles = nil
+	}
+
+	return c.playlist.Master(sourceURL, videos, audios, subtitles), nil
 }
 
 func (c *Controller) SubtitlePlaylist(ctx context.Context, sourceURL, trackID string) (string, error) {

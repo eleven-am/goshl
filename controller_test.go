@@ -327,6 +327,56 @@ func TestMasterPlaylistIncludesAllAudioTracks(t *testing.T) {
 	}
 }
 
+func masterWithSubtitles(t *testing.T, omit bool) string {
+	t.Helper()
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	meta := &domain.Metadata{
+		Video:  domain.VideoStream{Width: 1920, Height: 1080, Bitrate: 5_000_000},
+		Audios: []domain.AudioStream{{Codec: "aac", Channels: 2, Bitrate: 128_000, Language: "eng"}},
+		Subtitles: []domain.SubtitleStream{
+			{Index: 2, ID: "t2", Codec: "subrip", Language: "eng", Default: true},
+			{Index: 3, ID: "t3", Codec: "subrip", Language: "fra"},
+		},
+	}
+	metaBytes, _ := json.Marshal(meta)
+	svc := NewController(Options{
+		Storage:                &stubStorage{metaData: metaBytes, metaExists: true},
+		Coordinator:            &stubCoordinator{},
+		PathGen:                stubPathGen{},
+		OmitSubtitleRenditions: omit,
+	})
+
+	out, err := svc.MasterPlaylist(context.Background(), "file:///media")
+	if err != nil {
+		t.Fatalf("master playlist err: %v", err)
+	}
+	return out
+}
+
+func TestMasterOmitsSubtitleRenditionsWhenConfigured(t *testing.T) {
+	out := masterWithSubtitles(t, true)
+	if !strings.Contains(out, "#EXT-X-STREAM-INF") {
+		t.Fatalf("expected variants in playlist: %s", out)
+	}
+	for _, unwanted := range []string{"TYPE=SUBTITLES", "SUBTITLES="} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("playlist must not contain %q: %s", unwanted, out)
+		}
+	}
+}
+
+func TestMasterAdvertisesSubtitleRenditionsByDefault(t *testing.T) {
+	out := masterWithSubtitles(t, false)
+	if got := strings.Count(out, "TYPE=SUBTITLES"); got != 2 {
+		t.Fatalf("expected 2 subtitle renditions, got %d: %s", got, out)
+	}
+	if !strings.Contains(out, "SUBTITLES=\"subtitles\"") {
+		t.Fatalf("expected variants to reference the subtitle group: %s", out)
+	}
+}
+
 func TestSegmentReturnsCachedData(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
