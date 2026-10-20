@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.21] - 2026-10-20
+
+- fix(misc): subtitle batches survive caller cancel, lock waiters take over, configurable generation timeout
+
+
 ## [0.0.20] - 2026-10-19
 
 - perf: extract progressive MP4 text subtitles from indexed byte ranges when first requested
