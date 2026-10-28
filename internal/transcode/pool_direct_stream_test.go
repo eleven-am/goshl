@@ -34,7 +34,7 @@ func (c *capturingStorage) MetadataExists(ctx context.Context, mediaKey string) 
 }
 
 func (c *capturingStorage) GetMetadata(ctx context.Context, mediaKey string) ([]byte, error) {
-	return c.metadata[mediaKey], nil
+	panic("transcode workers must use metadata carried by the job")
 }
 
 func (c *capturingStorage) SetMetadata(ctx context.Context, mediaKey string, data []byte) error {
@@ -134,6 +134,7 @@ func directStreamJob(id, source string, segments []domain.Segment, start, end in
 		Overlap:         overlap,
 		ExpectedIndices: expected,
 		VideoRendition:  rendition,
+		Metadata:        &domain.Metadata{Video: domain.VideoStream{Index: 0}},
 	}
 }
 

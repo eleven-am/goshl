@@ -433,6 +433,13 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 	if coord.enqueued[0].StartIndex != 1 || coord.enqueued[0].EndIndex != 1 {
 		t.Fatalf("unexpected job indices: %#v", coord.enqueued[0])
 	}
+	if coord.enqueued[0].Metadata == nil || coord.enqueued[0].Metadata.Duration != meta.Duration {
+		t.Fatalf("enqueued job must carry the resolved metadata: %#v", coord.enqueued[0].Metadata)
+	}
+	coord.enqueued[0].Metadata.Audios[0].Codec = "changed"
+	if meta.Audios[0].Codec != "aac" {
+		t.Fatalf("enqueued metadata must not alias the controller metadata")
+	}
 }
 
 func TestSubtitleVTTReturnsErrorWhenLanguageMissing(t *testing.T) {
@@ -1340,8 +1347,9 @@ func TestBuildJobUsesOverlapOnlyForDirectStream(t *testing.T) {
 	direct := domain.VideoRendition{Name: "source", Method: domain.DirectStream}
 	transcoded := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
 	deadline := time.Now().Add(time.Minute)
-	directJob := controller.buildJob("run-direct", deadline, "source", "key", StreamVideo, direct.Name, 1, 1, 2, segments, &direct, nil)
-	transcodedJob := controller.buildJob("run-transcoded", deadline, "source", "key", StreamVideo, transcoded.Name, 1, 1, 2, segments, &transcoded, nil)
+	meta := testVideoMetadata(18, []float64{0, 6, 12})
+	directJob := controller.buildJob("run-direct", deadline, "source", "key", StreamVideo, direct.Name, 1, 1, 2, segments, &direct, nil, meta)
+	transcodedJob := controller.buildJob("run-transcoded", deadline, "source", "key", StreamVideo, transcoded.Name, 1, 1, 2, segments, &transcoded, nil, meta)
 	if directJob.Overlap == nil {
 		t.Fatalf("direct stream must retain the preceding GOP boundary")
 	}

@@ -20,6 +20,7 @@ type Job struct {
 	ExpectedIndices []int
 	VideoRendition  *VideoRendition
 	AudioRendition  *AudioRendition
+	Metadata        *Metadata
 }
 
 type JobDelivery struct {

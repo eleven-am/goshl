@@ -797,7 +797,7 @@ func (c *Controller) Segment(ctx context.Context, sourceURL string, streamType S
 		return nil, fmt.Errorf("%w: segment %d", ErrSegmentTimeout, info.Index)
 	}
 
-	job := c.buildJob(created.runID, created.deadline, sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition)
+	job := c.buildJob(created.runID, created.deadline, sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition, meta)
 	go c.watchFlight(created, jobStatusCh)
 	if err := c.opts.Coordinator.Enqueue(ctx, job); err != nil {
 		return nil, fmt.Errorf("enqueue: %w", err)
@@ -911,7 +911,7 @@ func resolveRendition(meta *domain.Metadata, streamType domain.StreamType, name 
 	return nil, nil, fmt.Errorf("%w: %s", ErrRenditionNotFound, name)
 }
 
-func (c *Controller) buildJob(runID string, deadline time.Time, sourceURL, mediaKey string, streamType domain.StreamType, renditionName string, index, startIdx, endIdx int, allSegments []domain.Segment, video *domain.VideoRendition, audio *domain.AudioRendition) domain.Job {
+func (c *Controller) buildJob(runID string, deadline time.Time, sourceURL, mediaKey string, streamType domain.StreamType, renditionName string, index, startIdx, endIdx int, allSegments []domain.Segment, video *domain.VideoRendition, audio *domain.AudioRendition, meta *domain.Metadata) domain.Job {
 	segments := append([]domain.Segment(nil), allSegments[startIdx:endIdx+1]...)
 	expected := make([]int, len(segments))
 	for i, segment := range segments {
@@ -941,7 +941,19 @@ func (c *Controller) buildJob(runID string, deadline time.Time, sourceURL, media
 		ExpectedIndices: expected,
 		VideoRendition:  video,
 		AudioRendition:  audio,
+		Metadata:        cloneMetadata(meta),
 	}
+}
+
+func cloneMetadata(meta *domain.Metadata) *domain.Metadata {
+	if meta == nil {
+		return nil
+	}
+	cloned := *meta
+	cloned.Keyframes = append([]float64(nil), meta.Keyframes...)
+	cloned.Audios = append([]domain.AudioStream(nil), meta.Audios...)
+	cloned.Subtitles = append([]domain.SubtitleStream(nil), meta.Subtitles...)
+	return &cloned
 }
 
 // SpriteVTT returns a WebVTT file mapping timestamps to thumbnail sprite images.

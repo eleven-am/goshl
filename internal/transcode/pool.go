@@ -2,7 +2,6 @@ package transcode
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -245,11 +244,7 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 		complete()
 		return
 	}
-	meta, err := p.getMetadata(jobCtx, job.MediaKey)
-	if err != nil {
-		fail(err)
-		return
-	}
+	meta := job.Metadata
 
 	segments := job.Segments
 	if len(segments) == 0 {
@@ -373,7 +368,7 @@ func (p *Pool) reportLeaseFailure(delivery domain.JobDelivery, err error, cancel
 }
 
 func (p *Pool) validateJob(job domain.Job) error {
-	if job.ID == "" || job.RunID == "" || job.MediaKey == "" || job.Profile == "" || job.SourceURL == "" || job.Rendition == "" || job.EnqueuedAt.IsZero() || job.Deadline.IsZero() {
+	if job.ID == "" || job.RunID == "" || job.MediaKey == "" || job.Profile == "" || job.SourceURL == "" || job.Rendition == "" || job.EnqueuedAt.IsZero() || job.Deadline.IsZero() || job.Metadata == nil {
 		return fmt.Errorf("invalid job contract: required identity is missing")
 	}
 	if p.profile != "" && job.Profile != p.profile {
@@ -400,18 +395,6 @@ func (p *Pool) validateJob(job domain.Job) error {
 		return fmt.Errorf("invalid job contract: overlap is inconsistent")
 	}
 	return nil
-}
-
-func (p *Pool) getMetadata(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
-	data, err := p.storage.GetMetadata(ctx, sourceURL)
-	if err != nil {
-		return nil, err
-	}
-	var meta domain.Metadata
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return nil, err
-	}
-	return &meta, nil
 }
 
 func (p *Pool) waitForWorker(ctx context.Context, w *Worker) error {

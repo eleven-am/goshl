@@ -148,6 +148,7 @@ func TestValidateJobRejectsMixedPipelineProfile(t *testing.T) {
 		Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
 		ExpectedIndices: []int{0},
 		VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
+		Metadata:        &domain.Metadata{},
 	}
 	if err := pool.validateJob(job); err == nil {
 		t.Fatalf("expected mixed pipeline profile rejection")
@@ -377,6 +378,7 @@ func TestInitialLeaseFailureLeavesDeliveryPending(t *testing.T) {
 			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
 			ExpectedIndices: []int{0},
 			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
+			Metadata:        &domain.Metadata{},
 		},
 	}
 	pool.processJob(context.Background(), delivery)
@@ -406,6 +408,7 @@ func TestExpiredDeliveryPublishesFailureAndSettles(t *testing.T) {
 			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
 			ExpectedIndices: []int{0},
 			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
+			Metadata:        &domain.Metadata{},
 		},
 	}
 
