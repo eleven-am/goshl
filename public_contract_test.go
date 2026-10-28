@@ -65,5 +65,6 @@ func TestPublicContractCompilesForExternalConsumers(t *testing.T) {
 	_ = goshl.EventSegmentNotifyFailed
 	_ = goshl.SegmentStateReady
 	_ = goshl.StreamSubtitle
+	_ = (*goshl.Controller).ProbeMetadata
 	t.Log(job.Deadline)
 }

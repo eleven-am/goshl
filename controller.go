@@ -1111,6 +1111,12 @@ func (c *Controller) Metadata(ctx context.Context, sourceURL string) (*Metadata,
 	return c.getMetadata(ctx, sourceURL)
 }
 
+func (c *Controller) ProbeMetadata(ctx context.Context, sourceURL string) (*Metadata, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, c.opts.ProbeTimeout)
+	defer cancel()
+	return c.prober.ProbeUncached(probeCtx, sourceURL)
+}
+
 func deterministicJobID(sourceURL, rendition string, streamType StreamType, startIdx, endIdx int) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s:%s:%s:%d:%d", sourceURL, rendition, streamType, startIdx, endIdx)

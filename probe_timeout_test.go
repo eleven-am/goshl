@@ -85,6 +85,17 @@ func TestMetadataProbeFailsPastProbeTimeout(t *testing.T) {
 	}
 }
 
+func TestTransientMetadataProbeFailsPastProbeTimeout(t *testing.T) {
+	installSlowFFprobe(t, "1")
+	svc, _ := probeController(t, Options{JobTimeout: 10 * time.Second, ProbeTimeout: 200 * time.Millisecond})
+
+	_, err := svc.ProbeMetadata(context.Background(), "file:///media")
+
+	if err == nil || strings.Contains(err.Error(), "invalid character") {
+		t.Fatalf("expected probe timeout, got %v", err)
+	}
+}
+
 func TestMetadataProbeUsesJobTimeoutWhenProbeTimeoutUnset(t *testing.T) {
 	installSlowFFprobe(t, "1")
 	svc, _ := probeController(t, Options{JobTimeout: 200 * time.Millisecond})

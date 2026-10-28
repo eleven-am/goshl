@@ -28,6 +28,10 @@ func (p *Prober) Probe(ctx context.Context, sourceURL string) (*domain.Metadata,
 	return p.ProbeWithKey(ctx, sourceURL, sourceURL)
 }
 
+func (p *Prober) ProbeUncached(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
+	return p.probe(ctx, sourceURL)
+}
+
 func (p *Prober) ProbeWithKey(ctx context.Context, sourceURL, mediaKey string) (*domain.Metadata, error) {
 	exists, err := p.storage.MetadataExists(ctx, mediaKey)
 	if err != nil {

@@ -165,6 +165,32 @@ func TestProbe_InvokesFFProbeAndPersistsMetadata(t *testing.T) {
 	}
 }
 
+func TestProbeUncachedSkipsStorage(t *testing.T) {
+	tmpDir := t.TempDir()
+	script := filepath.Join(tmpDir, "ffprobe")
+	if err := os.WriteFile(script, []byte(ffprobeScript), 0755); err != nil {
+		t.Fatalf("failed to write fake ffprobe: %v", err)
+	}
+
+	originalPath := os.Getenv("PATH")
+	t.Cleanup(func() { _ = os.Setenv("PATH", originalPath) })
+	if err := os.Setenv("PATH", tmpDir+string(os.PathListSeparator)+originalPath); err != nil {
+		t.Fatalf("failed to update PATH: %v", err)
+	}
+
+	storage := &stubStorage{exists: true, metaData: []byte(`{"duration":99}`)}
+	meta, err := NewProber(storage).ProbeUncached(context.Background(), "file:///input")
+	if err != nil {
+		t.Fatalf("probe returned error: %v", err)
+	}
+	if meta.Duration != 12.5 {
+		t.Fatalf("expected probed duration 12.5, got %v", meta.Duration)
+	}
+	if storage.existsCnt != 0 || storage.getCnt != 0 || storage.setCnt != 0 {
+		t.Fatalf("uncached probe touched storage: exists=%d get=%d set=%d", storage.existsCnt, storage.getCnt, storage.setCnt)
+	}
+}
+
 func TestProbe_UsesStreamBitRateBeforeBPSTag(t *testing.T) {
 	tmpDir := t.TempDir()
 	script := filepath.Join(tmpDir, "ffprobe")
