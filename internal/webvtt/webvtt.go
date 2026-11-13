@@ -112,6 +112,7 @@ func Parse(data []byte) ([]Cue, error) {
 		return nil, fmt.Errorf("%w: missing %s signature", ErrMalformed, signature)
 	}
 	var cues []Cue
+	var firstFailure error
 	for _, block := range blocks[1:] {
 		first := block[0]
 		if isNonCueBlock(first) {
@@ -122,17 +123,28 @@ func Parse(data []byte) ([]Cue, error) {
 			timingAt = 1
 		}
 		if timingAt >= len(block) || !strings.Contains(block[timingAt], cueArrow) {
-			return nil, fmt.Errorf("%w: cue block without timing line: %q", ErrMalformed, first)
+			if len(cues) > 0 {
+				cues[len(cues)-1].Text += "\n" + strings.Join(block, "\n")
+			} else if firstFailure == nil {
+				firstFailure = fmt.Errorf("%w: cue block without timing line: %q", ErrMalformed, first)
+			}
+			continue
 		}
 		cue, err := parseTiming(block[timingAt])
 		if err != nil {
-			return nil, err
+			if firstFailure == nil {
+				firstFailure = err
+			}
+			continue
 		}
 		if timingAt == 1 {
 			cue.ID = first
 		}
 		cue.Text = strings.Join(block[timingAt+1:], "\n")
 		cues = append(cues, cue)
+	}
+	if len(cues) == 0 && firstFailure != nil {
+		return nil, firstFailure
 	}
 	return cues, nil
 }

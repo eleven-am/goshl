@@ -275,6 +275,7 @@ func audioRendition(name, codec string, bitrate, channels int, method domain.Pla
 		Language:    audio.Language,
 		Title:       audio.Title,
 		Default:     isDefault,
+		SampleRate:  audio.SampleRate,
 		SourceEnd:   audio.End,
 	}
 }

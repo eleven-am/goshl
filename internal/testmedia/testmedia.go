@@ -11,9 +11,10 @@ import (
 )
 
 type AudioSpec struct {
-	Codec    string
-	Delay    float64
-	Duration float64
+	Codec      string
+	Delay      float64
+	Duration   float64
+	SampleRate int
 }
 
 type Spec struct {
@@ -29,6 +30,7 @@ type Spec struct {
 	Audio          []AudioSpec
 	Subtitles      bool
 	StartOffset    float64
+	VideoDelay     float64
 }
 
 type Packet struct {
@@ -54,11 +56,14 @@ func H264(t testing.TB, spec Spec) string {
 	dir := t.TempDir()
 	output := filepath.Join(dir, "source."+spec.Container)
 
-	args := []string{
-		"-hide_banner", "-loglevel", "error", "-y",
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	if spec.VideoDelay != 0 {
+		args = append(args, "-itsoffset", formatSeconds(spec.VideoDelay))
+	}
+	args = append(args,
 		"-f", "lavfi", "-t", formatSeconds(spec.Duration),
 		"-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=%s", spec.Width, spec.Height, spec.FPS),
-	}
+	)
 	for index, audio := range spec.Audio {
 		duration := audio.Duration
 		if duration <= 0 {
@@ -67,9 +72,13 @@ func H264(t testing.TB, spec Spec) string {
 		if audio.Delay != 0 {
 			args = append(args, "-itsoffset", formatSeconds(audio.Delay))
 		}
+		sampleRate := audio.SampleRate
+		if sampleRate == 0 {
+			sampleRate = 48000
+		}
 		args = append(args,
 			"-f", "lavfi", "-t", formatSeconds(duration),
-			"-i", fmt.Sprintf("sine=frequency=%d:sample_rate=48000", 440+110*index),
+			"-i", fmt.Sprintf("sine=frequency=%d:sample_rate=%d", 440+110*index, sampleRate),
 		)
 	}
 	if spec.Subtitles {

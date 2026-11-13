@@ -212,8 +212,8 @@ func TestKeyframeAlignedFalseWhenSplit(t *testing.T) {
 	if KeyframeAligned(nil, 60, 6) {
 		t.Fatalf("a fixed plan must not be keyframe aligned")
 	}
-	if KeyframeAligned([]float64{1, 7, 13}, 18, 6) {
-		t.Fatalf("a plan whose first segment does not start on a keyframe must not be keyframe aligned")
+	if !KeyframeAligned([]float64{1, 7, 13}, 18, 6) {
+		t.Fatalf("a plan whose first boundary has nothing before it stays keyframe aligned")
 	}
 	if KeyframeAligned([]float64{0, 6}, 0, 6) {
 		t.Fatalf("an empty plan must not be keyframe aligned")
@@ -258,7 +258,7 @@ func TestCalculateSegmentsInvariants(t *testing.T) {
 		for _, keyframe := range keyframes {
 			known[keyframe] = true
 		}
-		onKeyframes := true
+		onKeyframes := len(keyframes) > 0
 		for i, segment := range segments {
 			allowed := limit + 1e-6
 			if i == len(segments)-1 {
@@ -270,7 +270,7 @@ func TestCalculateSegmentsInvariants(t *testing.T) {
 			if i == len(segments)-1 && len(segments) > 1 && segment.Duration < 0.5 {
 				t.Fatalf("round %d: tail sliver %v survived", round, segment.Duration)
 			}
-			if !known[segment.Start] {
+			if i > 0 && !known[segment.Start] {
 				onKeyframes = false
 			}
 		}

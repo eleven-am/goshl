@@ -25,6 +25,10 @@ const maxSubtitleBytes = 64 << 20
 
 const maxCoalesceGap = 256 << 10
 
+const maxCoalescedSpan = 4 << 20
+
+const maxCoalescedGapBytes = 16 << 20
+
 type Track struct {
 	ID          string
 	StreamIndex int
@@ -67,7 +71,7 @@ func extractBatchFrom(ctx context.Context, source io.ReaderAt, sourceSize int64,
 	for _, track := range tracks {
 		streamIndexes = append(streamIndexes, track.StreamIndex)
 	}
-	indexes, failures, err := mp4index.SubtitleIndexesFrom(source, sourceSize, streamIndexes)
+	indexes, failures, err := mp4index.SubtitleIndexesFrom(ctx, source, sourceSize, streamIndexes)
 	if err != nil {
 		if errors.Is(err, mp4index.ErrUnsupported) {
 			return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
@@ -109,6 +113,7 @@ func extractTrack(ctx context.Context, source io.ReaderAt, index mp4index.Subtit
 		return nil, err
 	}
 	var cues []webvtt.Cue
+	decoded, undecodable := 0, 0
 	for sampleIndex, sample := range index.Samples {
 		if sample.Duration <= 0 {
 			continue
@@ -117,22 +122,29 @@ func extractTrack(ctx context.Context, source io.ReaderAt, index mp4index.Subtit
 		case "tx3g":
 			text, err := decodeTX3G(samples[sampleIndex])
 			if err != nil {
-				return nil, fmt.Errorf("decode tx3g sample %d: %w", sampleIndex+1, err)
+				undecodable++
+				continue
 			}
+			decoded++
 			if strings.TrimSpace(text) != "" {
 				cues = append(cues, webvtt.Cue{Start: sample.Start, End: sample.Start + sample.Duration, Text: text})
 			}
 		case "wvtt":
-			decoded, err := decodeWVTT(samples[sampleIndex])
+			boxes, err := decodeWVTT(samples[sampleIndex])
 			if err != nil {
-				return nil, fmt.Errorf("decode wvtt sample %d: %w", sampleIndex+1, err)
+				undecodable++
+				continue
 			}
-			for _, cue := range decoded {
+			decoded++
+			for _, cue := range boxes {
 				cues = append(cues, webvtt.Cue{ID: cue.id, Start: sample.Start, End: sample.Start + sample.Duration, Settings: cue.settings, Text: cue.text})
 			}
 		default:
 			return nil, ErrUnsupported
 		}
+	}
+	if undecodable > 0 && decoded == 0 {
+		return nil, fmt.Errorf("none of the %d %s subtitle samples could be decoded", undecodable, index.Codec)
 	}
 	return webvtt.Encode(webvtt.Shift(cues, origin), webvtt.Options{TimestampMap: true}), nil
 }
@@ -156,11 +168,17 @@ func readSamples(ctx context.Context, source io.ReaderAt, samples []mp4index.Sub
 		return references[i].offset < references[j].offset
 	})
 	ranges := make([]sampleRange, 0, len(references))
+	var gapBytes int64
 	for _, reference := range references {
-		if len(ranges) == 0 || reference.offset-ranges[len(ranges)-1].end > maxCoalesceGap {
+		gap := int64(0)
+		if len(ranges) > 0 {
+			gap = max(reference.offset-ranges[len(ranges)-1].end, 0)
+		}
+		if len(ranges) == 0 || gap > maxCoalesceGap || gapBytes+gap > maxCoalescedGapBytes || reference.offset+reference.size-ranges[len(ranges)-1].start > maxCoalescedSpan {
 			ranges = append(ranges, sampleRange{start: reference.offset, end: reference.offset + reference.size, samples: []sampleReference{reference}})
 			continue
 		}
+		gapBytes += gap
 		last := &ranges[len(ranges)-1]
 		last.end = max(last.end, reference.offset+reference.size)
 		last.samples = append(last.samples, reference)

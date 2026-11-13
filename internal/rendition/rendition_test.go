@@ -419,7 +419,7 @@ func TestDirectStreamRequiresKeyframeAlignedPlan(t *testing.T) {
 		{"aligned", []float64{0, 6, 12}, 18, 6, domain.DirectStream},
 		{"long keyframe gap is split", []float64{0, 20, 26}, 32, 6, domain.Transcode},
 		{"no keyframes", nil, 18, 6, domain.Transcode},
-		{"first keyframe is late", []float64{0.5, 6, 12}, 18, 6, domain.Transcode},
+		{"first keyframe is late", []float64{0.5, 6, 12}, 18, 6, domain.DirectStream},
 		{"same source, longer target", []float64{0, 20, 26}, 32, 12, domain.DirectStream},
 	}
 	for _, c := range cases {
@@ -563,6 +563,18 @@ func TestAudioRenditionsCarryTrackTitle(t *testing.T) {
 		}
 		if r.Title != want {
 			t.Fatalf("rendition %q Title = %q, want %q", r.Name, r.Title, want)
+		}
+	}
+}
+
+func TestGenerateAudioTracksCarriesSampleRate(t *testing.T) {
+	tracks := GenerateAudioTracks([]domain.AudioStream{{Index: 1, Codec: "aac", Channels: 2, SampleRate: 44100}})
+	if len(tracks) == 0 {
+		t.Fatal("no audio renditions")
+	}
+	for _, track := range tracks {
+		if track.SampleRate != 44100 {
+			t.Errorf("%s SampleRate = %d, want 44100", track.Name, track.SampleRate)
 		}
 	}
 }

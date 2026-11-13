@@ -78,7 +78,17 @@ func (c *Controller) SubtitlesVTT(ctx context.Context, sourceURL string, trackID
 		})
 	}
 
-	outcomes, err := c.miscGen.GetSubtitlesBatch(ctx, sourceURL, jobs)
+	request := misc.SubtitleRequest{SourceKey: assetIdentity(mediaKey, "subtitles", nil), Jobs: jobs}
+	for _, sibling := range convertibleSubtitles(meta.Subtitles) {
+		request.Siblings = append(request.Siblings, misc.SubtitleJob{
+			Key:         assetIdentity(mediaKey, "subtitle", sibling.ID),
+			TrackID:     sibling.ID,
+			StreamIndex: sibling.Index,
+			Codec:       sibling.Codec,
+			Origin:      meta.StartTime,
+		})
+	}
+	outcomes, err := c.miscGen.GetSubtitles(ctx, sourceURL, request)
 	if err != nil {
 		return nil, err
 	}

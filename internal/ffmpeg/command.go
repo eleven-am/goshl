@@ -111,6 +111,7 @@ type jobTimeline struct {
 	outputDir   string
 	firstIndex  int
 	generated   bool
+	sampleRate  int
 	seek        float64
 	end         float64
 	shift       float64
@@ -178,6 +179,9 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 	}
 	timeline.seek = leadSeconds(first.Start)
 	timeline.end = leadSeconds(last.End)
+	if p.Landing != nil && *p.Landing > first.Start {
+		timeline.reference = *p.Landing
+	}
 	timeline.inputFlags = config.DecodeFlags
 	timeline.encodeArgs, err = transcodeVideoArgs(config, chain, p.Rendition)
 	if err != nil {
@@ -226,7 +230,8 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 			timeline.encodeArgs = []string{"-c:a", "copy"}
 			return timeline.args(), nil
 		}
-		timeline.shift = float64(ac3EncoderDelay) / aacSampleRate
+		timeline.sampleRate = sourceSampleRate(p.Rendition)
+		timeline.shift = float64(ac3EncoderDelay) / float64(timeline.sampleRate)
 		timeline.encodeArgs = []string{
 			"-c:a", p.Rendition.Codec,
 			"-ac", strconv.Itoa(min(p.Rendition.Channels, passthroughMaxChannels)),
@@ -238,7 +243,7 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 			timeline.encodeArgs = append(timeline.encodeArgs, "-af", "apad")
 			return timeline.args(), nil
 		}
-		frame := float64(ac3FrameSamples) / aacSampleRate
+		frame := float64(ac3FrameSamples) / float64(timeline.sampleRate)
 		timeline.generated = true
 		timeline.seek = *p.Landing + math.Floor((first.Start-*p.Landing)/frame+domain.BoundaryTolerance)*frame
 		timeline.reference = timeline.seek
@@ -258,8 +263,22 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 		timeline.generated = true
 		return timeline.args(), nil
 	}
-	timeline.encodeArgs = append(timeline.encodeArgs, "-af", fmt.Sprintf("aresample=%d:first_pts=%d,apad", aacSampleRate, frames*aacFrameSamples))
+	timeline.encodeArgs = append(timeline.encodeArgs, "-af", fmt.Sprintf("aresample=%d,aresample=%d:first_pts=%d,apad", aacSampleRate, aacSampleRate, frames*aacFrameSamples))
 	return timeline.args(), nil
+}
+
+func sourceSampleRate(rendition domain.AudioRendition) int {
+	if rendition.SampleRate > 0 {
+		return rendition.SampleRate
+	}
+	return aacSampleRate
+}
+
+func (t jobTimeline) outputRate() int {
+	if t.sampleRate > 0 {
+		return t.sampleRate
+	}
+	return aacSampleRate
 }
 
 func (p AudioParams) LandingStart() float64 {
@@ -293,7 +312,7 @@ func (t jobTimeline) args() []string {
 	args = append(args, t.inputFlags...)
 	offset := domain.OutputTimelineOffset.Seconds() + t.shift
 	if t.generated {
-		args = append(args, "-f", "lavfi", "-i", fmt.Sprintf("anullsrc=r=%d:cl=stereo", aacSampleRate))
+		args = append(args, "-f", "lavfi", "-i", fmt.Sprintf("anullsrc=r=%d:cl=stereo", t.outputRate()))
 		args = append(args, "-to", formatSeconds(t.end-t.seek))
 		args = append(args,
 			"-muxdelay", "0",
@@ -315,7 +334,8 @@ func (t jobTimeline) args() []string {
 		"-f", "segment",
 		"-segment_time_delta", t.timeDelta,
 		"-segment_format", "mpegts",
-		"-segment_list_type", "flat",
+		"-segment_format_options", "mpegts_flags=+initial_discontinuity",
+		"-segment_list_type", "csv",
 		"-segment_list", "pipe:1",
 		"-segment_start_number", strconv.Itoa(t.firstIndex),
 		"-segment_times", t.segmentTimes(),

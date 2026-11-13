@@ -162,6 +162,11 @@ func (c *Controller) Start(ctx context.Context) error {
 		c.videoPool.Stop()
 		return fmt.Errorf("start audio pool: %w", err)
 	}
+	if c.lifecycle.Stopped() {
+		c.videoPool.Stop()
+		c.audioPool.Stop()
+		return ErrControllerStopped
+	}
 	return nil
 }
 

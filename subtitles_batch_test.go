@@ -62,6 +62,7 @@ if [ "$1" = "-encoders" ]; then
 echo "h264_nvenc"; exit 0; fi
 if [ "$1" = "-version" ]; then exit 0; fi
 echo "$*" >> "$FAKE_LOG"
+if [ -n "$FAKE_DELAY" ]; then sleep "$FAKE_DELAY"; fi
 if [ -n "$FAKE_HANG" ]; then
 echo $$ > "$FAKE_PID"
 exec sleep 30

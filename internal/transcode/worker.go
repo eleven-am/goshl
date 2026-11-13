@@ -36,7 +36,16 @@ type WorkerSpec struct {
 	Expected  []int
 	Overlap   *int
 	Trailing  *int
+	Ends      map[int]SegmentEnd
 }
+
+type SegmentEnd struct {
+	Time  float64
+	Early float64
+	Late  float64
+}
+
+var ErrSegmentTimeline = errors.New("ffmpeg segment does not match the planned time range")
 
 type Worker struct {
 	args      []string
@@ -47,6 +56,7 @@ type Worker struct {
 	tmpDir    string
 	expected  map[int]struct{}
 	dropped   map[int]struct{}
+	ends      map[int]SegmentEnd
 	done      chan struct{}
 
 	mu     sync.RWMutex
@@ -68,6 +78,7 @@ func NewWorker(spec WorkerSpec) *Worker {
 		tmpDir:    spec.TmpDir,
 		expected:  make(map[int]struct{}, len(spec.Expected)),
 		dropped:   make(map[int]struct{}, 2),
+		ends:      spec.Ends,
 		done:      make(chan struct{}),
 		state:     WorkerStateIdle,
 	}
@@ -165,9 +176,13 @@ func (w *Worker) consume(ctx context.Context, reader io.Reader) (map[int]struct{
 		if line == "" {
 			continue
 		}
-		filename := filepath.Base(line)
+		fields := strings.Split(line, ",")
+		filename := filepath.Base(fields[0])
 		index, err := parseSegmentIndex(filename)
 		if err != nil {
+			return uploaded, err
+		}
+		if err := w.checkEnd(index, fields); err != nil {
 			return uploaded, err
 		}
 		if _, drop := w.dropped[index]; drop {
@@ -189,6 +204,24 @@ func (w *Worker) consume(ctx context.Context, reader io.Reader) (map[int]struct{
 		return uploaded, fmt.Errorf("read ffmpeg output: %w", err)
 	}
 	return uploaded, nil
+}
+
+func (w *Worker) checkEnd(index int, fields []string) error {
+	want, ok := w.ends[index]
+	if !ok {
+		return nil
+	}
+	if len(fields) < 3 {
+		return fmt.Errorf("%w: segment %d has no reported end", ErrSegmentTimeline, index)
+	}
+	end, err := strconv.ParseFloat(strings.TrimSpace(fields[2]), 64)
+	if err != nil {
+		return fmt.Errorf("%w: segment %d end %q", ErrSegmentTimeline, index, fields[2])
+	}
+	if end < want.Time-want.Early || end > want.Time+want.Late {
+		return fmt.Errorf("%w: segment %d ends at %.3f, planned %.3f", ErrSegmentTimeline, index, end, want.Time)
+	}
+	return nil
 }
 
 func (w *Worker) missingExpected(uploaded map[int]struct{}) int {

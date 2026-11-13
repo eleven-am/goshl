@@ -112,17 +112,20 @@ func (c *Controller) segmentOnce(ctx context.Context, sourceURL string, streamTy
 		if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 			return data, err
 		}
-		return c.waitForSegment(ctx, info, statusCh, existing, nil, existing.runID, requested)
+		return c.waitForSegment(ctx, info, statusCh, existing, nil, existing.runID, requested, nil)
 	}
 	startIdx, endIdx, jobID := created.start, created.end, created.jobID
 	lockTTL := time.Until(created.deadline) + time.Minute
-	token, activeRunID, lockErr := c.opts.Coordinator.AcquireJob(ctx, jobID, created.runID, lockTTL)
+	setupCtx, stopSetup := c.flightSetupContext(ctx)
+	defer stopSetup()
+	token, activeRunID, lockErr := c.opts.Coordinator.AcquireJob(setupCtx, jobID, created.runID, lockTTL)
 
 	if lockErr != nil {
-		c.abandonFlight(created)
 		if !errors.Is(lockErr, domain.ErrLockHeld) {
+			c.abandonFlight(created)
 			return nil, fmt.Errorf("acquire segment lock: %w", lockErr)
 		}
+		defer c.abandonFlight(created)
 		waitCtx, stopWaiting := context.WithCancel(ctx)
 		defer stopWaiting()
 		statusCh, err := c.opts.Coordinator.WaitSegment(waitCtx, info)
@@ -142,7 +145,8 @@ func (c *Controller) segmentOnce(ctx context.Context, sourceURL string, streamTy
 		if err != nil {
 			return nil, fmt.Errorf("wait active job: %w", err)
 		}
-		return c.waitForSegment(ctx, info, statusCh, nil, jobStatusCh, activeRunID, requested)
+		lockFree := func() bool { return c.jobLockFree(jobID) }
+		return c.waitForSegment(ctx, info, statusCh, created, jobStatusCh, activeRunID, requested, lockFree)
 	}
 	if !c.setFlightLock(created, token) {
 		c.releaseFlightLocks([]*flight{created})
@@ -181,17 +185,22 @@ func (c *Controller) segmentOnce(ctx context.Context, sourceURL string, streamTy
 	if !c.startFlightWatch(created, jobStatusCh) {
 		return nil, ErrControllerStopped
 	}
-	requestDone := ctx.Err() != nil
-	c.markEnqueued(created)
-	if err := c.opts.Coordinator.Enqueue(ctx, job); err != nil {
-		if requestDone || errors.Is(err, domain.ErrEnqueueRejected) {
+	if err := ctx.Err(); err != nil {
+		c.abandonFlight(created)
+		return nil, fmt.Errorf("enqueue: %w", err)
+	}
+	if !c.markEnqueued(created) {
+		return nil, c.flightGoneError(info)
+	}
+	if err := c.opts.Coordinator.Enqueue(setupCtx, job); err != nil {
+		if setupCtx.Err() != nil || errors.Is(err, domain.ErrEnqueueRejected) {
 			c.abandonFlight(created)
 		}
 		return nil, fmt.Errorf("enqueue: %w", err)
 	}
 	c.observe(ctx, domain.Event{Type: domain.EventJobEnqueued, MediaKey: mediaKey, JobID: job.ID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
 
-	return c.waitForSegment(ctx, info, statusCh, created, nil, created.runID, requested)
+	return c.waitForSegment(ctx, info, statusCh, created, nil, created.runID, requested, nil)
 }
 
 func (c *Controller) flightGoneError(info domain.SegmentData) error {
@@ -201,7 +210,16 @@ func (c *Controller) flightGoneError(info domain.SegmentData) error {
 	return fmt.Errorf("%w: segment %d", ErrSegmentTimeout, info.Index)
 }
 
-func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus, f *flight, jobStatusCh <-chan domain.JobStatus, runID string, requested time.Time) ([]byte, error) {
+func (c *Controller) flightSetupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	setupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.opts.SegmentTimeout)
+	stop := context.AfterFunc(c.lifecycle.Context(), cancel)
+	return setupCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData, statusCh <-chan domain.SegmentStatus, f *flight, jobStatusCh <-chan domain.JobStatus, runID string, requested time.Time, lockFree func() bool) ([]byte, error) {
 	timer := time.NewTimer(c.opts.SegmentTimeout)
 	defer timer.Stop()
 	pollBackoff := backoff.NewExponentialBackOff()
@@ -219,6 +237,8 @@ func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-c.lifecycle.Context().Done():
+			return nil, ErrControllerStopped
 		case <-timer.C:
 			if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 				return data, err
@@ -227,6 +247,9 @@ func (c *Controller) waitForSegment(ctx context.Context, info domain.SegmentData
 		case <-poll.C:
 			if data, found, err := c.readStoredSegment(ctx, info); err != nil || found {
 				return data, err
+			}
+			if lockFree != nil && lockFree() {
+				return nil, errFlightAbandoned
 			}
 			poll.Reset(pollBackoff.NextBackOff())
 		case <-terminal:

@@ -71,7 +71,7 @@ func TestVideoCommand_TranscodeIncludesSegmentTimes(t *testing.T) {
 	if !strings.Contains(joined, "-to 29.999000") || strings.Contains(joined, "-t 18.000000") {
 		t.Fatalf("expected absolute end-time clipping one millisecond ahead of the job end, got %s", joined)
 	}
-	if !strings.Contains(joined, "-hwaccel none -ss 11.999000 -protocol_whitelist "+source.ProtocolWhitelist+" -i file:input.mp4") {
+	if !strings.Contains(joined, "-hwaccel none -ss 11.999000 -format_whitelist "+source.FormatWhitelist+" -protocol_whitelist "+source.ProtocolWhitelist+" -i file:input.mp4") {
 		t.Fatalf("decode flags must precede the seek: %s", joined)
 	}
 	if !strings.Contains(joined, "-vf scale=1280:720") {
@@ -190,7 +190,7 @@ func TestAACJobSeeksOnTheFrameGrid(t *testing.T) {
 			t.Fatalf("cut %d is %.6f, want %.6f measured from the priming packet", index, got, want)
 		}
 	}
-	if want := "aresample=48000:first_pts=" + strconv.FormatInt(int64(math.Round(seek*48000)), 10) + ",apad"; optionValue(t, joined, "-af") != want {
+	if want := "aresample=48000,aresample=48000:first_pts=" + strconv.FormatInt(int64(math.Round(seek*48000)), 10) + ",apad"; optionValue(t, joined, "-af") != want {
 		t.Fatalf("the encoder input must be pinned to the frame grid with %s: %s", want, joined)
 	}
 	if optionValue(t, joined, "-segment_start_number") != "3" {
@@ -599,7 +599,7 @@ func TestAACJobAlwaysPadsItsInput(t *testing.T) {
 		rendition := domain.AudioRendition{Method: domain.Transcode, Codec: "aac", Channels: 2, Bitrate: 128000, SourceEnd: sourceEnd}
 		args, err := builder.Audio(AudioParams{InputURL: "in.mkv", StreamIndex: 1, Rendition: rendition, Segments: segments[6:8], Overlap: &segments[5], OutputDir: "/tmp/a"})
 		joined := mustArgs(t, args, err)
-		if got := optionValue(t, joined, "-af"); got != "aresample=48000:first_pts=239616,apad" {
+		if got := optionValue(t, joined, "-af"); got != "aresample=48000,aresample=48000:first_pts=239616,apad" {
 			t.Errorf("source end %.1f: -af = %s, want the grid pin followed by apad", sourceEnd, got)
 		}
 		if optionValue(t, joined, "-to") != "8.000000" || !strings.Contains(joined, "-ss 4.992000 ") || strings.Contains(joined, "lavfi") {

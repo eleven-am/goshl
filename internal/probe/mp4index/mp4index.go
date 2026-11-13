@@ -15,9 +15,12 @@ import (
 var ErrUnsupported = errors.New("mp4index: unsupported layout")
 
 const (
-	maxMoovBytes = 256 << 20
-	smallHeader  = 8
-	largeHeader  = 16
+	maxMoovBytes      = 256 << 20
+	maxIndexedSamples = 1 << 25
+	maxKeyframes      = 1 << 21
+	maxTrailingBoxes  = 64
+	smallHeader       = 8
+	largeHeader       = 16
 )
 
 func Keyframes(path string, streamIndex int) ([]float64, error) {
@@ -44,7 +47,15 @@ func KeyframesFrom(r io.ReaderAt, size int64, streamIndex int) ([]float64, error
 	if streamIndex < 0 || streamIndex >= len(moov.Traks) {
 		return nil, fmt.Errorf("%w: no trak at index %d", ErrUnsupported, streamIndex)
 	}
-	return trackKeyframes(moov.Traks[streamIndex], uint64(moov.Mvhd.Timescale))
+	return trackKeyframes(moov.Traks[streamIndex], uint64(moov.Mvhd.Timescale), size)
+}
+
+func plausibleSampleCount(stsz *mp4.StszBox, size int64) bool {
+	count := uint64(stsz.GetNrSamples())
+	if count > maxIndexedSamples {
+		return false
+	}
+	return stsz.SampleUniformSize == 0 || len(stsz.SampleSize) != 0 || count*uint64(stsz.SampleUniformSize) <= uint64(size)
 }
 
 func readMoov(r io.ReaderAt, size int64) (*mp4.MoovBox, error) {
@@ -57,7 +68,14 @@ func readMoov(r io.ReaderAt, size int64) (*mp4.MoovBox, error) {
 		case "moof":
 			return nil, fmt.Errorf("%w: fragmented", ErrUnsupported)
 		case "moov":
-			return decodeMoov(r, pos, boxSize, size)
+			moov, err := decodeMoov(r, pos, boxSize, size)
+			if err != nil {
+				return nil, err
+			}
+			if err := requireCompleteBoxes(r, pos+boxSize, size); err != nil {
+				return nil, err
+			}
+			return moov, nil
 		}
 		if boxSize > size-pos {
 			break
@@ -65,6 +83,20 @@ func readMoov(r io.ReaderAt, size int64) (*mp4.MoovBox, error) {
 		pos += boxSize
 	}
 	return nil, fmt.Errorf("%w: no moov box", ErrUnsupported)
+}
+
+func requireCompleteBoxes(r io.ReaderAt, pos, size int64) error {
+	for scanned := 0; pos < size && scanned < maxTrailingBoxes; scanned++ {
+		_, boxSize, err := boxHeader(r, pos, size)
+		if err != nil {
+			return err
+		}
+		if boxSize > size-pos {
+			return fmt.Errorf("%w: box at %d extends %d bytes past the end of the source", ErrUnsupported, pos, boxSize-(size-pos))
+		}
+		pos += boxSize
+	}
+	return nil
 }
 
 func boxHeader(r io.ReaderAt, pos, size int64) (string, int64, error) {
@@ -125,12 +157,13 @@ func decodeMoov(r io.ReaderAt, pos, boxSize, size int64) (*mp4.MoovBox, error) {
 
 type timeline struct {
 	mediaTime  int64
+	hasEdit    bool
 	emptyDur   uint64
 	editEnd    int64
 	hasEditEnd bool
 }
 
-func trackKeyframes(trak *mp4.TrakBox, movieTimescale uint64) ([]float64, error) {
+func trackKeyframes(trak *mp4.TrakBox, movieTimescale uint64, size int64) ([]float64, error) {
 	if trak == nil || trak.Mdia == nil || trak.Mdia.Hdlr == nil || trak.Mdia.Mdhd == nil || trak.Mdia.Minf == nil || trak.Mdia.Minf.Stbl == nil {
 		return nil, fmt.Errorf("%w: incomplete trak", ErrUnsupported)
 	}
@@ -142,18 +175,32 @@ func trackKeyframes(trak *mp4.TrakBox, movieTimescale uint64) ([]float64, error)
 	if mediaTimescale == 0 || stbl.Stts == nil || stbl.Stsz == nil {
 		return nil, fmt.Errorf("%w: missing sample tables", ErrUnsupported)
 	}
+	if !plausibleSampleCount(stbl.Stsz, size) {
+		return nil, fmt.Errorf("%w: sample count %d cannot fit in a %d byte source", ErrUnsupported, stbl.Stsz.GetNrSamples(), size)
+	}
 	sampleCount := stbl.Stsz.GetNrSamples()
-	syncSamples := syncSampleNumbers(stbl.Stss, sampleCount)
-	if sampleCount == 0 || len(syncSamples) == 0 {
+	syncCount := uint64(sampleCount)
+	if stbl.Stss != nil {
+		syncCount = uint64(len(stbl.Stss.SampleNumber))
+	}
+	if sampleCount == 0 || syncCount == 0 {
 		return nil, fmt.Errorf("%w: no samples or sync table", ErrUnsupported)
 	}
+	if syncCount > maxKeyframes {
+		return nil, fmt.Errorf("%w: %d sync samples exceed the index limit", ErrUnsupported, syncCount)
+	}
+	syncSamples := syncSampleNumbers(stbl.Stss, sampleCount)
 
 	line, err := editTimeline(trak, movieTimescale, mediaTimescale)
 	if err != nil {
 		return nil, err
 	}
 
-	if line.mediaTime != 0 && (stbl.Ctts == nil || int64(stbl.Ctts.GetCompositionTimeOffset(1)) != line.mediaTime) {
+	firstComposition := int64(0)
+	if stbl.Ctts != nil {
+		firstComposition = int64(stbl.Ctts.GetCompositionTimeOffset(1))
+	}
+	if line.hasEdit && firstComposition != line.mediaTime {
 		return nil, fmt.Errorf("%w: edit start is not the first composition time", ErrUnsupported)
 	}
 
@@ -219,6 +266,7 @@ func editTimeline(trak *mp4.TrakBox, movieTimescale, mediaTimescale uint64) (tim
 		return line, fmt.Errorf("%w: unsupported edit rate or time", ErrUnsupported)
 	}
 	line.mediaTime = edit.MediaTime
+	line.hasEdit = true
 	if edit.SegmentDuration > 0 {
 		line.hasEditEnd = true
 		scaled := edit.SegmentDuration * mediaTimescale / movieTimescale

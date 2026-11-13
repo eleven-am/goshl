@@ -85,6 +85,7 @@ type VideoStream struct {
 	Rotation           int
 	Default            bool
 	StartsWithKeyframe bool
+	Start              float64
 	End                float64
 }
 
@@ -94,6 +95,7 @@ type AudioStream struct {
 	Language      string
 	Title         string
 	Channels      int
+	SampleRate    int
 	ChannelLayout string
 	Bitrate       int
 	Default       bool

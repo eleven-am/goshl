@@ -348,6 +348,13 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 				return
 			}
 			params.Landing = &landing
+		} else if jobSeekStart(job) <= domain.BoundaryTolerance {
+			landing, err := p.cmdBuilder.SeekLanding(jobCtx, job.SourceURL, 0, job.VideoStreamIndex)
+			if err != nil {
+				fail(err)
+				return
+			}
+			params.Landing = &landing
 		}
 		args, err = p.cmdBuilder.Video(params)
 	} else {
@@ -384,6 +391,7 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 		Expected:  job.ExpectedIndices,
 		Overlap:   segmentIndex(job.Overlap),
 		Trailing:  segmentIndex(job.Trailing),
+		Ends:      segmentEnds(job, isVideo),
 	})
 	if err := w.Start(jobCtx); err != nil {
 		fail(err)
@@ -396,6 +404,32 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 	}
 
 	complete()
+}
+
+const (
+	videoEndTolerance = 0.1
+	audioEndTolerance = 0.06
+	jobTailSlack      = 0.5
+)
+
+func segmentEnds(job domain.Job, isVideo bool) map[int]SegmentEnd {
+	tolerance := audioEndTolerance
+	if isVideo {
+		tolerance = videoEndTolerance
+	}
+	offset := domain.OutputTimelineOffset.Seconds()
+	ends := make(map[int]SegmentEnd, len(job.Segments)+1)
+	if job.Overlap != nil {
+		ends[job.Overlap.Index] = SegmentEnd{Time: offset + job.Overlap.End, Early: tolerance, Late: tolerance}
+	}
+	for position, segment := range job.Segments {
+		end := SegmentEnd{Time: offset + segment.End, Early: tolerance, Late: tolerance}
+		if position == len(job.Segments)-1 && job.Trailing == nil {
+			end.Early = jobTailSlack
+		}
+		ends[segment.Index] = end
+	}
+	return ends
 }
 
 func segmentIndex(segment *domain.Segment) *int {
@@ -598,8 +632,7 @@ func (p *Pool) completeJob(delivery domain.JobDelivery, started time.Time) bool 
 
 func (p *Pool) failJob(ctx context.Context, delivery domain.JobDelivery, err error, started time.Time) bool {
 	job := delivery.Job
-	cause := context.Cause(ctx)
-	if errors.Is(cause, context.Canceled) || errors.Is(cause, ErrDeliveryLeaseLost) {
+	if errors.Is(ctx.Err(), context.Canceled) {
 		return false
 	}
 	if p.settleJob(delivery, domain.JobStateFailed, err.Error()) == nil {

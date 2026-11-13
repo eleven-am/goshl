@@ -44,6 +44,7 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 	}
 
 	var keyframes []float64
+	cutShort := false
 	if streams.Video.Codec != "" {
 		var indexed bool
 		keyframes, indexed, err = p.indexKeyframes(ctx, url, formatName, streams.Video.Index)
@@ -55,24 +56,51 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 			if err != nil {
 				return nil, err
 			}
+			if scan.packets == 0 {
+				return nil, fmt.Errorf("video stream has no readable packets")
+			}
 			keyframes = scan.keyframes
+			declared := streams.Video.End
 			if scan.end > streams.StartTime {
 				streams.Video.End = scan.end - streams.StartTime
 			}
+			cutShort = declared > 0 && streams.Video.End < declared-durationSlack
 		}
 	}
 
 	streams.Duration = boundedDuration(streams)
+	if cutShort {
+		clampToVideoEnd(streams)
+	}
 	if err := validateMetadata(streams); err != nil {
 		return nil, err
 	}
 
 	streams.Keyframes = normalizeKeyframes(keyframes, streams.StartTime, streams.Duration)
-	streams.Video.StartsWithKeyframe = len(streams.Keyframes) > 0 && math.Abs(streams.Keyframes[0]) < 0.000001
+	streams.Video.StartsWithKeyframe = len(streams.Keyframes) > 0 && math.Abs(streams.Keyframes[0]-streams.Video.Start) < streamStartTolerance
 	return streams, nil
 }
 
 const durationSlack = 0.25
+
+func clampToVideoEnd(metadata *domain.Metadata) {
+	end := metadata.Video.End
+	if end <= 0 {
+		return
+	}
+	if metadata.Duration <= 0 || metadata.Duration > end {
+		metadata.Duration = end
+	}
+	for index := range metadata.Audios {
+		if metadata.Audios[index].End > end {
+			metadata.Audios[index].End = end
+		}
+	}
+}
+
+const streamStartTolerance = 0.0015
+
+const maxDuration = 100 * 3600.0
 
 func boundedDuration(metadata *domain.Metadata) float64 {
 	latest, complete := latestStreamEnd(metadata)
@@ -113,6 +141,9 @@ func validateMetadata(metadata *domain.Metadata) error {
 	if metadata == nil || metadata.Duration <= 0 || math.IsNaN(metadata.Duration) || math.IsInf(metadata.Duration, 0) {
 		return fmt.Errorf("media has no finite positive duration")
 	}
+	if metadata.Duration > maxDuration {
+		return fmt.Errorf("media duration %.0fs exceeds the %.0fs limit", metadata.Duration, maxDuration)
+	}
 	return validateStreams(metadata)
 }
 
@@ -136,6 +167,7 @@ type ffprobeStream struct {
 	StartTime   string            `json:"start_time"`
 	Duration    string            `json:"duration"`
 	Channels    int               `json:"channels"`
+	SampleRate  string            `json:"sample_rate"`
 	Layout      string            `json:"channel_layout"`
 	BitRate     string            `json:"bit_rate"`
 	ColorRange  string            `json:"color_range"`
@@ -218,6 +250,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 					SampleAspect:   s.SAR,
 					Rotation:       rotation,
 					Default:        s.Disposition.Default == 1,
+					Start:          ends.streamStart(s),
 					End:            ends.streamEnd(s),
 				}
 			}
@@ -228,6 +261,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 				Language:      s.Tags["language"],
 				Title:         s.Tags["title"],
 				Channels:      s.Channels,
+				SampleRate:    parseBitrate(s.SampleRate),
 				ChannelLayout: s.Layout,
 				Bitrate:       parseBitrate(firstNonEmpty(s.BitRate, statisticsTag(s.Tags, "BPS"))),
 				Default:       s.Disposition.Default == 1,
@@ -252,6 +286,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 type keyframeScan struct {
 	keyframes []float64
 	end       float64
+	packets   int
 }
 
 func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int) (keyframeScan, error) {
@@ -280,6 +315,7 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int
 		if len(parts) < 2 {
 			continue
 		}
+		scan.packets++
 		pts, err := strconv.ParseFloat(parts[0], 64)
 		if err != nil {
 			continue
@@ -491,6 +527,14 @@ func writtenByLibavformat(formatTags map[string]string) bool {
 	return false
 }
 
+func (r endReader) streamStart(s ffprobeStream) float64 {
+	start, err := strconv.ParseFloat(s.StartTime, 64)
+	if err != nil || math.IsNaN(start) || math.IsInf(start, 0) || start <= r.formatStart {
+		return 0
+	}
+	return start - r.formatStart
+}
+
 func (r endReader) streamEnd(s ffprobeStream) float64 {
 	start, startErr := strconv.ParseFloat(s.StartTime, 64)
 	end := 0.0
@@ -500,6 +544,9 @@ func (r endReader) streamEnd(s ffprobeStream) float64 {
 		end = parseClock(s.Tags["DURATION"])
 	} else if tagged := parseClock(statisticsTag(s.Tags, "DURATION")); tagged > 0 && startErr == nil {
 		end = start + tagged
+	}
+	if end == 0 {
+		return 0
 	}
 	end -= r.formatStart
 	if end <= 0 || math.IsNaN(end) || math.IsInf(end, 0) {

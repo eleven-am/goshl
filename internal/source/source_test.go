@@ -37,7 +37,7 @@ func TestInputArgsWhitelistsTheInputSide(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InputArgs: %v", err)
 	}
-	want := []string{"-protocol_whitelist", ProtocolWhitelist, "-i", "file:-dash.mp4"}
+	want := []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", ProtocolWhitelist, "-i", "file:-dash.mp4"}
 	if len(args) != len(want) {
 		t.Fatalf("args = %v, want %v", args, want)
 	}
@@ -107,7 +107,7 @@ func TestProtocolWhitelistIsExactlyTheSupportedSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InputArgs: %v", err)
 	}
-	if len(args) != 4 || args[0] != "-protocol_whitelist" || args[1] != "file" {
+	if len(args) != 6 || args[2] != "-protocol_whitelist" || args[3] != "file" {
 		t.Fatalf("args = %v", args)
 	}
 }
@@ -129,10 +129,11 @@ func TestInputArgsWhitelistFollowsRemoteness(t *testing.T) {
 		raw  string
 		want []string
 	}{
-		{"/media/a.mp4", []string{"-protocol_whitelist", "file", "-i", "file:/media/a.mp4"}},
-		{"file:///media/a.mp4", []string{"-protocol_whitelist", "file", "-i", "file:/media/a.mp4"}},
-		{"https://example.com/a.mp4", []string{"-protocol_whitelist", "http,https,tcp,tls", "-i", "https://example.com/a.mp4"}},
-		{"http://example.com/a.mp4", []string{"-protocol_whitelist", "http,https,tcp,tls", "-i", "http://example.com/a.mp4"}},
+		{"/media/a.mp4", []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", "file", "-i", "file:/media/a.mp4"}},
+		{"file:///media/a.mp4", []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", "file", "-i", "file:/media/a.mp4"}},
+		{"https://example.com/a.mp4", []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", "http,https,tcp,tls", "-i", "https://example.com/a.mp4"}},
+		{"http://example.com/a.mp4", []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", "http,https,tcp,tls", "-i", "http://example.com/a.mp4"}},
+		{"HTTPS://Example.com/A.mp4", []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", "http,https,tcp,tls", "-i", "https://Example.com/A.mp4"}},
 	}
 	for _, tc := range cases {
 		args, err := InputArgs(tc.raw)

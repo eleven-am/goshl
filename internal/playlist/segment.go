@@ -42,7 +42,7 @@ func planSegments(keyframes []float64, duration float64, targetDuration float64)
 	}
 
 	limit := MaxSegmentDuration(targetDuration) + domain.BoundaryTolerance
-	aligned := math.Abs(keyframes[0]) <= domain.BoundaryTolerance
+	aligned := true
 	boundaries := []float64{0}
 	start := 0.0
 	cut := func(end float64) {

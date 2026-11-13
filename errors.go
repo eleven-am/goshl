@@ -5,6 +5,7 @@ import (
 
 	"github.com/eleven-am/goshl/internal/coordination"
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/source"
 )
 
 var (
@@ -20,5 +21,7 @@ var (
 )
 
 var ErrEnqueueRejected = domain.ErrEnqueueRejected
+
+var ErrUnsupportedSource = source.ErrUnsupportedSource
 
 var ErrControllerStopped = coordination.ErrStopped

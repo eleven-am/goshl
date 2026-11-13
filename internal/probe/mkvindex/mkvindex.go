@@ -114,7 +114,13 @@ func KeyframesFrom(r io.ReaderAt, size int64, streamIndex int) ([]float64, error
 	return index.Keyframes, nil
 }
 
-func readIndex(r io.ReaderAt, size int64, streamIndex int) (*cueIndex, error) {
+type segmentLayout struct {
+	cursor    *cursor
+	start     int64
+	positions map[ebml.ElementType]int64
+}
+
+func readLayout(r io.ReaderAt, size int64) (*segmentLayout, error) {
 	c := &cursor{source: r, size: size}
 
 	var head header
@@ -122,9 +128,12 @@ func readIndex(r io.ReaderAt, size int64, streamIndex int) (*cueIndex, error) {
 		return nil, err
 	}
 
-	segment, err := c.segmentStart()
+	segment, declared, err := c.segmentStart()
 	if err != nil {
 		return nil, err
+	}
+	if declared >= 0 && declared > size-segment {
+		return nil, fmt.Errorf("%w: segment declares %d bytes but the source holds %d", ErrUnsupported, declared, size-segment)
 	}
 	var seek seekHead
 	if err := c.decode(&seek, segment, headWindow, headWindow, maxHeadElements); err != nil {
@@ -132,7 +141,7 @@ func readIndex(r io.ReaderAt, size int64, streamIndex int) (*cueIndex, error) {
 	}
 	positions := make(map[ebml.ElementType]int64)
 	for _, entry := range seek.SeekHead.Seek {
-		for _, element := range []ebml.ElementType{ebml.ElementInfo, ebml.ElementTracks, ebml.ElementCues} {
+		for _, element := range []ebml.ElementType{ebml.ElementInfo, ebml.ElementTracks, ebml.ElementCues, ebml.ElementTags} {
 			if _, seen := positions[element]; !seen && bytes.Equal(entry.ID, element.Bytes()) {
 				if entry.Position > uint64(size) {
 					return nil, fmt.Errorf("%w: seek position past the end", ErrUnsupported)
@@ -141,9 +150,20 @@ func readIndex(r io.ReaderAt, size int64, streamIndex int) (*cueIndex, error) {
 			}
 		}
 	}
-	if len(positions) != 3 {
-		return nil, fmt.Errorf("%w: seek head does not list info, tracks and cues", ErrUnsupported)
+	for _, element := range []ebml.ElementType{ebml.ElementInfo, ebml.ElementTracks, ebml.ElementCues} {
+		if _, listed := positions[element]; !listed {
+			return nil, fmt.Errorf("%w: seek head does not list info, tracks and cues", ErrUnsupported)
+		}
 	}
+	return &segmentLayout{cursor: c, start: segment, positions: positions}, nil
+}
+
+func readIndex(r io.ReaderAt, size int64, streamIndex int) (*cueIndex, error) {
+	layout, err := readLayout(r, size)
+	if err != nil {
+		return nil, err
+	}
+	c, positions := layout.cursor, layout.positions
 
 	var segmentInfo info
 	if err := c.decode(&segmentInfo, positions[ebml.ElementInfo], headWindow, maxHeadBytes, maxHeadElements); err != nil {
@@ -257,23 +277,39 @@ func (c *cursor) decode(target any, pos int64, window, limit int64, elements int
 	return nil
 }
 
-func (c *cursor) segmentStart() (int64, error) {
+func (c *cursor) segmentStart() (int64, int64, error) {
 	var head [elementIDLength + 1]byte
 	c.end = min(c.pos+int64(len(head)), c.size)
 	if _, err := io.ReadFull(c, head[:]); err != nil {
 		if c.failed != nil {
-			return 0, c.failed
+			return 0, 0, c.failed
 		}
-		return 0, fmt.Errorf("%w: truncated segment header", ErrUnsupported)
+		return 0, 0, fmt.Errorf("%w: truncated segment header", ErrUnsupported)
 	}
 	if !bytes.Equal(head[:elementIDLength], ebml.ElementSegment.Bytes()) {
-		return 0, fmt.Errorf("%w: no segment after the header", ErrUnsupported)
+		return 0, 0, fmt.Errorf("%w: no segment after the header", ErrUnsupported)
 	}
 	sizeLength := bits.LeadingZeros8(head[elementIDLength]) + 1
 	if sizeLength > maxSizeLength {
-		return 0, fmt.Errorf("%w: invalid segment size", ErrUnsupported)
+		return 0, 0, fmt.Errorf("%w: invalid segment size", ErrUnsupported)
 	}
-	return c.pos - 1 + int64(sizeLength), nil
+	var rest [maxSizeLength - 1]byte
+	c.end = min(c.pos+int64(sizeLength-1), c.size)
+	if _, err := io.ReadFull(c, rest[:sizeLength-1]); err != nil {
+		if c.failed != nil {
+			return 0, 0, c.failed
+		}
+		return 0, 0, fmt.Errorf("%w: truncated segment header", ErrUnsupported)
+	}
+	valueBits := uint(7 * sizeLength)
+	declared := uint64(head[elementIDLength]) & (0xff >> uint(sizeLength))
+	for _, value := range rest[:sizeLength-1] {
+		declared = declared<<8 | uint64(value)
+	}
+	if declared == 1<<valueBits-1 {
+		return c.pos, -1, nil
+	}
+	return c.pos, int64(declared), nil
 }
 
 func (c *cursor) Read(p []byte) (int, error) {

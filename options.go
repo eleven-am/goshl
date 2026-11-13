@@ -8,6 +8,13 @@ import (
 	"github.com/eleven-am/goshl/internal/domain"
 )
 
+const (
+	minTargetDuration = 1.0
+	maxTargetDuration = 60.0
+	maxSegmentsPerJob = 1000
+	maxPoolSize       = 1024
+)
+
 type Options struct {
 	Storage Storage
 
@@ -139,6 +146,12 @@ func (o *Options) validateResolvedError() error {
 	}
 	if o.SegmentsPerJob <= 0 || o.VideoPoolSize <= 0 || o.AudioPoolSize <= 0 {
 		return fmt.Errorf("%w: pool and batch sizes must be positive", ErrInvalidOptions)
+	}
+	if o.TargetDuration < minTargetDuration || o.TargetDuration > maxTargetDuration {
+		return fmt.Errorf("%w: TargetDuration must be between %g and %g seconds", ErrInvalidOptions, minTargetDuration, maxTargetDuration)
+	}
+	if o.SegmentsPerJob > maxSegmentsPerJob || o.VideoPoolSize > maxPoolSize || o.AudioPoolSize > maxPoolSize {
+		return fmt.Errorf("%w: SegmentsPerJob is limited to %d and pool sizes to %d", ErrInvalidOptions, maxSegmentsPerJob, maxPoolSize)
 	}
 	if err := validatePreviewConfig(o.DefaultPreviewConfig, false); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidOptions, err)

@@ -1,6 +1,7 @@
 package mp4index
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -8,6 +9,32 @@ import (
 
 	"github.com/Eyevinn/mp4ff/mp4"
 )
+
+const (
+	maxSubtitleSamples = 1 << 20
+	maxSubtitleBytes   = 64 << 20
+	sampleCheckEvery   = 4096
+)
+
+type sampleTimes struct {
+	stts     *mp4.SttsBox
+	run      int
+	runStart uint32
+	decode   uint64
+}
+
+func (s *sampleTimes) at(sample uint32) (uint64, uint32, bool) {
+	for s.run < len(s.stts.SampleCount) && sample-s.runStart >= s.stts.SampleCount[s.run] {
+		s.decode += uint64(s.stts.SampleCount[s.run]) * uint64(s.stts.SampleTimeDelta[s.run])
+		s.runStart += s.stts.SampleCount[s.run]
+		s.run++
+	}
+	if s.run >= len(s.stts.SampleCount) || s.run >= len(s.stts.SampleTimeDelta) {
+		return 0, 0, false
+	}
+	delta := s.stts.SampleTimeDelta[s.run]
+	return s.decode + uint64(sample-s.runStart)*uint64(delta), delta, true
+}
 
 type SubtitleSample struct {
 	Offset   int64
@@ -21,7 +48,7 @@ type SubtitleIndex struct {
 	Samples []SubtitleSample
 }
 
-func SubtitleIndexesFrom(r io.ReaderAt, size int64, streamIndexes []int) (map[int]SubtitleIndex, map[int]error, error) {
+func SubtitleIndexesFrom(ctx context.Context, r io.ReaderAt, size int64, streamIndexes []int) (map[int]SubtitleIndex, map[int]error, error) {
 	moov, err := readMoov(r, size)
 	if err != nil {
 		return nil, nil, err
@@ -39,7 +66,10 @@ func SubtitleIndexesFrom(r io.ReaderAt, size int64, streamIndexes []int) (map[in
 			failures[streamIndex] = fmt.Errorf("%w: no trak at index %d", ErrUnsupported, streamIndex)
 			continue
 		}
-		index, err := trackSubtitleIndex(moov.Traks[streamIndex], uint64(moov.Mvhd.Timescale), size)
+		index, err := trackSubtitleIndex(ctx, moov.Traks[streamIndex], uint64(moov.Mvhd.Timescale), size)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, nil, ctxErr
+		}
 		if err != nil {
 			failures[streamIndex] = err
 			continue
@@ -49,7 +79,7 @@ func SubtitleIndexesFrom(r io.ReaderAt, size int64, streamIndexes []int) (map[in
 	return indexes, failures, nil
 }
 
-func trackSubtitleIndex(trak *mp4.TrakBox, movieTimescale uint64, sourceSize int64) (SubtitleIndex, error) {
+func trackSubtitleIndex(ctx context.Context, trak *mp4.TrakBox, movieTimescale uint64, sourceSize int64) (SubtitleIndex, error) {
 	if trak == nil || trak.Mdia == nil || trak.Mdia.Hdlr == nil || trak.Mdia.Mdhd == nil || trak.Mdia.Minf == nil || trak.Mdia.Minf.Stbl == nil {
 		return SubtitleIndex{}, fmt.Errorf("%w: incomplete subtitle trak", ErrUnsupported)
 	}
@@ -65,6 +95,9 @@ func trackSubtitleIndex(trak *mp4.TrakBox, movieTimescale uint64, sourceSize int
 	if sampleCount == 0 {
 		return SubtitleIndex{Samples: []SubtitleSample{}}, nil
 	}
+	if sampleCount > maxSubtitleSamples {
+		return SubtitleIndex{}, fmt.Errorf("%w: subtitle track claims %d samples", ErrUnsupported, sampleCount)
+	}
 	chunkCount := 0
 	if stbl.Stco != nil {
 		chunkCount = len(stbl.Stco.ChunkOffset)
@@ -79,7 +112,9 @@ func trackSubtitleIndex(trak *mp4.TrakBox, movieTimescale uint64, sourceSize int
 		return SubtitleIndex{}, err
 	}
 	emptyTicks := (int64(line.emptyDur)*int64(timescale) + int64(movieTimescale)/2) / int64(movieTimescale)
-	index := SubtitleIndex{Samples: make([]SubtitleSample, 0, sampleCount)}
+	index := SubtitleIndex{Samples: make([]SubtitleSample, 0, min(sampleCount, sampleCheckEvery))}
+	times := sampleTimes{stts: stbl.Stts, runStart: 1}
+	var totalBytes uint64
 	var nextSample uint32 = 1
 	entryIndex := 0
 	for chunkNumber := 1; chunkNumber <= chunkCount; chunkNumber++ {
@@ -115,12 +150,21 @@ func trackSubtitleIndex(trak *mp4.TrakBox, movieTimescale uint64, sourceSize int
 			return SubtitleIndex{}, err
 		}
 		for inChunk := uint32(0); inChunk < chunk.NrSamples && nextSample <= sampleCount; inChunk++ {
+			if nextSample%sampleCheckEvery == 0 {
+				if err := ctx.Err(); err != nil {
+					return SubtitleIndex{}, err
+				}
+			}
 			sampleSize := stbl.Stsz.GetSampleSize(int(nextSample))
+			totalBytes += uint64(sampleSize)
+			if totalBytes > maxSubtitleBytes {
+				return SubtitleIndex{}, fmt.Errorf("%w: subtitle samples exceed %d bytes", ErrUnsupported, maxSubtitleBytes)
+			}
 			if offset > uint64(math.MaxInt64) || uint64(sampleSize) > uint64(sourceSize) || offset > uint64(sourceSize)-uint64(sampleSize) {
 				return SubtitleIndex{}, fmt.Errorf("%w: subtitle sample %d is out of bounds", ErrUnsupported, nextSample)
 			}
-			decodeTime, duration, err := stbl.Stts.GetDecodeTime(nextSample)
-			if err != nil || decodeTime > math.MaxInt64 {
+			decodeTime, duration, timed := times.at(nextSample)
+			if !timed || decodeTime > math.MaxInt64 {
 				return SubtitleIndex{}, fmt.Errorf("%w: subtitle sample %d timing", ErrUnsupported, nextSample)
 			}
 			composition := int64(decodeTime)

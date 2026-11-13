@@ -11,6 +11,8 @@ const ProtocolWhitelist = "file"
 
 const RemoteProtocolWhitelist = "http,https,tcp,tls"
 
+const FormatWhitelist = "mov,matroska,mpegts,mpeg,avi,flv,asf,ogg,mxf,nut,rm,wtv,dv,gxf,m4v,h264,hevc,mpegvideo,ivf,mp3,aac,ac3,eac3,flac,wav,w64,aiff,caf,dts,truehd,wv,ape,tta,amr"
+
 var ErrUnsupportedSource = errors.New("unsupported media source")
 
 type Input struct {
@@ -61,7 +63,7 @@ func InputArgs(raw string) ([]string, error) {
 	if input.Remote {
 		whitelist = RemoteProtocolWhitelist
 	}
-	return []string{"-protocol_whitelist", whitelist, "-i", input.Arg}, nil
+	return []string{"-format_whitelist", FormatWhitelist, "-protocol_whitelist", whitelist, "-i", input.Arg}, nil
 }
 
 func local(path string) Input {
@@ -111,5 +113,5 @@ func resolveRemote(raw, scheme string) (Input, error) {
 	if err != nil || parsed.Host == "" {
 		return Input{}, fmt.Errorf("%w: invalid %s URL", ErrUnsupportedSource, scheme)
 	}
-	return Input{Arg: raw, Remote: true}, nil
+	return Input{Arg: scheme + raw[len(scheme):], Remote: true}, nil
 }

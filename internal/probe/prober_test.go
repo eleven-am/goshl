@@ -216,6 +216,7 @@ exit 1
 
 const ffprobeBitRateScript = `#!/bin/sh
 if printf "%s" "$*" | grep -q "show_entries"; then
+  printf '0.000000,K\n'
   exit 0
 fi
 
@@ -399,8 +400,9 @@ func TestProbe_EmptyEditOddTimescaleMatchesPacketScan(t *testing.T) {
 		wantStarts *bool
 	}{
 		"with audio": {
-			inputs: []string{"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"},
-			maps:   []string{"-map", "0:v", "-map", "1:a", "-c:a", "aac"},
+			inputs:     []string{"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"},
+			maps:       []string{"-map", "0:v", "-map", "1:a", "-c:a", "aac"},
+			wantStarts: boolPtr(true),
 		},
 		"video only": {wantStarts: boolPtr(true)},
 	}
@@ -447,7 +449,7 @@ func TestProbe_EmptyEditOddTimescaleMatchesPacketScan(t *testing.T) {
 					t.Fatalf("keyframe %d: %v, want %v", i, meta.Keyframes[i], want[i])
 				}
 			}
-			wantStarts := len(want) > 0 && math.Abs(want[0]) < 0.000001
+			wantStarts := len(want) > 0 && math.Abs(want[0]-meta.Video.Start) < streamStartTolerance
 			if meta.Video.StartsWithKeyframe != wantStarts {
 				t.Fatalf("StartsWithKeyframe %v, want %v", meta.Video.StartsWithKeyframe, wantStarts)
 			}
@@ -537,4 +539,22 @@ func recordFFprobeArgv(t *testing.T) string {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return logPath
+}
+
+func TestProbe_ReportsVideoStartAndAudioSampleRate(t *testing.T) {
+	testmedia.Require(t)
+	path := testmedia.H264(t, testmedia.Spec{Container: "mp4", Duration: 4, VideoDelay: 0.0834, Audio: []testmedia.AudioSpec{{Codec: "aac", SampleRate: 44100}}})
+	meta, err := NewProber().Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if math.Abs(meta.Video.Start-0.0834) > 0.002 {
+		t.Errorf("Video.Start = %v, want about 0.0834", meta.Video.Start)
+	}
+	if len(meta.Audios) != 1 || meta.Audios[0].SampleRate != 44100 {
+		t.Errorf("audio sample rate = %+v, want 44100", meta.Audios)
+	}
+	if !meta.Video.StartsWithKeyframe {
+		t.Errorf("a stream whose first keyframe is its first frame must report StartsWithKeyframe")
+	}
 }

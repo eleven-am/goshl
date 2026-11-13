@@ -115,7 +115,7 @@ func TestProbeRecordsFormatBitrate(t *testing.T) {
 }
 
 func TestProbeReadsLanguageSuffixedStatisticsTags(t *testing.T) {
-	fakeFFprobe(t, `{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"start_time":"0.000000","tags":{"BPS-eng":"4940302","DURATION-eng":"00:21:01.511000000","_STATISTICS_WRITING_APP-eng":"mkvmerge v55.0.0"}},{"index":1,"codec_name":"aac","codec_type":"audio","channels":2,"start_time":"0.000000","tags":{"BPS-eng":"125588","DURATION-eng":"00:21:01.516000000","_STATISTICS_WRITING_APP-eng":"mkvmerge v55.0.0"}}],"format":{"format_name":"matroska,webm","start_time":"0.000000","duration":"1261.516000","bit_rate":"5068415","tags":{"encoder":"libebml v1.4.2 + libmatroska v1.6.4"}}}`, "0.000000,0.041000,K_\n")
+	fakeFFprobe(t, `{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"start_time":"0.000000","tags":{"BPS-eng":"4940302","DURATION-eng":"00:21:01.511000000","_STATISTICS_WRITING_APP-eng":"mkvmerge v55.0.0"}},{"index":1,"codec_name":"aac","codec_type":"audio","channels":2,"start_time":"0.000000","tags":{"BPS-eng":"125588","DURATION-eng":"00:21:01.516000000","_STATISTICS_WRITING_APP-eng":"mkvmerge v55.0.0"}}],"format":{"format_name":"matroska,webm","start_time":"0.000000","duration":"1261.516000","bit_rate":"5068415","tags":{"encoder":"libebml v1.4.2 + libmatroska v1.6.4"}}}`, "0.000000,0.041000,K_\n1261.470000,0.041000,__\n")
 	input := filepath.Join(t.TempDir(), "input.mkv")
 	if err := os.WriteFile(input, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -197,6 +197,8 @@ func TestStreamEndReadsEachDeclaredShape(t *testing.T) {
 		"libavformat prefers its own tag":  {ffprobeStream{StartTime: "0.000000", Tags: map[string]string{"DURATION-eng": "00:21:01.516000000", "DURATION": "00:00:20.014000000"}}, endReader{timestampTags: true}, 20.014},
 		"end timestamp, late format":       {ffprobeStream{StartTime: "5.000000", Tags: map[string]string{"DURATION": "00:00:15.010000000"}}, endReader{formatStart: 4.979, timestampTags: true}, 10.031},
 		"nothing declared":                 {ffprobeStream{StartTime: "0.000000"}, endReader{}, 0},
+		"nothing declared, negative start": {ffprobeStream{StartTime: "-0.021000"}, endReader{formatStart: -0.021}, 0},
+		"no tag, negative start, lavf":     {ffprobeStream{StartTime: "-0.021000"}, endReader{formatStart: -0.021, timestampTags: true}, 0},
 		"unparsable":                       {ffprobeStream{StartTime: "0.000000", Duration: "N/A", Tags: map[string]string{"DURATION": "soon"}}, endReader{}, 0},
 		"ends before format start":         {ffprobeStream{StartTime: "0.000000", Duration: "1.000000"}, endReader{formatStart: 3}, 0},
 	}

@@ -178,10 +178,30 @@ func (c *Controller) expireFlight(f *flight) {
 	c.finishFlight(f)
 }
 
-func (c *Controller) markEnqueued(f *flight) {
+func (c *Controller) markEnqueued(f *flight) bool {
 	c.flights.mu.Lock()
+	defer c.flights.mu.Unlock()
+	if c.flights.flights[f.jobID] != f {
+		return false
+	}
 	f.enqueued = true
-	c.flights.mu.Unlock()
+	return true
+}
+
+const lockProbeTTL = 5 * time.Second
+
+func (c *Controller) jobLockFree(jobID string) bool {
+	probe, cancel := cleanupContext()
+	defer cancel()
+	runID := uuid.NewString()
+	token, _, err := c.opts.Coordinator.AcquireJob(probe, jobID, runID, lockProbeTTL)
+	if err != nil {
+		return false
+	}
+	if err := c.opts.Coordinator.ReleaseJob(probe, jobID, runID, token); err != nil {
+		c.observe(probe, domain.Event{Type: domain.EventLockReleaseFailed, JobID: jobID, Error: err.Error()})
+	}
+	return true
 }
 
 func (c *Controller) finishFlight(f *flight) {

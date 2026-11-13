@@ -246,17 +246,22 @@ func TestSegmentJoinerFollowsActiveRunWhenCreatorFindsLockHeld(t *testing.T) {
 	}
 	close(gate)
 
-	for i := 0; i < 2; i++ {
-		select {
-		case runID := <-coord.waitJobs:
-			if runID != "other-run" {
-				t.Fatalf("waited on run %q, want other-run", runID)
-			}
-		case r := <-joiner:
-			t.Fatalf("joiner returned early: data=%q err=%v", r.data, r.err)
-		case <-time.After(3 * time.Second):
-			t.Fatal("creator and joiner did not both follow the active run")
+	select {
+	case runID := <-coord.waitJobs:
+		if runID != "other-run" {
+			t.Fatalf("waited on run %q, want other-run", runID)
 		}
+	case r := <-joiner:
+		t.Fatalf("joiner returned early: data=%q err=%v", r.data, r.err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("creator did not follow the active run")
+	}
+	select {
+	case r := <-joiner:
+		t.Fatalf("joiner returned before the remote run delivered: data=%q err=%v", r.data, r.err)
+	case r := <-creator:
+		t.Fatalf("creator returned before the remote run delivered: data=%q err=%v", r.data, r.err)
+	default:
 	}
 	store.ready.Store(true)
 

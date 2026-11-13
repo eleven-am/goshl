@@ -29,6 +29,7 @@ type AudioRendition struct {
 	GroupID     string
 	Bitrate     int
 	Channels    int
+	SampleRate  int
 	SourceEnd   float64
 	Method      PlaybackMethod
 

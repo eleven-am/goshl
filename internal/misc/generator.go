@@ -2,6 +2,7 @@ package misc
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/eleven-am/goshl/internal/coordination"
@@ -33,6 +34,7 @@ type Generator struct {
 
 	generationTimeout time.Duration
 	extractSubtitles  func(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error
+	narrowSubtitles   sync.Map
 
 	thumbWidth  int
 	thumbHeight int
