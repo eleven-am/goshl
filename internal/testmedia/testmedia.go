@@ -209,11 +209,27 @@ func x264Params(spec Spec) string {
 }
 
 func keyframeExpression(frames []int) string {
+	if step, ok := evenStep(frames); ok {
+		return fmt.Sprintf("expr:not(mod(n,%d))*lte(n,%d)", step, frames[len(frames)-1])
+	}
 	terms := make([]string, 0, len(frames))
 	for _, frame := range frames {
 		terms = append(terms, fmt.Sprintf("eq(n,%d)", frame))
 	}
 	return "expr:" + strings.Join(terms, "+")
+}
+
+func evenStep(frames []int) (int, bool) {
+	if len(frames) < 3 || frames[0] != 0 || frames[1] <= 0 {
+		return 0, false
+	}
+	step := frames[1]
+	for i, frame := range frames {
+		if frame != i*step {
+			return 0, false
+		}
+	}
+	return step, true
 }
 
 func subtitleScript(duration float64) string {

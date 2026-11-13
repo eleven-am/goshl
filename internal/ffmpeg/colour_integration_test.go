@@ -201,18 +201,24 @@ func TestHDRToneMapDarkensShadowsBelowRetag(t *testing.T) {
 	dir := t.TempDir()
 	args, err := softwareBuilder(nil).Video(VideoParams{InputURL: input, Rendition: colourRendition(spec, 320, 180), Segments: []domain.Segment{{Index: 0, Start: 0, End: 2, Duration: 2}}, OutputDir: dir})
 	runJob(t, args, err)
-	raw, err := exec.Command("ffmpeg", "-v", "error", "-i", filepath.Join(dir, "segment-00000.ts"), "-frames:v", "1", "-vf", "format=gray", "-f", "rawvideo", "-").Output()
+	mapped := meanLuma(t, filepath.Join(dir, "segment-00000.ts"), "format=gray")
+	retagged := meanLuma(t, input, "format=yuv420p,format=gray")
+	if mapped <= 16 || mapped >= retagged-5 {
+		t.Fatalf("tone mapped 10-nit PQ patch has mean luma %.1f, want above black (16) and clearly below the plain retag %.1f", mapped, retagged)
+	}
+}
+
+func meanLuma(t *testing.T, path, filter string) float64 {
+	t.Helper()
+	raw, err := exec.Command("ffmpeg", "-v", "error", "-i", path, "-frames:v", "1", "-vf", filter, "-f", "rawvideo", "-").Output()
 	if err != nil || len(raw) == 0 {
-		t.Fatalf("decode tone mapped frame: %v", err)
+		t.Fatalf("decode frame of %s: %v", path, err)
 	}
 	var sum int
 	for _, value := range raw {
 		sum += int(value)
 	}
-	mean := float64(sum) / float64(len(raw))
-	if mean >= 65 || mean <= 16 {
-		t.Fatalf("tone mapped 10-nit PQ patch has mean luma %.1f, want within (16, 65); a plain retag measures 75 on this fixture", mean)
-	}
+	return float64(sum) / float64(len(raw))
 }
 
 func TestVideoToolboxKeepsHardwareCodecsForColourWork(t *testing.T) {
