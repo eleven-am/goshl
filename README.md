@@ -30,6 +30,7 @@ go get github.com/eleven-am/goshl
 - For HDR sources (PQ or HLG transfer), an `ffmpeg` built with the `zscale` (libzimg) and `tonemap` filters, for example Homebrew `ffmpeg-full` or `jellyfin-ffmpeg`. Use the same build on every replica. This is not checked at startup: it is detected on first use and cached. Without these filters, `MasterPlaylist` and the video `VariantPlaylist` of an HDR source return an error wrapping `ErrTonemapUnavailable`, and its HDR renditions fail explicitly. The check runs on the host serving the playlist, so every replica must use the same build. SDR sources do not need it. An 8-bit source tagged PQ or HLG is treated as a mis-tagged SDR source: it is retagged BT.709 and encoded normally, since genuine HDR is 10-bit or more.
 - Source schemes are limited to local paths, `file:`, `http:` and `https:`. Every FFmpeg and FFprobe invocation runs with the protocol whitelist `file,http,https,tcp,tls`; any other scheme (for example `rtmp://`, `concat:` or `data:`) is rejected before FFmpeg starts. An empty source, an unsupported scheme or a malformed URL returns an error wrapping `ErrUnsupportedSource`.
 - Trust model: goshl treats `sourceURL` as trusted. The host owns URL policy; goshl does not restrict which hosts an http(s) source may point at, including loopback and private IP addresses. FFmpeg, FFprobe and goshl's own range reader fetch the URL as given. goshl's own range reader (used for MP4 and MKV indexing and indexed subtitle extraction) follows at most 5 redirects, only to http(s) URLs, and refuses an https-to-http downgrade. FFmpeg and FFprobe follow redirects themselves under their own limits, which goshl does not control. TLS certificate verification by FFmpeg depends on its TLS backend (SecureTransport, OpenSSL or GnuTLS) and is not enforced by goshl, so hosts should only pass trusted https sources. If source URLs can come from users, validate them in your application and limit outbound network access to the origins you intend. Inputs are restricted to real container formats (`-format_whitelist`). Playlist formats such as HLS or ffconcat are rejected, so a source cannot make FFmpeg open further URLs or files.
+- A ready-made runtime base image with a matching ffmpeg is published as `ghcr.io/eleven-am/goshl-ffmpeg:<version>` (multi-arch amd64 and arm64, Ubuntu 24.04, glibc). See [ffmpeg base image](#ffmpeg-base-image).
 - Generated segments sit on a timeline that starts at 10 seconds rather than 0. Subtitle WebVTT files carry `X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000` so players keep cues aligned with the video. Sprite, preview and thumbnail output is unaffected.
 
 ## Quick start
@@ -436,6 +437,20 @@ Every transcode is tagged BT.709 limited range. Untagged sources are assumed BT.
 Transcoded audio from sources at 44.1 kHz or 32 kHz joins frame-exactly across jobs. Sources whose video starts after the container start are cut on the plan, and every job's output is validated against its expected segment times; a mismatch fails the job instead of caching misplaced segments. When the video ends before the audio, the remaining video segments repeat the last frame.
 
 Master playlists distinguish audio codec and channel groups, declare aggregate bandwidth and codecs, support silent and audio-only media, and expose subtitle groups (unless `OmitSubtitleRenditions` is set). Each audio group has the same members, one per source track, with `NAME` taken from the track title or language label, exactly one `DEFAULT` per group, and `LANGUAGE` as an RFC 5646 tag (`en`, not `eng`). Subtitle `DEFAULT` follows the source disposition, subtitle names are unique, and `FORCED=YES` implies `AUTOSELECT=YES`. An audio-only master carries `BANDWIDTH` and `SUBTITLES`. `MasterPlaylist`, `SubtitlePlaylist` and `VariantPlaylist` return an error rather than write an invalid playlist (no renditions, zero bitrate, empty codec, zero duration or no segments).
+
+## ffmpeg base image
+
+`docker/ffmpeg` builds a runtime base image with ffmpeg and ffprobe for goshl hosts. Tags are immutable and never move; pin the digest.
+
+| Tag | ffmpeg | Platforms | Digest |
+|---|---|---|---|
+| `ghcr.io/eleven-am/goshl-ffmpeg:9.0.2-1` | 9.0.2 | linux/amd64, linux/arm64 | `sha256:49618bfc33fd0a8e9705be5aae97129172b596bc3a1b69a9fd03664a2ccfcaef` |
+
+- Built from the official ffmpeg source, as a shared-library build on `ubuntu:24.04`, against nv-codec-headers 13.0.19.0 (NVENC API 13.0). NVENC therefore runs on NVIDIA driver 570 or newer.
+- Includes `libx264`, `h264_nvenc`, `h264_vaapi`, `h264_qsv` (amd64), `aac`, `ac3`, `eac3`, `png`, `mjpeg` and the subtitle codecs. Filters include `scale_cuda`, `zscale`, `tonemap`, `tonemap_vaapi` and `tonemap_opencl`.
+- The runtime has `gosu`, `passwd`, `ca-certificates`, `tzdata` and `wget`, with `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`.
+- `docker/ffmpeg/selfcheck.sh` runs as the last build step. The build fails unless every required encoder, filter, muxer and library is present, NVENC targets API 13.0, and software, HLS, HDR tone-mapping and subtitle smoke encodes succeed. Hardware encoders are checked for presence only.
+- To release a new image, push a tag `ffmpeg-<version>-<n>` to run `.github/workflows/ffmpeg-image.yml`. It builds each platform on native runners and refuses to overwrite an existing tag. To build locally, run `docker buildx build --platform linux/amd64,linux/arm64 -t <image>:<tag> --push docker/ffmpeg`.
 
 ## Upgrading
 
