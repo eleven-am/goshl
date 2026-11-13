@@ -1,6 +1,10 @@
 package goshl
 
-import "github.com/eleven-am/goshl/internal/domain"
+import (
+	"context"
+
+	"github.com/eleven-am/goshl/internal/domain"
+)
 
 type (
 	Storage = domain.Storage
@@ -145,3 +149,12 @@ const (
 var (
 	ErrLockHeld = domain.ErrLockHeld
 )
+
+type CacheInvalidator interface {
+	DeleteMedia(context.Context, string) error
+}
+
+type SubtitleResult struct {
+	Data []byte
+	Err  error
+}

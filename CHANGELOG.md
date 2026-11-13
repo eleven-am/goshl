@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.0.28] - 2026-11-13
+
+No behaviour, API, cache or job contract change.
+
+- refactor: the root package holds only the public API; scheduling, flights, metadata, identity and asset machinery live in an internal engine package
+- test: end-to-end tests are a black-box e2e package grouped by concern; unit tests moved with their code, none removed
+- docs: shorter README; API reference, configuration, operations and architecture in docs/; MIGRATION rewritten as per-version upgrade steps
+
 ## [0.0.27] - 2026-11-13
 
 Cache `goshl-cache-v6`; job contract version unchanged (5). See MIGRATION.md.
