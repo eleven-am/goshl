@@ -3,6 +3,7 @@ package goshl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -59,6 +60,7 @@ if [ "$1" = "-hwaccels" ]; then
 echo "Hardware acceleration methods:"; echo cuda; exit 0; fi
 if [ "$1" = "-encoders" ]; then
 echo "h264_nvenc"; exit 0; fi
+if [ "$1" = "-version" ]; then exit 0; fi
 echo "$*" >> "$FAKE_LOG"
 if [ -n "$FAKE_HANG" ]; then
 echo $$ > "$FAKE_PID"
@@ -70,7 +72,7 @@ done
 prev=""; m=""
 for a; do
 case "$prev" in -map) m=$a;; esac
-case "$a" in *.vtt) echo "WEBVTT stream $m" > "$a";; esac
+case "$a" in *.vtt) printf 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nstream %s\n' "$m" > "$a";; esac
 prev=$a
 done
 exit 0
@@ -124,7 +126,7 @@ func TestSubtitlesVTTUsesOneFFmpegForAllTracks(t *testing.T) {
 	logPath, _ := installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2, 4, 5, 7, 9))
 
-	got, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "t4", "t5", "t7", "t9"})
+	got, err := svc.SubtitlesVTT(context.Background(), nonMP4Source(t), []string{"t2", "t4", "t5", "t7", "t9"})
 	if err != nil {
 		t.Fatalf("batch: %v", err)
 	}
@@ -136,17 +138,21 @@ func TestSubtitlesVTTUsesOneFFmpegForAllTracks(t *testing.T) {
 	}
 }
 
+func wantStubSubtitleVTT(stream string) string {
+	return fmt.Sprintf("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:%d,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:02.000\nstream %s\n\n", int64(domain.OutputTimelineOffset.Seconds()*90000), stream)
+}
+
 func TestSubtitlesVTTMapsOutputsToTracks(t *testing.T) {
 	installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2, 4, 5))
 
-	got, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "t4", "t5"})
+	got, err := svc.SubtitlesVTT(context.Background(), nonMP4Source(t), []string{"t2", "t4", "t5"})
 	if err != nil {
 		t.Fatalf("batch: %v", err)
 	}
 	for _, id := range []string{"t2", "t4", "t5"} {
-		want := "WEBVTT stream 0:" + strings.TrimPrefix(id, "t")
-		if got[id].Err != nil || strings.TrimSpace(string(got[id].Data)) != want {
+		want := wantStubSubtitleVTT("0:" + strings.TrimPrefix(id, "t"))
+		if got[id].Err != nil || string(got[id].Data) != want {
 			t.Fatalf("track %s: data %q err %v, want %q", id, got[id].Data, got[id].Err, want)
 		}
 	}
@@ -158,7 +164,7 @@ func TestSubtitlesVTTBitmapTrackDoesNotFailOthers(t *testing.T) {
 	subs = append(subs, domain.SubtitleStream{Index: 6, ID: "pgs", Codec: "hdmv_pgs_subtitle", Language: "en"})
 	svc := newSubtitleController(t, subs)
 
-	got, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "pgs", "t4"})
+	got, err := svc.SubtitlesVTT(context.Background(), nonMP4Source(t), []string{"t2", "pgs", "t4"})
 	if err != nil {
 		t.Fatalf("batch: %v", err)
 	}
@@ -177,7 +183,7 @@ func TestSubtitlesVTTFailingTrackDoesNotFailOthers(t *testing.T) {
 	installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2, 3, 4))
 
-	got, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "t3", "t4"})
+	got, err := svc.SubtitlesVTT(context.Background(), nonMP4Source(t), []string{"t2", "t3", "t4"})
 	if err != nil {
 		t.Fatalf("batch: %v", err)
 	}
@@ -193,10 +199,11 @@ func TestSubtitlesVTTSkipsCachedTracks(t *testing.T) {
 	logPath, _ := installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2, 4))
 
-	if _, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "t4"}); err != nil {
+	source := nonMP4Source(t)
+	if _, err := svc.SubtitlesVTT(context.Background(), source, []string{"t2", "t4"}); err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	got, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "t4"})
+	got, err := svc.SubtitlesVTT(context.Background(), source, []string{"t2", "t4"})
 	if err != nil || len(got["t2"].Data) == 0 {
 		t.Fatalf("second: %v %+v", err, got)
 	}
@@ -267,7 +274,7 @@ func TestSubtitlesVTTUnknownTrackIsReported(t *testing.T) {
 	installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2))
 
-	got, err := svc.SubtitlesVTT(context.Background(), "file:///media", []string{"t2", "nope"})
+	got, err := svc.SubtitlesVTT(context.Background(), nonMP4Source(t), []string{"t2", "nope"})
 	if err != nil {
 		t.Fatalf("batch: %v", err)
 	}
@@ -280,8 +287,8 @@ func TestSubtitleVTTUsesBatchPath(t *testing.T) {
 	logPath, _ := installSubtitleFFmpeg(t)
 	svc := newSubtitleController(t, textTracks(2))
 
-	data, err := svc.SubtitleVTT(context.Background(), "file:///media", "t2")
-	if err != nil || strings.TrimSpace(string(data)) != "WEBVTT stream 0:2" {
+	data, err := svc.SubtitleVTT(context.Background(), nonMP4Source(t), "t2")
+	if err != nil || string(data) != wantStubSubtitleVTT("0:2") {
 		t.Fatalf("single: %q %v", data, err)
 	}
 	if calls := ffmpegCalls(t, logPath); len(calls) != 1 {
@@ -298,7 +305,7 @@ func TestSubtitlesVTTCallerCancelDetachesAndGenerationTimeoutKillsFFmpeg(t *test
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := svc.SubtitlesVTT(ctx, "file:///media", []string{"t2", "t4"})
+		_, err := svc.SubtitlesVTT(ctx, nonMP4Source(t), []string{"t2", "t4"})
 		done <- err
 	}()
 
@@ -382,4 +389,29 @@ func subtitleTestRange(value string) (int64, int64, bool) {
 	}
 	end, err := strconv.ParseInt(parts[1], 10, 64)
 	return start, end, err == nil && start <= end
+}
+
+func nonMP4Source(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "source.mkv")
+	if err := os.WriteFile(path, []byte("not an indexable mp4 container"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	return path
+}
+
+func TestSubtitlesVTTMissingLocalSourceFailsWithNotExist(t *testing.T) {
+	logPath, _ := installSubtitleFFmpeg(t)
+	svc := newSubtitleController(t, textTracks(2))
+
+	got, err := svc.SubtitlesVTT(context.Background(), filepath.Join(t.TempDir(), "missing.mp4"), []string{"t2"})
+	if err != nil {
+		t.Fatalf("top-level err = %v, want nil", err)
+	}
+	if !errors.Is(got["t2"].Err, os.ErrNotExist) {
+		t.Fatalf("track err = %v (results %+v), want os.ErrNotExist", got["t2"].Err, got)
+	}
+	if calls := ffmpegCalls(t, logPath); len(calls) != 0 {
+		t.Fatalf("ffmpeg ran %d times for a missing source", len(calls))
+	}
 }

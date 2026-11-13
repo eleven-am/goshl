@@ -19,7 +19,10 @@ func TestSpriteArgsDecodeOnlyKeyframesBeforeInput(t *testing.T) {
 		DecodeFlags: []string{"-hwaccel", "cuda"},
 	})
 
-	args := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
+	args, err := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
 
 	skip := indexOf(args, "-skip_frame")
 	input := indexOf(args, "-i")
@@ -74,19 +77,19 @@ func TestSetSpriteStorageIgnoresNil(t *testing.T) {
 
 func TestSpritesUseSeparateSpriteStorage(t *testing.T) {
 	main := &stubStorage{}
-	sprites := &stubStorage{spriteVTTExists: true, spriteVTTData: []byte("from-sprites"), spriteData: map[int][]byte{0: []byte("img")}}
+	sprites := &stubStorage{spriteData: map[int][]byte{0: []byte("img")}}
 	g := NewGenerator(main)
 	g.SetSpriteStorage(sprites)
 
 	vtt, err := g.GetSpriteVTT(context.Background(), "file:///media", "key", 10, spriteURL)
-	if err != nil || string(vtt) != "from-sprites" {
-		t.Fatalf("expected vtt from sprite storage, got %q %v", vtt, err)
+	if err != nil || !strings.Contains(string(vtt), "http://sprites/0.jpg#xywh=0,0,160,90") {
+		t.Fatalf("expected vtt rendered from sprites in sprite storage, got %q %v", vtt, err)
 	}
-	img, err := g.GetSprite(context.Background(), "file:///media", "key", 10, spriteURL, 0)
+	img, err := g.GetSprite(context.Background(), "file:///media", "key", 10, 0)
 	if err != nil || string(img) != "img" {
 		t.Fatalf("expected sprite from sprite storage, got %q %v", img, err)
 	}
-	if main.readSprites != 0 || main.wroteSprites != 0 || main.wroteSpriteVTT != 0 {
+	if main.readSprites != 0 || main.wroteSprites != 0 {
 		t.Fatalf("segment storage must not serve sprites")
 	}
 }
@@ -120,10 +123,10 @@ func TestGenerateSpritesFromKeyframesProducesValidVTT(t *testing.T) {
 	if !strings.Contains(text, "00:01:35.000 --> 00:01:37.000") {
 		t.Fatalf("expected final cue to end at duration, got %s", text)
 	}
-	if sprites.wroteSprites != 1 || sprites.wroteSpriteVTT != 1 {
-		t.Fatalf("expected one sprite sheet and one vtt, got %d %d", sprites.wroteSprites, sprites.wroteSpriteVTT)
+	if sprites.wroteSprites != 1 {
+		t.Fatalf("expected one sprite sheet, got %d", sprites.wroteSprites)
 	}
-	if main.wroteSprites != 0 || main.wroteSpriteVTT != 0 {
+	if main.wroteSprites != 0 {
 		t.Fatalf("segment storage must not receive sprites")
 	}
 	img, err := jpeg.Decode(bytes.NewReader(sprites.spriteData[0]))
@@ -148,7 +151,10 @@ func TestGenerateSpritesFillsThumbsAfterLastKeyframe(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	args := NewGenerator(&stubStorage{}).spriteArgs(clip, filepath.Join(tmp, "s-%d.jpg"), 97)
+	args, err := NewGenerator(&stubStorage{}).spriteArgs(clip, filepath.Join(tmp, "s-%d.jpg"), 97)
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
 	args = append([]string{"-y"}, args...)
 	if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
 		t.Fatalf("ffmpeg: %v %s", err, out)

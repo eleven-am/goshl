@@ -30,7 +30,7 @@ func TestGenerateVideo_DirectStreamAndClamping(t *testing.T) {
 			if r.Width != 1280 {
 				t.Fatalf("expected 720p width 1280, got %d", r.Width)
 			}
-			if r.Bitrate != 4_000_000 { // ratio would be higher, should clamp to 4Mbps cap
+			if r.Bitrate != 4_000_000 {
 				t.Fatalf("expected 720p bitrate clamp to 4Mbps, got %d", r.Bitrate)
 			}
 		}

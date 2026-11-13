@@ -24,7 +24,11 @@ Segments are only transcoded when a client requests them. A 2-hour video doesn't
 go get github.com/eleven-am/goshl
 ```
 
-Requires `ffmpeg` and `ffprobe` in PATH.
+### Runtime requirements
+
+- `ffmpeg` and `ffprobe` in `PATH`, version 6.1 or newer. Transcoded video relies on `-enc_time_base demux`, which older releases do not have; the controller checks both versions at startup and returns an error wrapping `ErrInvalidOptions` if either is older.
+- Source schemes are limited to local paths, `file:`, `http:` and `https:`. Every FFmpeg and FFprobe invocation runs with the protocol whitelist `file,http,https,tcp,tls`; any other scheme (for example `rtmp://`, `concat:` or `data:`) is rejected before FFmpeg starts.
+- Generated segments sit on a timeline that starts at 10 seconds rather than 0. Subtitle WebVTT files carry `X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000` so players keep cues aligned with the video. Sprite, preview and thumbnail output is unaffected.
 
 ## Quick start
 
@@ -44,17 +48,26 @@ if err := controller.Start(ctx); err != nil {
 defer controller.Stop()
 ```
 
+`NewController(opts)` does the same but panics on error.
+
 ## Interfaces
 
-You need to implement three interfaces:
+You implement three interfaces. `SpriteStorage` is an optional fourth.
 
 ### Storage
 
-Handles persistence of segments, metadata, sprites, and subtitles.
+Handles persistence of segments, metadata, sprites, subtitles, previews and thumbnails.
 
 Metadata methods receive an opaque media key. Asset methods receive an opaque asset key. Store these values exactly as provided; do not derive them again from the source URL. `SegmentData.MediaKey` carries the same opaque media identity. Goshl versions these keys using the source revision and active media pipeline so incompatible output is not reused.
 
 ```go
+type SegmentData struct {
+    MediaKey  string
+    Index     int
+    Rendition string
+    IsVideo   bool
+}
+
 type Storage interface {
     MetadataExists(ctx context.Context, mediaKey string) (bool, error)
     GetMetadata(ctx context.Context, mediaKey string) ([]byte, error)
@@ -67,10 +80,6 @@ type Storage interface {
     WriteSprite(ctx context.Context, assetKey string, index int, data []byte) error
     ReadSprite(ctx context.Context, assetKey string, index int) ([]byte, error)
     SpriteExists(ctx context.Context, assetKey string, index int) (bool, error)
-
-    WriteSpriteVTT(ctx context.Context, assetKey string, data []byte) error
-    ReadSpriteVTT(ctx context.Context, assetKey string) ([]byte, error)
-    SpriteVTTExists(ctx context.Context, assetKey string) (bool, error)
 
     WriteSubtitleVTT(ctx context.Context, assetKey string, trackID string, data []byte) error
     ReadSubtitleVTT(ctx context.Context, assetKey string, trackID string) ([]byte, error)
@@ -86,11 +95,27 @@ type Storage interface {
 }
 ```
 
+The sprite VTT is never stored: `SpriteVTT` renders it on each request from `PathGenerator.Sprite`.
+
+If the storage also implements `DeleteMedia(ctx context.Context, mediaKey string) error`, `controller.Invalidate` uses it to purge everything stored for a media key.
+
+### SpriteStorage
+
+Optional. When `Options.SpriteStorage` is set, sprite sheets are written there instead of `Storage` (for example to keep them on a CDN-backed store). It is the sprite subset of `Storage`:
+
+```go
+type SpriteStorage interface {
+    WriteSprite(ctx context.Context, assetKey string, index int, data []byte) error
+    ReadSprite(ctx context.Context, assetKey string, index int) ([]byte, error)
+    SpriteExists(ctx context.Context, assetKey string, index int) (bool, error)
+}
+```
+
+To let `Invalidate` clean it, implement `DeleteMedia(ctx, mediaKey) error` on it as well.
+
 ### Coordinator
 
 Manages job distribution and segment notifications. For single-instance deployments, an in-memory implementation works. For distributed setups, use something like Redis.
-
-Jobs are concrete, versioned work contracts. A coordinator must preserve every `Job` field unchanged. Enqueue is idempotent by `Job.RunID`. Each delivery has an opaque receipt so settlement cannot affect another execution of the same deterministic batch.
 
 ```go
 type Coordinator interface {
@@ -112,17 +137,61 @@ type Coordinator interface {
 }
 ```
 
-`Subscribe` is a competing-consumer subscription scoped to both stream type and pipeline profile. A job must only be delivered to a worker subscribed to its exact `Job.Profile`. Every delivery needs a unique receipt and an initial lease of at least five seconds. `Renew` extends that exact delivery, `Ack` discards only that receipt, and an unacknowledged delivery becomes available again after its lease expires. Redelivery invalidates the previous receipt so its worker can no longer renew or settle the delivery.
+#### Job
 
-`Job.ID` is the deterministic batch identity used for locking. `Job.RunID` identifies one execution of that batch and is the queue idempotency key. Job status is keyed by `RunID`, must fan out to all current waiters, and the latest status must be replayed to a late waiter.
+Jobs are concrete, versioned work contracts. A coordinator must carry every `Job` field unchanged, including fields it does not understand:
 
-`AcquireJob` atomically acquires the deterministic batch lock and registers its run ID. When the lock is already held, it returns `ErrLockHeld` together with the active run ID. This lets every replica subscribe to the same durable job lifecycle. `ReleaseJob` must compare the job ID, run ID, and token before clearing the lock or active run.
+```go
+type Job struct {
+    ID               string
+    RunID            string
+    MediaKey         string
+    Profile          string
+    SourceURL        string
+    Rendition        string
+    StreamType       StreamType
+    StartIndex       int
+    EndIndex         int
+    RequestedIndex   int
+    EnqueuedAt       time.Time
+    StartBy          time.Time
+    Segments         []Segment
+    Overlap          *Segment
+    Trailing         *Segment
+    ExpectedIndices  []int
+    VideoRendition   *VideoRendition
+    AudioRendition   *AudioRendition
+    VideoStreamIndex int
+}
 
-`SettleJob` must atomically validate the active receipt, persist its terminal status, and remove the delivery. It must be idempotent when retried with the same receipt and status. The receipt-to-status settlement record must remain available until at least one minute after `Job.Deadline`. This prevents a crash between status publication and acknowledgement from redelivering terminal work. `Ack` is reserved for malformed deliveries that cannot supply a valid run status.
+type JobDelivery struct {
+    Job     Job
+    Receipt string
+}
 
-Job status must remain replayable until at least one minute after `Job.Deadline`. Segment status is only a transient readiness hint and must not replay notifications. Failures travel through run scoped job status. `WaitJob` and `WaitSegment` must unregister their subscribers when the supplied context ends. Goshl does not cancel a cluster job merely because one replica has no local waiters; another replica may still need it.
+type JobStatus struct {
+    JobID string
+    RunID string
+    State JobState
+    Error string
+}
+```
 
-Terminal job states are immutable. A coordinator must not replace a terminal state.
+`JobState` is `JobStateCompleted`, `JobStateFailed` or `JobStateCancelled`; all three are terminal.
+
+`StartBy` is the latest moment a worker may begin the job. A worker refuses a delivery whose `StartBy` has passed, and otherwise runs it with a full `Options.JobTimeout` counted from the start of execution. `Overlap` and `Trailing` are extra media ranges the worker needs so copied segments join without gaps; `VideoStreamIndex` selects the source video stream. A coordinator never interprets them.
+
+`Job.ID` is the deterministic batch identity used for locking. `Job.RunID` identifies one execution of that batch and is the queue idempotency key.
+
+#### Contract
+
+- `Enqueue` is idempotent by `Job.RunID`. Return an error wrapping `goshl.ErrEnqueueRejected` only when the job was definitely not persisted; goshl then frees the batch at once so the next request can retry. Any other error is treated as ambiguous and the batch stays reserved until its lock expires.
+- `Subscribe` is a competing-consumer subscription scoped to both stream type and pipeline profile. A job is delivered only to a worker subscribed to its exact `Job.Profile`. Every delivery has a unique receipt and an initial lease of at least five seconds. `Renew` extends that exact delivery, `Ack` discards only that receipt, and an unacknowledged delivery becomes available again when its lease expires. Redelivery invalidates the previous receipt.
+- `SettleJob` atomically validates the active receipt, persists the terminal status and removes the delivery. It is idempotent when retried with the same receipt and status. The receipt-to-status record and the job status must stay available until at least one minute after `Job.StartBy` plus `JobTimeout`. `Ack` is reserved for malformed deliveries that cannot supply a valid status.
+- `WaitJob` is keyed by `RunID`, fans out to all current waiters and replays the latest status to a late waiter. Terminal states are immutable.
+- `AcquireJob` atomically acquires the batch lock and registers the run ID. When the lock is already held it returns `ErrLockHeld` together with the active run ID, so every replica can wait on the same run. `ReleaseJob` compares job ID, run ID and token before clearing anything.
+- Segment status (`NotifySegment`, `WaitSegment`) is a transient readiness hint and must not replay. Failures travel through run-scoped job status.
+- `WaitJob` and `WaitSegment` must unregister their subscribers when the supplied context ends. Goshl does not cancel a cluster job merely because one replica has no local waiters.
 
 ### PathGenerator
 
@@ -138,27 +207,68 @@ type PathGenerator interface {
 }
 ```
 
-## Controller methods
+## Controller
+
+`sourceURL` is a local path, a `file:` URL, or an `http(s)` URL. Rendition names contain only letters, digits, `.`, `_` and `-`, at most 64 characters; they must not start with `.` or contain `..`.
+
+### Construction and lifecycle
+
+| Method | Description |
+|---|---|
+| `NewControllerWithContext(ctx, Options) (*Controller, error)` | Validates options, applies defaults, runs hardware detection and validation. Returns an error wrapping `ErrInvalidOptions` for bad options. |
+| `NewController(Options) *Controller` | Same, panics on error. |
+| `Start(ctx) error` | Starts the video and audio worker pools. |
+| `Stop()` | Idempotent. Cancels detached work (asset generation, metadata probes, flight watchers), waits up to 10 seconds for it, then releases the locks of flights that were never enqueued. A `Segment` call racing `Stop` returns `ErrControllerStopped`. Locks of jobs already enqueued are not released; they expire by their TTL (`StartBy` plus `JobTimeout` plus one minute). A stopped controller cannot be restarted. |
+| `HWAccelConfig() HWAccelConfig` | Copy of the selected hardware configuration: `Accelerator`, `Requested`, `Available`, `Error`, `DecodeMode`, plus the FFmpeg flags in use. |
+
+After `Stop`, every method returns `ErrControllerStopped` (checked before argument validation) except `Stop` itself, `HWAccelConfig` (a pure accessor) and the constructors. This covers `Start`, `Segment`, `Metadata`, `ProbeMetadata`, `MasterPlaylist`, `VariantPlaylist`, `SubtitlePlaylist`, `SpriteVTT`, `Sprite`, `SubtitleVTT`, `SubtitlesVTT`, `Preview`, `Thumbnail`, `MediaKey` and `Invalidate`.
+
+With `HWAccel: true`, construction may take noticeably longer when hardware validation fails: an explicit `HWAccelMode` is validated with a 15-second bound. Auto-detection (`HWAccel: true`) runs detection and validation inside a single 20-second bound.
+
+### Playlists and segments
+
+| Method | Description |
+|---|---|
+| `MasterPlaylist(ctx, sourceURL) (string, error)` | Master playlist with video, audio and subtitle renditions. |
+| `VariantPlaylist(ctx, sourceURL, streamType, rendition) (string, error)` | Media playlist for one video or audio rendition. |
+| `SubtitlePlaylist(ctx, sourceURL, trackID) (string, error)` | Media playlist for one subtitle track. |
+| `Segment(ctx, sourceURL, streamType, rendition, index) ([]byte, error)` | Segment data; transcoded on first request, cached after. `streamType` is `StreamVideo` or `StreamAudio`. |
+
+### Metadata and identity
+
+| Method | Description |
+|---|---|
+| `Metadata(ctx, sourceURL) (*Metadata, error)` | Probe result, cached in `Storage`. |
+| `ProbeMetadata(ctx, sourceURL) (*Metadata, error)` | Probes without reading or writing the cache. Bounded by `ProbeTimeout`. |
+| `MediaKey(ctx, sourceURL) (string, error)` | The resolved opaque media key. |
+| `Invalidate(ctx, sourceURL) error` | Deletes everything stored for the media, including `SpriteStorage` when configured. Returns `ErrCacheInvalidationUnsupported` if `Storage` (or a configured `SpriteStorage`) has no `DeleteMedia`. |
+
+`Metadata` carries `StartTime`, `Duration`, `Keyframes`, one `Video` stream, and `Audios` and `Subtitles` lists. Each subtitle has a stable `ID` (for example `subtitle-3`) used as the track ID everywhere else.
+
+A probe that fails is remembered in process for 10 seconds (at most 1024 sources are remembered; the earliest to expire is evicted first), so repeated requests for a broken source return the same error without re-running ffprobe. `Invalidate(sourceURL)` forgets that source's entry, and a probe that began before any `Invalidate` call is not remembered.
+
+### Seek previews and subtitle files
+
+| Method | Description |
+|---|---|
+| `SpriteVTT(ctx, sourceURL) ([]byte, error)` | Thumbnail-sprite WebVTT, rendered on every request with the current `PathGenerator.Sprite`. Generates the sprite sheets if they are missing. |
+| `Sprite(ctx, sourceURL, index) ([]byte, error)` | One sprite sheet image. |
+| `SubtitleVTT(ctx, sourceURL, trackID) ([]byte, error)` | WebVTT for one subtitle track. |
+| `SubtitlesVTT(ctx, sourceURL, trackIDs) (map[string]SubtitleResult, error)` | Several tracks in one pass. `SubtitleResult` has `Data []byte` and `Err error` per track. |
+| `Preview(ctx, sourceURL, *PreviewConfig) ([]byte, error)` | Animated preview. `nil` uses `DefaultPreviewConfig`; zero fields fall back to the defaults. |
+| `Thumbnail(ctx, sourceURL, *ThumbnailConfig) ([]byte, error)` | Single image. `nil` uses `DefaultThumbnailConfig`; a zero `Position` or `Width` means "use the default". `Position` is a fraction of the duration in `(0, 1]`, so the very first frame is not selectable; use a small positive value such as `0.001`. |
 
 ```go
-// Returns master playlist with available renditions
-playlist, err := controller.MasterPlaylist(ctx, "file:///path/to/video.mp4")
+type PreviewConfig struct {
+    MaxFrames     int // 1..1000
+    Frameduration int // milliseconds per frame, 1..60000
+    Width         int // pixels, 1..4096
+}
 
-// Returns variant playlist for a specific rendition
-playlist, err := controller.VariantPlaylist(ctx, sourceURL, goshl.StreamVideo, "720p")
-
-// Returns segment data (transcodes on first request, cached after)
-data, err := controller.Segment(ctx, sourceURL, goshl.StreamVideo, "720p", 0)
-
-// Returns WebVTT file for thumbnail sprites
-vtt, err := controller.SpriteVTT(ctx, sourceURL)
-
-// Returns sprite sheet image
-sprite, err := controller.Sprite(ctx, sourceURL, 0)
-
-// Returns a subtitle media playlist and WebVTT payload by stable track ID
-playlist, err := controller.SubtitlePlaylist(ctx, sourceURL, "subtitle-3")
-subs, err := controller.SubtitleVTT(ctx, sourceURL, "subtitle-3")
+type ThumbnailConfig struct {
+    Position float64 // (0, 1]; 0 means the default
+    Width    int     // pixels, 1..8192
+}
 ```
 
 For progressive MP4 sources, Goshl reads the MP4 index and fetches only the bytes belonging to requested `mov_text`/`tx3g` or `wvtt` subtitle samples. Local files use random access and HTTP sources use validated byte-range requests. The generated WebVTT is stored through `Storage`, so later requests do not reopen the source.
@@ -167,44 +277,60 @@ Unsupported containers, fragmented MP4 layouts, subtitle codecs, and HTTP server
 
 ## Options
 
+Fields left at their zero value take the default shown.
+
 ```go
 goshl.Options{
-    Storage:        myStorage,          // required
-    Coordinator:    myCoordinator,      // required
-    PathGen:        myPathGen,          // required
+    Storage:     myStorage,     // required
+    Coordinator: myCoordinator, // required
+    PathGen:     myPathGen,     // required
 
-    HWAccel:        false,              // auto-detect GPU encoding if available
-    HWAccelMode:    goshl.AccelNone,    // explicitly choose none, cuda, videotoolbox, vaapi, or qsv
-    SegmentTimeout: 30 * time.Second,   // max wait for segment transcoding
-    JobTimeout:     2 * time.Minute,    // hard deadline for queued FFmpeg work
-    TargetDuration: 6.0,                // target segment duration in seconds
-    SegmentsPerJob: 4,                  // segments per transcoding job
-    VideoPoolSize:  2,                  // video transcoding workers
-    AudioPoolSize:  4,                  // audio transcoding workers
+    SpriteStorage: nil, // optional separate store for sprite sheets
 
-    CacheVersion:   "deployment-v1",   // bump when host-side media policy changes
-    SourceRevision: revisionResolver,   // ETag/version resolver for remote sources
-    Observer:       observer,           // structured lifecycle events
+    HWAccel:               false,           // auto-detect GPU encoding
+    HWAccelMode:           "",              // AccelNone, AccelCUDA, AccelVideoToolbox, AccelVAAPI or AccelQSV; overrides HWAccel
+    HWAccelDecodeMode:     goshl.DecodeSafe, // DecodeSafe or DecodeDevice
+    AllowHardwareFallback: false,           // fall back to software when an explicit HWAccelMode fails validation
 
-    HWAccelDecodeMode:    goshl.DecodeSafe,
-    AllowHardwareFallback: false,
+    SegmentTimeout:    30 * time.Second, // max wait for one Segment call
+    JobTimeout:        2 * time.Minute,  // execution budget of one FFmpeg job
+    ProbeTimeout:      0,                // defaults to JobTimeout
+    GenerationTimeout: 10 * time.Minute, // sprites, previews, thumbnails, subtitles
+
+    TargetDuration: 6.0, // target segment duration in seconds
+    SegmentsPerJob: 4,   // segments per transcoding job
+    VideoPoolSize:  2,   // video workers
+    AudioPoolSize:  4,   // audio workers
+
+    DefaultPreviewConfig:   goshl.PreviewConfig{MaxFrames: 40, Frameduration: 250, Width: 480},
+    DefaultThumbnailConfig: goshl.ThumbnailConfig{Position: 0.1, Width: 480},
+
+    OmitSubtitleRenditions: false, // leave subtitle groups out of the master playlist
+
+    CacheVersion:   "",     // change when host-side media policy changes
+    SourceRevision: nil,    // func(ctx, sourceURL) (string, error)
+    Observer:       nil,    // receives lifecycle events
 }
 ```
 
-Local files use size and modification time as their default source revision. Remote URLs are treated as immutable unless `SourceRevision` returns an ETag, version, or content fingerprint. Call `controller.MediaKey` to inspect the resolved opaque key. If storage also implements `DeleteMedia(context.Context, string) error`, `controller.Invalidate` purges that media key.
+Negative durations, sizes, or out-of-range preview and thumbnail values make construction return `ErrInvalidOptions` (or `ErrInvalidPreviewConfig` / `ErrInvalidThumbnailConfig` wrapped in it).
+
+A segment request waits up to `SegmentTimeout` for the segment, but the job itself is never cancelled because a waiter left. A queued job that does not start before its `StartBy` (enqueue time plus `JobTimeout`) is settled as failed with a start-by error rather than run.
+
+Local files use size and modification time as their default source revision. Remote URLs are treated as immutable unless `SourceRevision` returns an ETag, version, or content fingerprint. Call `controller.MediaKey` to inspect the resolved opaque key.
 
 ## Hardware acceleration
 
-Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Apple VideoToolbox, VAAPI, and Intel QSV. Detection performs a bounded decode/filter/encode self-test. Auto mode falls back to software and exposes the reason through `controller.HWAccelConfig()` and observer events.
+Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Intel QSV, Apple VideoToolbox and VAAPI. Detection performs a bounded decode/filter/encode self-test. Auto mode falls back to software and exposes the reason through `controller.HWAccelConfig()` and observer events.
 
 Set `HWAccelMode` when the caller already knows the desired accelerator:
 
 ```go
-controller := goshl.NewController(goshl.Options{
-    Storage:     myStorage,
-    Coordinator: myCoordinator,
-    PathGen:     myPathGen,
-    HWAccelMode: goshl.AccelCUDA,
+controller, err := goshl.NewControllerWithContext(ctx, goshl.Options{
+    Storage:           myStorage,
+    Coordinator:       myCoordinator,
+    PathGen:           myPathGen,
+    HWAccelMode:       goshl.AccelCUDA,
     HWAccelDecodeMode: goshl.DecodeSafe,
 })
 ```
@@ -216,24 +342,62 @@ cfg := controller.HWAccelConfig()
 log.Printf("accelerator=%s requested=%s available=%v error=%s", cfg.Accelerator, cfg.Requested, cfg.Available, cfg.Error)
 ```
 
+Workers on different accelerators use different pipeline profiles and never exchange jobs, so mixed-hardware fleets keep separate queues.
+
+## Other exported types
+
+- `PlaybackMethod`: `DirectPlay`, `DirectStream` or `Transcode`, set on each `VideoRendition` and `AudioRendition` in a `Job`.
+- `StreamType`: `StreamVideo`, `StreamAudio` or `StreamSubtitle` (subtitles are served through `SubtitlePlaylist` and `SubtitleVTT`; `Segment` rejects them).
+- `SegmentState` / `SegmentStatus`: `SegmentStateReady` or `SegmentStateError`, with an `Error` string, passed to `Coordinator.NotifySegment`.
+- `SourceRevisionResolver`: `func(ctx context.Context, sourceURL string) (string, error)`, the type of `Options.SourceRevision`.
+- `CacheInvalidator`: `DeleteMedia(ctx context.Context, mediaKey string) error`, implemented by `Storage` and `SpriteStorage` to support `Invalidate`.
+- `HWAccelConfig` also carries `Encoder`, `KeyframeFlag`, `ScaleFilter`, `DecodeMode` and `DeviceFrames`, describing the FFmpeg setup selected.
+
 ## Observability
 
-`Observer` receives typed events for metadata and segment cache hits/misses, lock waits and release failures, job enqueue/start/completion/failure, acknowledgement failures, notification failures, segment readiness, and hardware selection/fallback. Event identities are opaque hashes; raw signed source URLs are not emitted. Observer callbacks should return promptly.
+`Observer` receives an `Event` for each of the following. Event identities are opaque hashes; raw signed source URLs are not emitted. Callbacks should return promptly. `ObserverFunc` adapts a plain function.
+
+| Event type | Meaning |
+|---|---|
+| `EventMetadataCacheHit`, `EventMetadataCacheMiss`, `EventMetadataProbed` | Metadata cache lookups and fresh probes. A miss caused by unreadable stored metadata carries `Error` ("corrupt cached metadata: ...") and the metadata is probed again. |
+| `EventSegmentCacheHit`, `EventSegmentCacheMiss` | Segment cache lookups. |
+| `EventLockWait` | A request is waiting on a lock another replica holds: a segment batch, a metadata probe, or a generated asset (sprites, previews, thumbnails, subtitles). |
+| `EventLockReleaseFailed` | Releasing a batch lock failed. |
+| `EventJobEnqueued`, `EventJobJoined` | This replica enqueued a job, or joined one already running. |
+| `EventJobStarted`, `EventJobCompleted`, `EventJobFailed` | Worker-side job lifecycle. |
+| `EventJobAckFailed`, `EventJobLeaseFailed`, `EventJobSettleFailed` | Coordinator calls failed during delivery handling. |
+| `EventJobDeliveryRejected` | A worker refused a malformed delivery (wrong profile or invalid job). A job whose `StartBy` already passed is not a rejection: it is settled failed and reported as `EventJobFailed`. |
+| `EventPoolSubscriptionLost` | A worker pool lost its coordinator subscription. |
+| `EventSegmentReady`, `EventSegmentNotifyFailed` | `EventSegmentReady`: a waiting request learned of its segment through the coordinator's readiness notification (requests satisfied directly from storage do not emit it). `EventSegmentNotifyFailed`: the worker could not publish the notification. |
+| `EventHardwareSelected`, `EventHardwareFallback` | Hardware choice at construction, and the reason when it fell back to software. |
 
 FFmpeg and FFprobe stderr are bounded, and source URLs, credentials, query strings, and media paths are redacted from returned command errors.
 
-## Compatibility notes
+## Errors
 
-This version intentionally tightens the distributed contracts:
+| Error | Returned when |
+|---|---|
+| `ErrInvalidOptions` | `Options` failed validation. |
+| `ErrControllerStopped` | The controller was stopped; build a new one. |
+| `ErrInvalidPreviewConfig`, `ErrInvalidThumbnailConfig` | A preview or thumbnail config is out of range. |
+| `ErrInvalidStreamType` | `Segment` or `VariantPlaylist` got a stream type other than video or audio. |
+| `ErrRenditionNotFound` | The rendition name is invalid or not offered for this source. |
+| `ErrSegmentOutOfRange` | Negative or past-the-end segment index, or a source with no playable segments. |
+| `ErrSegmentTimeout` | A segment did not become available within `SegmentTimeout`. |
+| `ErrMetadataTimeout` | Metadata did not become available in time, including when a probe (this replica's, or the replica holding the lock) hit `ProbeTimeout`; the error also wraps `context.DeadlineExceeded` and the probe error. |
+| `ErrCacheInvalidationUnsupported` | `Invalidate` was called but storage has no `DeleteMedia`. |
+| `ErrLockHeld` | Returned by `Coordinator.AcquireJob` / `AcquireLock` when the lock is taken. |
+| `ErrEnqueueRejected` | Wrap in `Coordinator.Enqueue` errors when the job was definitely not persisted. |
 
-See [MIGRATION.md](MIGRATION.md) for the complete consumer and rollout guide.
+Match with `errors.Is`.
 
-- `PathGenerator` must implement `SubtitlePlaylist`.
-- Unused route methods and `Coordinator.Close` were removed from the required interfaces; lifecycle ownership remains with the host.
-- `SegmentData` now uses `MediaKey` instead of overloading `SourceURL`.
-- Coordinators must serialize the expanded concrete `Job` fields.
-- Storage keys are versioned opaque identities rather than source URLs.
-- Direct H.264 remuxing is restricted to compatible 8-bit `yuv420p` Baseline/Main/High streams that start with a keyframe; other inputs transcode to High-profile `yuv420p` H.264.
+## Playback behavior
+
+Direct H.264 remuxing is restricted to compatible 8-bit `yuv420p` Baseline/Main/High streams that start with a keyframe; other inputs transcode to High-profile `yuv420p` H.264. Master playlists distinguish audio codec and channel groups, declare aggregate bandwidth and codecs, support silent and audio-only media, and expose subtitle groups (unless `OmitSubtitleRenditions` is set).
+
+## Upgrading
+
+See [MIGRATION.md](MIGRATION.md) for cache, job-contract and rollout changes between versions, and [CHANGELOG.md](CHANGELOG.md) for history.
 
 ## Author
 

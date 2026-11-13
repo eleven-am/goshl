@@ -44,6 +44,7 @@ type clusterCoordinator struct {
 	acks           []string
 	onEnqueue      func(domain.Job)
 	enqueueErr     error
+	enqueueRejects bool
 	onRenew        func(context.Context, domain.Job) error
 	onSettle       func(context.Context, string, domain.JobStatus) error
 }
@@ -72,6 +73,9 @@ func (c *clusterCoordinator) queue(route clusterRoute) chan domain.JobDelivery {
 }
 
 func (c *clusterCoordinator) Enqueue(ctx context.Context, job domain.Job) error {
+	if c.enqueueRejects {
+		return fmt.Errorf("queue refused job: %w", domain.ErrEnqueueRejected)
+	}
 	if c.onEnqueue != nil {
 		c.onEnqueue(job)
 	}
@@ -430,8 +434,9 @@ func TestAmbiguousEnqueueKeepsRunRegisteredUntilTerminalStatus(t *testing.T) {
 	coordinator.mu.Lock()
 	lock := coordinator.locks["job:"+job.ID]
 	coordinator.mu.Unlock()
-	if delta := lock.expires.Sub(job.Deadline); delta < time.Minute-20*time.Millisecond || delta > time.Minute+20*time.Millisecond {
-		t.Fatalf("job and lock do not share one deadline: lock expires %s after job", delta)
+	delta, want := lock.expires.Sub(job.StartBy), time.Second+time.Minute
+	if delta < want-20*time.Millisecond || delta > want+20*time.Millisecond {
+		t.Fatalf("lock must expire one minute after start-by plus a full execution budget: lock expires %s after start-by", delta)
 	}
 	close(allowWorker)
 	waitUntil(t, time.Second, func() bool { return coordinator.releaseCount() == 1 })

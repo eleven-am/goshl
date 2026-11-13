@@ -5,14 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/eleven-am/goshl/internal/localpath"
+	"github.com/eleven-am/goshl/internal/source"
 )
+
+const maxRedirects = 5
+
+var errRedirectRejected = errors.New("redirect rejected")
 
 var ErrUnsupported = errors.New("media source does not support random access")
 
@@ -39,10 +45,14 @@ type httpReader struct {
 }
 
 func Open(ctx context.Context, sourceURL string) (Reader, error) {
-	if path, ok := localpath.Resolve(sourceURL); ok {
-		file, err := os.Open(path)
+	input, err := source.Resolve(sourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUnsupported, err)
+	}
+	if !input.Remote {
+		file, err := os.Open(input.LocalPath)
 		if err != nil {
-			return nil, fmt.Errorf("%w: open local source: %v", ErrUnsupported, err)
+			return nil, err
 		}
 		info, err := file.Stat()
 		if err != nil {
@@ -52,17 +62,46 @@ func Open(ctx context.Context, sourceURL string) (Reader, error) {
 		return &fileReader{File: file, size: info.Size()}, nil
 	}
 
-	parsed, err := url.Parse(sourceURL)
-	if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, ErrUnsupported
-	}
-	reader := &httpReader{ctx: ctx, client: http.DefaultClient, url: sourceURL}
+	reader := &httpReader{ctx: ctx, client: sharedRemoteClient(), url: input.Arg}
 	size, err := reader.probeSize()
 	if err != nil {
 		return nil, err
 	}
 	reader.size = size
 	return reader, nil
+}
+
+var (
+	remoteClientOnce sync.Once
+	remoteClient     *http.Client
+)
+
+func sharedRemoteClient() *http.Client {
+	remoteClientOnce.Do(func() {
+		remoteClient = newRemoteClient()
+	})
+	return remoteClient
+}
+
+func newRemoteClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{Transport: transport, CheckRedirect: checkRedirect}
+}
+
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > maxRedirects {
+		return fmt.Errorf("%w: stopped after %d redirects", errRedirectRejected, maxRedirects)
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return fmt.Errorf("%w: unsupported scheme %q", errRedirectRejected, req.URL.Scheme)
+	}
+	if previous := via[len(via)-1]; previous.URL.Scheme == "https" && req.URL.Scheme == "http" {
+		return fmt.Errorf("%w: https to http downgrade", errRedirectRejected)
+	}
+	return nil
 }
 
 func (r *httpReader) Size() int64 {

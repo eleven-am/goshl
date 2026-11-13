@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
-	"github.com/eleven-am/goshl/internal/localpath"
+	"github.com/eleven-am/goshl/internal/source"
 )
 
-const cacheSchemaVersion = "goshl-cache-v3"
+const cacheSchemaVersion = "goshl-cache-v4"
 
 type SourceRevisionResolver func(context.Context, string) (string, error)
 
@@ -22,19 +22,39 @@ type CacheInvalidator interface {
 }
 
 func (c *Controller) MediaKey(ctx context.Context, sourceURL string) (string, error) {
+	if err := c.ensureRunning(); err != nil {
+		return "", err
+	}
 	return c.resolveMediaKey(ctx, sourceURL)
 }
 
 func (c *Controller) Invalidate(ctx context.Context, sourceURL string) error {
+	if err := c.ensureRunning(); err != nil {
+		return err
+	}
 	invalidator, ok := c.opts.Storage.(CacheInvalidator)
 	if !ok {
 		return ErrCacheInvalidationUnsupported
+	}
+	var spriteInvalidator CacheInvalidator
+	if c.opts.SpriteStorage != nil {
+		spriteInvalidator, ok = c.opts.SpriteStorage.(CacheInvalidator)
+		if !ok {
+			return ErrCacheInvalidationUnsupported
+		}
 	}
 	mediaKey, err := c.resolveMediaKey(ctx, sourceURL)
 	if err != nil {
 		return err
 	}
-	return invalidator.DeleteMedia(ctx, mediaKey)
+	c.metadata.clearFailure(mediaKey)
+	if err := invalidator.DeleteMedia(ctx, mediaKey); err != nil {
+		return err
+	}
+	if spriteInvalidator != nil {
+		return spriteInvalidator.DeleteMedia(ctx, mediaKey)
+	}
+	return nil
 }
 
 func (c *Controller) resolveMediaKey(ctx context.Context, sourceURL string) (string, error) {
@@ -58,28 +78,40 @@ func (c *Controller) sourceRevision(ctx context.Context, sourceURL string) (stri
 }
 
 func localSourcePath(sourceURL string) (string, bool) {
-	return localpath.Resolve(sourceURL)
+	input, err := source.Resolve(sourceURL)
+	if err != nil || input.Remote {
+		return "", false
+	}
+	return input.LocalPath, true
 }
 
 func pipelineVersion(opts Options, config *domain.HWAccelConfig) string {
+	return pipelineIdentity(opts, config, domain.OutputTimelineOffset, domain.JobContractVersion)
+}
+
+func pipelineIdentity(opts Options, config *domain.HWAccelConfig, timelineOffset time.Duration, jobContractVersion int) string {
 	value := struct {
-		Schema         string
-		Version        string
-		TargetDuration float64
-		Accelerator    domain.Accelerator
-		DecodeFlags    []string
-		EncodeFlags    []string
-		ScaleFilter    string
-		DecodeMode     domain.DecodeMode
+		Schema             string
+		Version            string
+		TargetDuration     float64
+		Accelerator        domain.Accelerator
+		DecodeFlags        []string
+		EncodeFlags        []string
+		ScaleFilter        string
+		DecodeMode         domain.DecodeMode
+		TimelineOffset     time.Duration
+		JobContractVersion int
 	}{
-		Schema:         cacheSchemaVersion,
-		Version:        opts.CacheVersion,
-		TargetDuration: opts.TargetDuration,
-		Accelerator:    config.Accelerator,
-		DecodeFlags:    config.DecodeFlags,
-		EncodeFlags:    config.EncodeFlags,
-		ScaleFilter:    config.ScaleFilter,
-		DecodeMode:     config.DecodeMode,
+		Schema:             cacheSchemaVersion,
+		Version:            opts.CacheVersion,
+		TargetDuration:     opts.TargetDuration,
+		Accelerator:        config.Accelerator,
+		DecodeFlags:        config.DecodeFlags,
+		EncodeFlags:        config.EncodeFlags,
+		ScaleFilter:        config.ScaleFilter,
+		DecodeMode:         config.DecodeMode,
+		TimelineOffset:     timelineOffset,
+		JobContractVersion: jobContractVersion,
 	}
 	encoded, _ := json.Marshal(value)
 	return hashIdentity(string(encoded))

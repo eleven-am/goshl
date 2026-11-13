@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"sort"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	"github.com/Eyevinn/mp4ff/mp4"
 	"github.com/eleven-am/goshl/internal/mediasource"
 	"github.com/eleven-am/goshl/internal/probe/mp4index"
+	"github.com/eleven-am/goshl/internal/webvtt"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -23,10 +23,13 @@ var ErrUnsupported = errors.New("indexed subtitle extraction is unsupported")
 
 const maxSubtitleBytes = 64 << 20
 
+const maxCoalesceGap = 256 << 10
+
 type Track struct {
 	ID          string
 	StreamIndex int
 	Codec       string
+	Origin      time.Duration
 }
 
 type Outcome struct {
@@ -83,7 +86,7 @@ func extractBatchFrom(ctx context.Context, source io.ReaderAt, sourceSize int64,
 			outcomes[track.ID] = Outcome{}
 			continue
 		}
-		data, err := extractTrack(ctx, source, index)
+		data, err := extractTrack(ctx, source, index, track.Origin)
 		outcomes[track.ID] = Outcome{Data: data, Err: err, Supported: true}
 	}
 	return outcomes, nil
@@ -100,13 +103,12 @@ func codecMatches(probed, indexed string) bool {
 	}
 }
 
-func extractTrack(ctx context.Context, source io.ReaderAt, index mp4index.SubtitleIndex) ([]byte, error) {
+func extractTrack(ctx context.Context, source io.ReaderAt, index mp4index.SubtitleIndex, origin time.Duration) ([]byte, error) {
 	samples, err := readSamples(ctx, source, index.Samples)
 	if err != nil {
 		return nil, err
 	}
-	var output strings.Builder
-	output.WriteString("WEBVTT\n\n")
+	var cues []webvtt.Cue
 	for sampleIndex, sample := range index.Samples {
 		if sample.Duration <= 0 {
 			continue
@@ -118,21 +120,21 @@ func extractTrack(ctx context.Context, source io.ReaderAt, index mp4index.Subtit
 				return nil, fmt.Errorf("decode tx3g sample %d: %w", sampleIndex+1, err)
 			}
 			if strings.TrimSpace(text) != "" {
-				writeCue(&output, sample.Start, sample.Start+sample.Duration, "", "", text)
+				cues = append(cues, webvtt.Cue{Start: sample.Start, End: sample.Start + sample.Duration, Text: text})
 			}
 		case "wvtt":
-			cues, err := decodeWVTT(samples[sampleIndex])
+			decoded, err := decodeWVTT(samples[sampleIndex])
 			if err != nil {
 				return nil, fmt.Errorf("decode wvtt sample %d: %w", sampleIndex+1, err)
 			}
-			for _, cue := range cues {
-				writeCue(&output, sample.Start, sample.Start+sample.Duration, cue.id, cue.settings, cue.text)
+			for _, cue := range decoded {
+				cues = append(cues, webvtt.Cue{ID: cue.id, Start: sample.Start, End: sample.Start + sample.Duration, Settings: cue.settings, Text: cue.text})
 			}
 		default:
 			return nil, ErrUnsupported
 		}
 	}
-	return []byte(output.String()), nil
+	return webvtt.Encode(webvtt.Shift(cues, origin), webvtt.Options{TimestampMap: true}), nil
 }
 
 func readSamples(ctx context.Context, source io.ReaderAt, samples []mp4index.SubtitleSample) ([][]byte, error) {
@@ -155,12 +157,12 @@ func readSamples(ctx context.Context, source io.ReaderAt, samples []mp4index.Sub
 	})
 	ranges := make([]sampleRange, 0, len(references))
 	for _, reference := range references {
-		if len(ranges) == 0 || reference.offset != ranges[len(ranges)-1].end {
+		if len(ranges) == 0 || reference.offset-ranges[len(ranges)-1].end > maxCoalesceGap {
 			ranges = append(ranges, sampleRange{start: reference.offset, end: reference.offset + reference.size, samples: []sampleReference{reference}})
 			continue
 		}
 		last := &ranges[len(ranges)-1]
-		last.end += reference.size
+		last.end = max(last.end, reference.offset+reference.size)
 		last.samples = append(last.samples, reference)
 	}
 	group, groupCtx := errgroup.WithContext(ctx)
@@ -224,7 +226,7 @@ func decodeTX3G(data []byte) (string, error) {
 	text = strings.ReplaceAll(text, "\x00", "")
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
-	return html.EscapeString(text), nil
+	return webvtt.EscapeText(text), nil
 }
 
 type webVTTCue struct {
@@ -247,48 +249,14 @@ func decodeWVTT(data []byte) ([]webVTTCue, error) {
 		if cueBox, ok := box.(*mp4.VttcBox); ok && cueBox.Payl != nil {
 			cue := webVTTCue{text: cueBox.Payl.CueText}
 			if cueBox.Iden != nil {
-				cue.id = singleLine(cueBox.Iden.CueID)
+				cue.id = cueBox.Iden.CueID
 			}
 			if cueBox.Sttg != nil {
-				cue.settings = singleLine(cueBox.Sttg.Settings)
+				cue.settings = cueBox.Sttg.Settings
 			}
 			cues = append(cues, cue)
 		}
 		position += size
 	}
 	return cues, nil
-}
-
-func singleLine(value string) string {
-	value = strings.ReplaceAll(value, "\r", " ")
-	return strings.ReplaceAll(value, "\n", " ")
-}
-
-func writeCue(output *strings.Builder, start, end time.Duration, id, settings, text string) {
-	if id != "" {
-		output.WriteString(id)
-		output.WriteByte('\n')
-	}
-	output.WriteString(formatTime(start))
-	output.WriteString(" --> ")
-	output.WriteString(formatTime(end))
-	if settings != "" {
-		output.WriteByte(' ')
-		output.WriteString(settings)
-	}
-	output.WriteByte('\n')
-	output.WriteString(text)
-	output.WriteString("\n\n")
-}
-
-func formatTime(value time.Duration) string {
-	if value < 0 {
-		value = 0
-	}
-	totalMilliseconds := value.Milliseconds()
-	hours := totalMilliseconds / 3_600_000
-	minutes := totalMilliseconds / 60_000 % 60
-	seconds := totalMilliseconds / 1_000 % 60
-	milliseconds := totalMilliseconds % 1_000
-	return fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, seconds, milliseconds)
 }

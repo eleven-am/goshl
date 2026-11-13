@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -137,3 +139,88 @@ fi
 
 exit 1
 `
+
+func TestValidateExercisesLevelPolicyBounds(t *testing.T) {
+	tmp := t.TempDir()
+	log := filepath.Join(tmp, "calls.log")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + log + "\n" +
+		"case \"$*\" in\n" +
+		"*\"-level:v 5.2\"*) echo 'Invalid Profile/Level' >&2; exit 1;;\n" +
+		"esac\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(tmp, "ffmpeg"), []byte(script), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	err := Validate(context.Background(), NewConfig(domain.AccelVideoToolbox))
+	if err == nil {
+		t.Fatalf("expected validation to fail when the ceiling level is rejected")
+	}
+	if !strings.Contains(err.Error(), "5.2") {
+		t.Fatalf("expected error to name the rejected level, got %v", err)
+	}
+	recorded, readErr := os.ReadFile(log)
+	if readErr != nil {
+		t.Fatalf("read call log: %v", readErr)
+	}
+	calls := string(recorded)
+	for _, want := range []string{"-profile:v high -level:v 3.0", "-profile:v high -level:v 5.2"} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("expected an encode with %q, calls:\n%s", want, calls)
+		}
+	}
+}
+
+func TestVideoToolboxEncodesPolicyLevels(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("h264_videotoolbox is only available on darwin")
+	}
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not found on PATH")
+	}
+	encoders, err := exec.Command(ffmpeg, "-hide_banner", "-encoders").Output()
+	if err != nil || !strings.Contains(string(encoders), "h264_videotoolbox") {
+		t.Skip("ffmpeg lacks h264_videotoolbox")
+	}
+
+	if strings.Join(validationLevels, ",") != "3.0,5.2" {
+		t.Fatalf("validation levels = %v, want the policy levels 3.0 and 5.2", validationLevels)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "argv.log")
+	wrapper := "#!/bin/sh\necho \"$*\" >> \"" + logPath + "\"\nexec \"" + ffmpeg + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ffmpeg"), []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("write ffmpeg wrapper: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := NewConfig(domain.AccelVideoToolbox)
+	if err := Validate(context.Background(), cfg); err != nil {
+		t.Fatalf("videotoolbox rejected the policy levels: %v", err)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read argv log: %v", err)
+	}
+	invocations := strings.Split(strings.TrimSpace(string(logged)), "\n")
+	for _, level := range validationLevels {
+		found := false
+		for _, invocation := range invocations {
+			if strings.Contains(invocation, "-profile:v high -level:v "+level+" ") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("Validate never encoded at -level:v %s; invocations:\n%s", level, logged)
+		}
+	}
+
+	broken := NewConfig(domain.AccelVideoToolbox)
+	broken.EncodeFlags = []string{"-c:v", "goshl_missing_encoder"}
+	if err := Validate(context.Background(), broken); err == nil {
+		t.Fatal("Validate must fail for a pipeline whose encoder cannot run")
+	}
+}

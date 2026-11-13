@@ -24,9 +24,10 @@ type stubStorage struct {
 	segments           map[int][]byte
 	segmentCalls       int
 	subtitleData       []byte
-	spriteVTT          []byte
 	metaExistsCalls    int
 	segmentExistsCalls int
+	onSegmentExists    func()
+	hideSegments       bool
 }
 
 type invalidatingStorage struct {
@@ -68,10 +69,15 @@ func (s *stubStorage) ReadSegment(ctx context.Context, info domain.SegmentData) 
 }
 func (s *stubStorage) SegmentExists(ctx context.Context, info domain.SegmentData) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.segmentExistsCalls++
 	_, ok := s.segments[info.Index]
-	return ok, nil
+	hook := s.onSegmentExists
+	hidden := s.hideSegments
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return ok && !hidden, nil
 }
 
 func (s *stubStorage) setSegment(index int, data []byte) {
@@ -90,16 +96,6 @@ func (s *stubStorage) ReadSprite(ctx context.Context, mediaID string, index int)
 }
 func (s *stubStorage) SpriteExists(ctx context.Context, mediaID string, index int) (bool, error) {
 	return false, nil
-}
-func (s *stubStorage) WriteSpriteVTT(ctx context.Context, mediaID string, data []byte) error {
-	s.spriteVTT = data
-	return nil
-}
-func (s *stubStorage) ReadSpriteVTT(ctx context.Context, mediaID string) ([]byte, error) {
-	return s.spriteVTT, nil
-}
-func (s *stubStorage) SpriteVTTExists(ctx context.Context, mediaID string) (bool, error) {
-	return s.spriteVTT != nil, nil
 }
 func (s *stubStorage) WriteSubtitleVTT(ctx context.Context, mediaID string, lang string, data []byte) error {
 	s.subtitleData = data
@@ -253,7 +249,6 @@ func (stubPathGen) SubtitleVTT(sourceURL string, lang string) string         { r
 func (stubPathGen) Preview(sourceURL string) string                          { return "/preview.gif" }
 func (stubPathGen) Thumbnail(sourceURL string) string                        { return "/thumbnail.jpg" }
 
-// installFakeFFmpeg ensures hwaccel.Detect can run without real ffmpeg.
 func installFakeFFmpeg(t *testing.T) func() {
 	t.Helper()
 	dir := t.TempDir()
@@ -414,18 +409,14 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 		PathGen:     stubPathGen{},
 	})
 
-	// simulate worker ready
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
-	}()
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 
 	data, err := svc.Segment(context.Background(), "file:///media", domain.StreamAudio, "aac_stereo", 1)
 	if err != nil {
 		t.Fatalf("segment err: %v", err)
 	}
 	if data != nil {
-		// stub storage has no segment 1; should still call ReadSegment returning nil
+		t.Fatalf("stub storage has no segment 1, got %q", data)
 	}
 	if len(coord.enqueued) != 1 {
 		t.Fatalf("expected enqueue, got %d", len(coord.enqueued))
@@ -433,12 +424,11 @@ func TestSegmentEnqueuesWhenMissingAndUsesPubSubReady(t *testing.T) {
 	if coord.enqueued[0].StartIndex != 1 || coord.enqueued[0].EndIndex != 1 {
 		t.Fatalf("unexpected job indices: %#v", coord.enqueued[0])
 	}
-	if coord.enqueued[0].Metadata == nil || coord.enqueued[0].Metadata.Duration != meta.Duration {
-		t.Fatalf("enqueued job must carry the resolved metadata: %#v", coord.enqueued[0].Metadata)
+	if coord.enqueued[0].VideoStreamIndex != meta.Video.Index {
+		t.Fatalf("enqueued job must carry the video stream index %d, got %d", meta.Video.Index, coord.enqueued[0].VideoStreamIndex)
 	}
-	coord.enqueued[0].Metadata.Audios[0].Codec = "changed"
-	if meta.Audios[0].Codec != "aac" {
-		t.Fatalf("enqueued metadata must not alias the controller metadata")
+	if overlap := coord.enqueued[0].Overlap; overlap == nil || overlap.Index != 0 || coord.enqueued[0].Trailing != nil {
+		t.Fatalf("enqueued audio job must carry segment 0 as overlap and no trailing segment: %#v / %#v", overlap, coord.enqueued[0].Trailing)
 	}
 }
 
@@ -635,10 +625,7 @@ func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
 		PathGen:     stubPathGen{},
 	})
 
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
-	}()
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 
@@ -671,10 +658,7 @@ func TestSegmentWaitsWhenLockHeld(t *testing.T) {
 		PathGen:     stubPathGen{},
 	})
 
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
-	}()
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 
@@ -842,10 +826,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 		PathGen:     stubPathGen{},
 	})
 
-	go func() {
-		time.Sleep(5 * time.Millisecond)
-		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
-	}()
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 	firstJobID := coord.enqueued[0].ID
 	firstJobRunID := coord.enqueued[0].RunID
@@ -853,10 +834,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 
 	coord.enqueued = nil
 	coord.waitCh = make(chan domain.SegmentStatus, 1)
-	go func() {
-		time.Sleep(5 * time.Millisecond)
-		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
-	}()
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 1)
 	secondJobID := coord.enqueued[0].ID
 
@@ -866,10 +844,7 @@ func TestDeterministicJobIDs(t *testing.T) {
 
 	coord.enqueued = nil
 	coord.waitCh = make(chan domain.SegmentStatus, 1)
-	go func() {
-		time.Sleep(5 * time.Millisecond)
-		coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
-	}()
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
 	_, _ = svc.Segment(context.Background(), "file:///media", domain.StreamVideo, "720p", 1)
 	differentRenditionID := coord.enqueued[0].ID
 
@@ -1104,62 +1079,118 @@ func TestSegmentJobStopsBeforeNeighbouringFlight(t *testing.T) {
 	}
 }
 
-type abandonRecorder struct {
-	mu     sync.Mutex
-	jobIDs []string
-}
-
-func (r *abandonRecorder) Observe(ctx context.Context, event domain.Event) {
-	if event.Type != domain.EventJobAbandoned {
-		return
+func waitForEnqueued(t *testing.T, coord *stubCoordinator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		coord.mu.Lock()
+		got := len(coord.enqueued)
+		coord.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d enqueued jobs, got %d", want, got)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	r.mu.Lock()
-	r.jobIDs = append(r.jobIDs, event.JobID)
-	r.mu.Unlock()
 }
 
-func (r *abandonRecorder) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.jobIDs)
+type joinRecorder struct {
+	joined chan struct{}
+	ready  chan domain.Event
+}
+
+func newJoinRecorder() *joinRecorder {
+	return &joinRecorder{joined: make(chan struct{}, 8), ready: make(chan domain.Event, 8)}
+}
+
+func (r *joinRecorder) observer() domain.Observer {
+	return domain.ObserverFunc(func(_ context.Context, event domain.Event) {
+		switch event.Type {
+		case domain.EventJobJoined:
+			r.joined <- struct{}{}
+		case domain.EventSegmentReady:
+			r.ready <- event
+		}
+	})
+}
+
+type segmentResult struct {
+	data []byte
+	err  error
+}
+
+func startSegment(ctx context.Context, svc *Controller, index int) <-chan segmentResult {
+	done := make(chan segmentResult, 1)
+	go func() {
+		data, err := svc.Segment(ctx, "file:///media", domain.StreamVideo, "1080p", index)
+		done <- segmentResult{data, err}
+	}()
+	return done
+}
+
+func cancelFirstWaiter(t *testing.T, svc *Controller, coord *stubCoordinator) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startSegment(ctx, svc, 2)
+	waitForEnqueued(t, coord, 1)
+	cancel()
+	if res := <-done; !errors.Is(res.err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", res.err)
+	}
+}
+
+func awaitJoined(t *testing.T, rec *joinRecorder, done <-chan segmentResult) {
+	t.Helper()
+	select {
+	case <-rec.joined:
+	case res := <-done:
+		t.Fatalf("request returned without joining the cluster job: data=%q err=%v", res.data, res.err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("request never joined the cluster job")
+	}
 }
 
 func TestSegmentKeepsClusterJobAfterLocalWaiterLeaves(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	recorder := &abandonRecorder{}
+	store := &stubStorage{}
 	coord := &stubCoordinator{}
-	svc := seekTestController(t, &stubStorage{}, coord, Options{AbandonGrace: 60 * time.Millisecond, Observer: recorder})
+	rec := newJoinRecorder()
+	svc := seekTestController(t, store, coord, Options{Observer: rec.observer()})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := svc.Segment(ctx, "file:///media", domain.StreamVideo, "1080p", 2)
-		done <- err
-	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		coord.mu.Lock()
-		queued := len(coord.enqueued)
-		coord.mu.Unlock()
-		if queued == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("job was never enqueued")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	cancel()
-	<-done
+	cancelFirstWaiter(t, svc, coord)
 
-	if recorder.count() != 0 {
-		t.Fatalf("job must survive the grace period")
+	coord.mu.Lock()
+	enqueued := len(coord.enqueued)
+	released := len(coord.releaseCalls)
+	coord.mu.Unlock()
+	if enqueued != 1 {
+		t.Fatalf("local waiter departure must leave the single cluster job in place, got %d", enqueued)
 	}
-	time.Sleep(250 * time.Millisecond)
-	if recorder.count() != 0 {
-		t.Fatalf("local waiter departure must not abandon cluster work, got %d events", recorder.count())
+	if released != 0 {
+		t.Fatalf("local waiter departure must not release the cluster job lock, got %d releases", released)
+	}
+
+	followUp := startSegment(context.Background(), svc, 2)
+	awaitJoined(t, rec, followUp)
+	store.setSegment(2, []byte("segment-2"))
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
+	select {
+	case res := <-followUp:
+		if res.err != nil || string(res.data) != "segment-2" {
+			t.Fatalf("follow-up request: data=%q err=%v", res.data, res.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("follow-up request was never served")
+	}
+
+	coord.mu.Lock()
+	defer coord.mu.Unlock()
+	if len(coord.enqueued) != 1 || len(coord.releaseCalls) != 0 {
+		t.Fatalf("follow-up must reuse the job: enqueued=%d releases=%v", len(coord.enqueued), coord.releaseCalls)
 	}
 }
 
@@ -1167,51 +1198,86 @@ func TestSegmentRejoinKeepsExistingClusterJob(t *testing.T) {
 	cleanup := installFakeFFmpeg(t)
 	defer cleanup()
 
-	recorder := &abandonRecorder{}
+	store := &stubStorage{}
 	coord := &stubCoordinator{}
-	svc := seekTestController(t, &stubStorage{}, coord, Options{AbandonGrace: 150 * time.Millisecond, Observer: recorder})
+	rec := newJoinRecorder()
+	svc := seekTestController(t, store, coord, Options{Observer: rec.observer()})
 
-	first, cancelFirst := context.WithCancel(context.Background())
-	firstDone := make(chan error, 1)
-	go func() {
-		_, err := svc.Segment(first, "file:///media", domain.StreamVideo, "1080p", 2)
-		firstDone <- err
-	}()
-	for {
-		coord.mu.Lock()
-		queued := len(coord.enqueued)
-		coord.mu.Unlock()
-		if queued == 1 {
-			break
+	cancelFirstWaiter(t, svc, coord)
+
+	second := startSegment(context.Background(), svc, 3)
+	awaitJoined(t, rec, second)
+	store.setSegment(3, []byte("segment-3"))
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
+
+	select {
+	case res := <-second:
+		if res.err != nil {
+			t.Fatalf("rejoined request failed: %v", res.err)
 		}
-		time.Sleep(5 * time.Millisecond)
+		if string(res.data) != "segment-3" {
+			t.Fatalf("expected rejoined request to be served segment 3, got %q", res.data)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rejoined request was never served")
 	}
-	cancelFirst()
-	<-firstDone
 
-	second, cancelSecond := context.WithCancel(context.Background())
-	secondDone := make(chan error, 1)
-	go func() {
-		_, err := svc.Segment(second, "file:///media", domain.StreamVideo, "1080p", 3)
-		secondDone <- err
-	}()
-
-	time.Sleep(400 * time.Millisecond)
-	if recorder.count() != 0 {
-		t.Fatalf("a rejoined job must not be abandoned while a waiter remains")
-	}
 	coord.mu.Lock()
-	enqueued := len(coord.enqueued)
-	coord.mu.Unlock()
-	if enqueued != 1 {
-		t.Fatalf("rejoin must not enqueue again, got %d", enqueued)
+	defer coord.mu.Unlock()
+	if len(coord.enqueued) != 1 {
+		t.Fatalf("rejoin must not enqueue again, got %d", len(coord.enqueued))
+	}
+	if len(coord.releaseCalls) != 0 {
+		t.Fatalf("rejoin must not release the cluster job lock, got %v", coord.releaseCalls)
+	}
+}
+
+func TestSegmentParkedWaiterIsServedByReadyNotification(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+
+	polled := make(chan struct{}, 64)
+	store := &stubStorage{hideSegments: true, onSegmentExists: func() {
+		select {
+		case polled <- struct{}{}:
+		default:
+		}
+	}}
+	coord := &stubCoordinator{}
+	rec := newJoinRecorder()
+	svc := seekTestController(t, store, coord, Options{Observer: rec.observer(), SegmentTimeout: 10 * time.Second})
+
+	done := startSegment(context.Background(), svc, 1)
+	waitForEnqueued(t, coord, 1)
+	for len(polled) > 0 {
+		<-polled
+	}
+	select {
+	case <-polled:
+	case res := <-done:
+		t.Fatalf("waiter returned before any notification: data=%q err=%v", res.data, res.err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter never polled storage, so it is not parked")
 	}
 
-	cancelSecond()
-	<-secondDone
-	time.Sleep(400 * time.Millisecond)
-	if recorder.count() != 0 {
-		t.Fatalf("local waiters must not abandon cluster work, got %d events", recorder.count())
+	store.setSegment(1, []byte("late-segment"))
+	coord.sendWaitStatus(domain.SegmentStatus{State: domain.SegmentStateReady})
+
+	select {
+	case res := <-done:
+		if res.err != nil || string(res.data) != "late-segment" {
+			t.Fatalf("parked waiter: data=%q err=%v", res.data, res.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("parked waiter was not served by the ready notification")
+	}
+	select {
+	case event := <-rec.ready:
+		if event.Index != 1 || event.Bytes != int64(len("late-segment")) {
+			t.Fatalf("unexpected ready event: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected EventSegmentReady for the notified segment")
 	}
 }
 
@@ -1337,24 +1403,105 @@ func TestAssetIdentityIncludesRequestedConfiguration(t *testing.T) {
 	}
 }
 
-func TestBuildJobUsesOverlapOnlyForDirectStream(t *testing.T) {
+func TestPipelineVersionChangesWithTimelineOffset(t *testing.T) {
+	config := &domain.HWAccelConfig{Accelerator: domain.AccelNone}
+	base := pipelineIdentity(Options{TargetDuration: 6}, config, 10*time.Second, 1)
+	shifted := pipelineIdentity(Options{TargetDuration: 6}, config, 1400*time.Millisecond, 1)
+	if base == shifted {
+		t.Fatalf("a different output timeline offset must change the pipeline version")
+	}
+	if pipelineVersion(Options{TargetDuration: 6}, config) != pipelineIdentity(Options{TargetDuration: 6}, config, domain.OutputTimelineOffset, domain.JobContractVersion) {
+		t.Fatalf("the pipeline version must be derived from the domain timeline offset and job contract version")
+	}
+}
+
+func TestPipelineVersionChangesWithJobContractVersion(t *testing.T) {
+	config := &domain.HWAccelConfig{Accelerator: domain.AccelNone}
+	base := pipelineIdentity(Options{TargetDuration: 6}, config, 10*time.Second, 1)
+	bumped := pipelineIdentity(Options{TargetDuration: 6}, config, 10*time.Second, 2)
+	if base == bumped {
+		t.Fatalf("a different job contract version must change the pipeline version")
+	}
+}
+
+func TestBuildJobOverlapAndTrailingRules(t *testing.T) {
 	controller := &Controller{opts: Options{JobTimeout: time.Minute}, pipelineVersion: "test"}
 	segments := []domain.Segment{
 		{Index: 0, Start: 0, End: 6},
 		{Index: 1, Start: 6, End: 12},
 		{Index: 2, Start: 12, End: 18},
+		{Index: 3, Start: 18, End: 24},
 	}
 	direct := domain.VideoRendition{Name: "source", Method: domain.DirectStream}
 	transcoded := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
+	stereo := domain.AudioRendition{Name: "aac_stereo", Method: domain.Transcode}
+	passthrough := domain.AudioRendition{Name: "ac3_passthrough", Method: domain.DirectStream}
 	deadline := time.Now().Add(time.Minute)
-	meta := testVideoMetadata(18, []float64{0, 6, 12})
-	directJob := controller.buildJob("run-direct", deadline, "source", "key", StreamVideo, direct.Name, 1, 1, 2, segments, &direct, nil, meta)
-	transcodedJob := controller.buildJob("run-transcoded", deadline, "source", "key", StreamVideo, transcoded.Name, 1, 1, 2, segments, &transcoded, nil, meta)
-	if directJob.Overlap == nil {
-		t.Fatalf("direct stream must retain the preceding GOP boundary")
+	meta := testVideoMetadata(24, []float64{0, 6, 12, 18})
+	build := func(stream StreamType, video *domain.VideoRendition, audio *domain.AudioRendition, start, end int) domain.Job {
+		name := ""
+		if video != nil {
+			name = video.Name
+		} else {
+			name = audio.Name
+		}
+		return controller.buildJob("run", deadline, "source", "key", stream, name, start, start, end, segments, video, audio, meta)
 	}
-	if transcodedJob.Overlap != nil {
-		t.Fatalf("transcoded video must not process a discarded preceding segment")
+
+	middle := build(StreamVideo, &direct, nil, 1, 2)
+	if middle.Overlap == nil || *middle.Overlap != segments[0] {
+		t.Fatalf("copied video must carry the preceding segment as overlap, got %+v", middle.Overlap)
+	}
+	if middle.Trailing == nil || *middle.Trailing != segments[3] {
+		t.Fatalf("copied video must carry the following segment as trailing, got %+v", middle.Trailing)
+	}
+	first := build(StreamVideo, &direct, nil, 0, 1)
+	if first.Overlap != nil || first.Trailing == nil || *first.Trailing != segments[2] {
+		t.Fatalf("copied video from segment 0 has no overlap but a trailing segment, got %+v / %+v", first.Overlap, first.Trailing)
+	}
+	last := build(StreamVideo, &direct, nil, 2, 3)
+	if last.Overlap == nil || last.Trailing != nil {
+		t.Fatalf("copied video ending at the last segment has no trailing segment, got %+v / %+v", last.Overlap, last.Trailing)
+	}
+
+	encoded := build(StreamVideo, &transcoded, nil, 1, 2)
+	if encoded.Overlap != nil || encoded.Trailing != nil {
+		t.Fatalf("transcoded video must not process discarded neighbours, got %+v / %+v", encoded.Overlap, encoded.Trailing)
+	}
+
+	for _, audio := range []domain.AudioRendition{stereo, passthrough} {
+		audio := audio
+		job := build(StreamAudio, nil, &audio, 1, 2)
+		if job.Overlap == nil || *job.Overlap != segments[0] {
+			t.Fatalf("%s must carry the preceding segment as overlap, got %+v", audio.Name, job.Overlap)
+		}
+		if job.Trailing != nil {
+			t.Fatalf("%s must not carry a trailing segment, got %+v", audio.Name, job.Trailing)
+		}
+		if start := build(StreamAudio, nil, &audio, 0, 1); start.Overlap != nil || start.Trailing != nil {
+			t.Fatalf("%s from segment 0 has no neighbours, got %+v / %+v", audio.Name, start.Overlap, start.Trailing)
+		}
+	}
+}
+
+func TestBuildJobCarriesOnlyVideoStreamIndex(t *testing.T) {
+	controller := &Controller{opts: Options{JobTimeout: time.Minute}, pipelineVersion: "test"}
+	segments := []domain.Segment{{Index: 0, Start: 0, End: 6}}
+	video := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
+	meta := testVideoMetadata(6, []float64{0, 1.5, 3, 4.5})
+	meta.Video.Index = 3
+	job := controller.buildJob("run", time.Now().Add(time.Minute), "source", "key", StreamVideo, video.Name, 0, 0, 0, segments, &video, nil, meta)
+	if job.VideoStreamIndex != 3 {
+		t.Fatalf("job must carry the video stream index 3, got %d", job.VideoStreamIndex)
+	}
+	encoded, err := json.Marshal(job)
+	if err != nil {
+		t.Fatalf("marshal job: %v", err)
+	}
+	for _, field := range []string{"Keyframes", "Metadata", "Subtitles"} {
+		if strings.Contains(string(encoded), field) {
+			t.Fatalf("job message must not carry probe metadata (%s): %s", field, encoded)
+		}
 	}
 }
 

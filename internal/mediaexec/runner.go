@@ -7,8 +7,12 @@ import (
 	"io"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 )
+
+const waitDelay = 5 * time.Second
 
 const maxOutputBytes = 64 << 20
 
@@ -52,6 +56,7 @@ func (b *LimitedBuffer) Bytes() []byte {
 func Run(ctx context.Context, name string, args ...string) error {
 	stderr := NewLimitedBuffer(64 << 10)
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = waitDelay
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return commandError(name, args, stderr.String(), err)
@@ -63,6 +68,7 @@ func Output(ctx context.Context, name string, args ...string) ([]byte, error) {
 	stderr := NewLimitedBuffer(64 << 10)
 	stdout := NewLimitedBuffer(maxOutputBytes)
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = waitDelay
 	cmd.Stderr = stderr
 	cmd.Stdout = stdout
 	if err := cmd.Run(); err != nil {
@@ -77,6 +83,7 @@ func Output(ctx context.Context, name string, args ...string) ([]byte, error) {
 func StartOutput(ctx context.Context, name string, args ...string) (*exec.Cmd, io.ReadCloser, *LimitedBuffer, error) {
 	stderr := NewLimitedBuffer(64 << 10)
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = waitDelay
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -101,6 +108,15 @@ func commandError(name string, args []string, stderr string, err error) error {
 	return fmt.Errorf("%s %s: %w: %s", name, command, err, detail)
 }
 
+const redactedMedia = "<redacted-media>"
+
+var (
+	urlPattern     = regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.\-]*://[^\s'"<>]+`)
+	filePattern    = regexp.MustCompile(`\bfile:[^\s'"<>]*[^\s'"<>:;,.)\]]`)
+	pathPattern    = regexp.MustCompile(`(^|[\s'"=(\[,])/[^\s'"<>]*[^\s'"<>:;,.)\]]`)
+	sequenceVerbRe = regexp.MustCompile(`%0?\d*d`)
+)
+
 func redactText(value string, args []string) string {
 	for index, argument := range args {
 		if argument == "" {
@@ -109,10 +125,30 @@ func redactText(value string, args []string) string {
 		isInput := index > 0 && args[index-1] == "-i"
 		isURL := hasMediaScheme(argument)
 		if isInput || isURL || filepath.IsAbs(argument) {
-			value = strings.ReplaceAll(value, argument, "<redacted-media>")
+			value = strings.ReplaceAll(value, argument, redactedMedia)
+		}
+		if pattern := sequencePattern(argument); pattern != nil {
+			value = pattern.ReplaceAllString(value, redactedMedia)
 		}
 	}
-	return value
+	value = urlPattern.ReplaceAllString(value, redactedMedia)
+	value = filePattern.ReplaceAllString(value, redactedMedia)
+	return pathPattern.ReplaceAllString(value, "${1}"+redactedMedia)
+}
+
+func sequencePattern(argument string) *regexp.Regexp {
+	if !sequenceVerbRe.MatchString(argument) || !strings.ContainsAny(argument, "/.") {
+		return nil
+	}
+	parts := sequenceVerbRe.Split(argument, -1)
+	for index, part := range parts {
+		parts[index] = regexp.QuoteMeta(part)
+	}
+	pattern, err := regexp.Compile(strings.Join(parts, `\d+`))
+	if err != nil {
+		return nil
+	}
+	return pattern
 }
 
 func redactArgs(args []string) []string {
@@ -126,7 +162,7 @@ func redactArgs(args []string) []string {
 			redacted[index] = "<redacted-url>"
 			continue
 		}
-		if strings.HasPrefix(argument, "/") && index == len(redacted)-1 {
+		if filepath.IsAbs(argument) {
 			redacted[index] = "<redacted-path>"
 		}
 	}
@@ -134,8 +170,11 @@ func redactArgs(args []string) []string {
 }
 
 func hasMediaScheme(value string) bool {
-	colon := strings.IndexByte(value, ':')
-	if colon <= 0 || value[:colon] == "lavfi" {
+	if strings.HasPrefix(value, "file:") {
+		return true
+	}
+	colon := strings.Index(value, "://")
+	if colon <= 0 {
 		return false
 	}
 	for index := 0; index < colon; index++ {

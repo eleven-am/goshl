@@ -8,6 +8,8 @@ import (
 	"github.com/eleven-am/goshl/internal/domain"
 )
 
+const notifyTimeout = 2 * time.Second
+
 type NotifyingStorage struct {
 	storage     domain.Storage
 	coordinator domain.Coordinator
@@ -43,7 +45,7 @@ func (s *NotifyingStorage) WriteSegment(ctx context.Context, info domain.Segment
 	}
 
 	status := domain.SegmentStatus{State: domain.SegmentStateReady}
-	if err := s.notify(info, status); err != nil {
+	if err := s.notify(ctx, info, status); err != nil {
 		s.observe(domain.Event{
 			Type:       domain.EventSegmentNotifyFailed,
 			MediaKey:   info.MediaKey,
@@ -57,20 +59,10 @@ func (s *NotifyingStorage) WriteSegment(ctx context.Context, info domain.Segment
 	return nil
 }
 
-func (s *NotifyingStorage) notify(info domain.SegmentData, status domain.SegmentStatus) error {
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		err = s.coordinator.NotifySegment(ctx, info, status)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		if attempt < 2 {
-			time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
-		}
-	}
-	return err
+func (s *NotifyingStorage) notify(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
+	ctx, cancel := context.WithTimeout(ctx, notifyTimeout)
+	defer cancel()
+	return s.coordinator.NotifySegment(ctx, info, status)
 }
 
 func (s *NotifyingStorage) observe(event domain.Event) {
@@ -106,18 +98,6 @@ func (s *NotifyingStorage) ReadSprite(ctx context.Context, sourceURL string, ind
 
 func (s *NotifyingStorage) SpriteExists(ctx context.Context, sourceURL string, index int) (bool, error) {
 	return s.storage.SpriteExists(ctx, sourceURL, index)
-}
-
-func (s *NotifyingStorage) WriteSpriteVTT(ctx context.Context, sourceURL string, data []byte) error {
-	return s.storage.WriteSpriteVTT(ctx, sourceURL, data)
-}
-
-func (s *NotifyingStorage) ReadSpriteVTT(ctx context.Context, sourceURL string) ([]byte, error) {
-	return s.storage.ReadSpriteVTT(ctx, sourceURL)
-}
-
-func (s *NotifyingStorage) SpriteVTTExists(ctx context.Context, sourceURL string) (bool, error) {
-	return s.storage.SpriteVTTExists(ctx, sourceURL)
 }
 
 func (s *NotifyingStorage) WriteSubtitleVTT(ctx context.Context, sourceURL string, lang string, data []byte) error {

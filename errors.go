@@ -1,6 +1,11 @@
 package goshl
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/eleven-am/goshl/internal/coordination"
+	"github.com/eleven-am/goshl/internal/domain"
+)
 
 var (
 	ErrInvalidOptions               = errors.New("invalid goshl options")
@@ -13,3 +18,7 @@ var (
 	ErrInvalidPreviewConfig         = errors.New("invalid preview configuration")
 	ErrInvalidThumbnailConfig       = errors.New("invalid thumbnail configuration")
 )
+
+var ErrEnqueueRejected = domain.ErrEnqueueRejected
+
+var ErrControllerStopped = coordination.ErrStopped

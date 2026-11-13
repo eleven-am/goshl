@@ -25,7 +25,6 @@ func staticSpriteURL(url string) func(int) string {
 }
 
 type stubStorage struct {
-	spriteVTTExists bool
 	spriteExists    bool
 	subtitleExists  bool
 	previewExists   bool
@@ -34,12 +33,10 @@ type stubStorage struct {
 	existsErr error
 
 	wroteSprites   int
-	wroteSpriteVTT int
 	wroteSubtitle  int
 	wrotePreview   int
 	wroteThumbnail int
 
-	spriteVTTData []byte
 	spriteData    map[int][]byte
 	defaultSprite []byte
 	readSprites   int
@@ -92,21 +89,6 @@ func (s *stubStorage) SpriteExists(ctx context.Context, mediaID string, index in
 		return ok, nil
 	}
 	return s.spriteExists, nil
-}
-
-func (s *stubStorage) WriteSpriteVTT(ctx context.Context, mediaID string, data []byte) error {
-	s.wroteSpriteVTT++
-	s.spriteVTTData = data
-	return nil
-}
-func (s *stubStorage) ReadSpriteVTT(ctx context.Context, mediaID string) ([]byte, error) {
-	return s.spriteVTTData, nil
-}
-func (s *stubStorage) SpriteVTTExists(ctx context.Context, mediaID string) (bool, error) {
-	if s.existsErr != nil {
-		return false, s.existsErr
-	}
-	return s.spriteVTTExists, nil
 }
 
 func (s *stubStorage) WriteSubtitleVTT(ctx context.Context, mediaID string, lang string, data []byte) error {
@@ -167,19 +149,34 @@ func TestGenerateVTTProducesContinuousEntries(t *testing.T) {
 	}
 }
 
-func TestGetSpriteVTTUsesCacheWhenPresent(t *testing.T) {
-	storage := &stubStorage{spriteVTTExists: true, spriteVTTData: []byte("cached")}
+func TestSpriteVTTHasNoTimestampMapAndRoundsTimes(t *testing.T) {
+	g := &Generator{thumbWidth: 10, thumbHeight: 10, interval: 0.7, cols: 2, rows: 2}
+
+	out := string(g.generateVTT(2.1, 1, spriteURL))
+
+	if strings.Contains(out, "X-TIMESTAMP-MAP") {
+		t.Fatalf("sprite vtt carries a timestamp map: %s", out)
+	}
+	for _, want := range []string{"00:00:00.700 --> 00:00:01.400", "00:00:01.400 --> 00:00:02.100"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in %s", want, out)
+		}
+	}
+}
+
+func TestGetSpriteVTTRendersFromExistingSprites(t *testing.T) {
+	storage := &stubStorage{spriteData: map[int][]byte{0: []byte("img")}}
 	g := NewGenerator(storage)
 
-	data, err := g.GetSpriteVTT(context.Background(), "file:///media", "sprite-key", 30, spriteURL)
+	data, err := g.GetSpriteVTT(context.Background(), "file:///media", "sprite-key", 30, staticSpriteURL("sheet.jpg"))
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if string(data) != "cached" {
-		t.Fatalf("expected cached data, got %s", data)
+	if strings.Count(string(data), "sheet.jpg#xywh=") != 6 {
+		t.Fatalf("expected a freshly rendered vtt, got %s", data)
 	}
-	if storage.wroteSpriteVTT != 0 || storage.wroteSprites != 0 {
-		t.Fatalf("should not generate sprites when cached")
+	if storage.wroteSprites != 0 {
+		t.Fatalf("should not generate sprites when they exist")
 	}
 }
 
@@ -188,14 +185,33 @@ func TestGetSpriteVTTPropagatesExistenceError(t *testing.T) {
 	g := NewGenerator(storage)
 
 	_, err := g.GetSpriteVTT(context.Background(), "file:///media", "sprite-key", 10, staticSpriteURL("pattern"))
-	if err == nil || !strings.Contains(err.Error(), "check sprite vtt") {
+	if err == nil || !strings.Contains(err.Error(), "check sprite") {
 		t.Fatalf("expected propagated error, got %v", err)
 	}
 }
 
-func TestFormatVTTTime(t *testing.T) {
-	if got := formatVTTTime(3661.789); got != "01:01:01.789" {
-		t.Fatalf("unexpected time format: %s", got)
+func TestSpriteIdentityFollowsGeneratorConfig(t *testing.T) {
+	g := NewGenerator(&stubStorage{})
+	if got := g.SpriteIdentity(); got != "160x90:5:10x10" {
+		t.Fatalf("default sprite identity must stay compatible with existing caches, got %q", got)
+	}
+
+	variants := map[string]func(*Generator){
+		"width":    func(g *Generator) { g.thumbWidth = 320 },
+		"height":   func(g *Generator) { g.thumbHeight = 180 },
+		"interval": func(g *Generator) { g.interval = 2.5 },
+		"cols":     func(g *Generator) { g.cols = 5 },
+		"rows":     func(g *Generator) { g.rows = 4 },
+	}
+	seen := map[string]string{g.SpriteIdentity(): "default"}
+	for name, mutate := range variants {
+		variant := NewGenerator(&stubStorage{})
+		mutate(variant)
+		identity := variant.SpriteIdentity()
+		if previous, dup := seen[identity]; dup {
+			t.Fatalf("%s collides with %s: %q", name, previous, identity)
+		}
+		seen[identity] = name
 	}
 }
 
@@ -215,7 +231,7 @@ func TestGetPreviewReturnsCachedData(t *testing.T) {
 	storage := &stubStorage{previewExists: true, previewData: []byte("cached-gif")}
 	g := NewGenerator(storage)
 
-	data, err := g.GetPreview(context.Background(), "file:///media", "sprite-key", "preview-key", 10, spriteURL, domain.PreviewConfig{
+	data, err := g.GetPreview(context.Background(), "file:///media", "sprite-key", "preview-key", 10, domain.PreviewConfig{
 		MaxFrames:     10,
 		Frameduration: 100,
 		Width:         100,
@@ -235,7 +251,7 @@ func TestGetPreviewPropagatesExistenceError(t *testing.T) {
 	storage := &stubStorage{existsErr: errors.New("boom")}
 	g := NewGenerator(storage)
 
-	_, err := g.GetPreview(context.Background(), "file:///media", "sprite-key", "preview-key", 10, staticSpriteURL("pattern"), domain.PreviewConfig{})
+	_, err := g.GetPreview(context.Background(), "file:///media", "sprite-key", "preview-key", 10, domain.PreviewConfig{})
 	if err == nil || !strings.Contains(err.Error(), "check preview") {
 		t.Fatalf("expected propagated error, got %v", err)
 	}
@@ -253,9 +269,7 @@ func TestGeneratePreviewFromSprites(t *testing.T) {
 
 	spriteImg := createTestSpriteImage(20, 20)
 	storage := &stubStorage{
-		spriteData:      map[int][]byte{0: spriteImg},
-		spriteVTTExists: true,
-		spriteVTTData:   []byte("WEBVTT"),
+		spriteData: map[int][]byte{0: spriteImg},
 	}
 	g.storage = storage
 
@@ -291,9 +305,7 @@ func TestGeneratePreviewSamplesFrames(t *testing.T) {
 
 	spriteImg := createTestSpriteImage(30, 30)
 	storage := &stubStorage{
-		spriteData:      map[int][]byte{0: spriteImg},
-		spriteVTTExists: true,
-		spriteVTTData:   []byte("WEBVTT"),
+		spriteData: map[int][]byte{0: spriteImg},
 	}
 	g.storage = storage
 
@@ -344,7 +356,7 @@ func TestGetSpriteExistenceError(t *testing.T) {
 	storage := &stubStorage{existsErr: errors.New("sprite err")}
 	g := NewGenerator(storage)
 
-	_, err := g.GetSprite(context.Background(), "file:///media", "sprite-key", 10, staticSpriteURL("pattern"), 0)
+	_, err := g.GetSprite(context.Background(), "file:///media", "sprite-key", 10, 0)
 	if err == nil || !strings.Contains(err.Error(), "check sprite") {
 		t.Fatalf("expected propagated error, got %v", err)
 	}
@@ -353,13 +365,11 @@ func TestGetSpriteExistenceError(t *testing.T) {
 func TestGetSpriteReturnsCachedData(t *testing.T) {
 	spriteImg := createTestSpriteImage(20, 20)
 	storage := &stubStorage{
-		spriteData:      map[int][]byte{0: spriteImg},
-		spriteVTTExists: true,
-		spriteVTTData:   []byte("WEBVTT"),
+		spriteData: map[int][]byte{0: spriteImg},
 	}
 	g := NewGenerator(storage)
 
-	data, err := g.GetSprite(context.Background(), "file:///media", "file:///media", 10, spriteURL, 0)
+	data, err := g.GetSprite(context.Background(), "file:///media", "file:///media", 10, 0)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -477,7 +487,10 @@ func TestGetThumbnailExistsCheckError(t *testing.T) {
 
 func TestThumbnailArgsSeekDirectlyToConfiguredPosition(t *testing.T) {
 	g := NewGenerator(&stubStorage{})
-	args := g.thumbnailArgs("file:///media", 100, domain.ThumbnailConfig{Position: 0.25, Width: 480})
+	args, err := g.thumbnailArgs("file:///media", 100, domain.ThumbnailConfig{Position: 0.25, Width: 480})
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
 	joined := strings.Join(args, " ")
 	for _, want := range []string{"-ss 25.000000", "-frames:v 1", "scale=480:-2", "pipe:1"} {
 		if !strings.Contains(joined, want) {
@@ -509,7 +522,10 @@ func TestSpriteArgsLimitCUDAThreads(t *testing.T) {
 		DeviceFrames: true,
 	})
 
-	args := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
+	args, err := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
 
 	threadsIndex := indexOf(args, "-threads")
 	inputIndex := indexOf(args, "-i")
@@ -524,7 +540,10 @@ func TestSpriteArgsLimitCUDAThreads(t *testing.T) {
 func TestSpriteArgsDoesNotLimitCPUThreads(t *testing.T) {
 	g := NewGenerator(&stubStorage{})
 
-	args := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
+	args, err := g.spriteArgs("input.mp4", "sprite-%d.jpg", 100)
+	if err != nil {
+		t.Fatalf("args: %v", err)
+	}
 
 	if indexOf(args, "-threads") != -1 {
 		t.Fatalf("expected cpu sprite args not to include -threads, got %v", args)

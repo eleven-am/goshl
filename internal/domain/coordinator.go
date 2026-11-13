@@ -8,6 +8,8 @@ import (
 
 var ErrLockHeld = errors.New("lock is held by another instance")
 
+var ErrEnqueueRejected = errors.New("job was not enqueued")
+
 type Coordinator interface {
 	Enqueue(ctx context.Context, job Job) error
 	Subscribe(ctx context.Context, streamType StreamType, profile string) (<-chan JobDelivery, error)

@@ -56,7 +56,7 @@ func TestPublicContractCompilesForExternalConsumers(t *testing.T) {
 		VideoRendition: &goshl.VideoRendition{Method: goshl.Transcode},
 		AudioRendition: &goshl.AudioRendition{Method: goshl.DirectStream},
 		EnqueuedAt:     time.Now(),
-		Deadline:       time.Now(),
+		StartBy:        time.Now(),
 	}
 	_ = pathGenerator
 	_ = observer
@@ -66,5 +66,5 @@ func TestPublicContractCompilesForExternalConsumers(t *testing.T) {
 	_ = goshl.SegmentStateReady
 	_ = goshl.StreamSubtitle
 	_ = (*goshl.Controller).ProbeMetadata
-	t.Log(job.Deadline)
+	t.Log(job.StartBy)
 }

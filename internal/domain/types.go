@@ -3,24 +3,25 @@ package domain
 import "time"
 
 type Job struct {
-	ID              string
-	RunID           string
-	MediaKey        string
-	Profile         string
-	SourceURL       string
-	Rendition       string
-	StreamType      StreamType
-	StartIndex      int
-	EndIndex        int
-	RequestedIndex  int
-	EnqueuedAt      time.Time
-	Deadline        time.Time
-	Segments        []Segment
-	Overlap         *Segment
-	ExpectedIndices []int
-	VideoRendition  *VideoRendition
-	AudioRendition  *AudioRendition
-	Metadata        *Metadata
+	ID               string
+	RunID            string
+	MediaKey         string
+	Profile          string
+	SourceURL        string
+	Rendition        string
+	StreamType       StreamType
+	StartIndex       int
+	EndIndex         int
+	RequestedIndex   int
+	EnqueuedAt       time.Time
+	StartBy          time.Time
+	Segments         []Segment
+	Overlap          *Segment
+	Trailing         *Segment
+	ExpectedIndices  []int
+	VideoRendition   *VideoRendition
+	AudioRendition   *AudioRendition
+	VideoStreamIndex int
 }
 
 type JobDelivery struct {

@@ -11,59 +11,23 @@ import (
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
-	"github.com/eleven-am/goshl/internal/localpath"
 	"github.com/eleven-am/goshl/internal/mediaexec"
 	"github.com/eleven-am/goshl/internal/probe/mp4index"
+	"github.com/eleven-am/goshl/internal/source"
 )
 
-type Prober struct {
-	storage domain.Storage
-}
+type Prober struct{}
 
-func NewProber(storage domain.Storage) *Prober {
-	return &Prober{storage: storage}
+func NewProber() *Prober {
+	return &Prober{}
 }
 
 func (p *Prober) Probe(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
-	return p.ProbeWithKey(ctx, sourceURL, sourceURL)
+	return p.probe(ctx, sourceURL)
 }
 
 func (p *Prober) ProbeUncached(ctx context.Context, sourceURL string) (*domain.Metadata, error) {
 	return p.probe(ctx, sourceURL)
-}
-
-func (p *Prober) ProbeWithKey(ctx context.Context, sourceURL, mediaKey string) (*domain.Metadata, error) {
-	exists, err := p.storage.MetadataExists(ctx, mediaKey)
-	if err != nil {
-		return nil, err
-	}
-	if exists {
-		data, err := p.storage.GetMetadata(ctx, mediaKey)
-		if err != nil {
-			return nil, err
-		}
-		var meta domain.Metadata
-		if err := json.Unmarshal(data, &meta); err != nil {
-			return nil, err
-		}
-		return &meta, nil
-	}
-
-	metadata, err := p.probe(ctx, sourceURL)
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := p.storage.SetMetadata(ctx, mediaKey, data); err != nil {
-		return nil, err
-	}
-
-	return metadata, nil
 }
 
 func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error) {
@@ -151,13 +115,12 @@ type ffprobeSideData struct {
 }
 
 func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata, string, error) {
-	output, err := mediaexec.Output(ctx, "ffprobe",
-		"-v", "error",
-		"-show_format",
-		"-show_streams",
-		"-of", "json",
-		url,
-	)
+	input, err := source.InputArgs(url)
+	if err != nil {
+		return nil, "", err
+	}
+	args := append([]string{"-v", "error", "-show_format", "-show_streams", "-of", "json"}, input...)
+	output, err := mediaexec.Output(ctx, "ffprobe", args...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -231,13 +194,16 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 }
 
 func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int) ([]float64, error) {
-	args := []string{
+	input, err := source.InputArgs(url)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{
 		"-v", "error",
 		"-select_streams", strconv.Itoa(streamIndex),
 		"-show_entries", "packet=pts_time,flags",
 		"-of", "csv=p=0",
-		url,
-	}
+	}, input...)
 	cmd, output, stderr, err := mediaexec.StartOutput(ctx, "ffprobe", args...)
 	if err != nil {
 		return nil, err
@@ -277,11 +243,11 @@ func (p *Prober) indexKeyframes(url, formatName string, streamIndex int) ([]floa
 	if !isISOBaseFormat(formatName) {
 		return nil, false
 	}
-	path, local := localpath.Resolve(url)
-	if !local {
+	input, err := source.Resolve(url)
+	if err != nil || input.Remote {
 		return nil, false
 	}
-	keyframes, err := mp4index.Keyframes(path, streamIndex)
+	keyframes, err := mp4index.Keyframes(input.LocalPath, streamIndex)
 	if err != nil {
 		return nil, false
 	}

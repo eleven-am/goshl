@@ -17,12 +17,16 @@ type flight struct {
 	rendition   string
 	start       int
 	end         int
+	startBy     time.Time
 	deadline    time.Time
 	token       string
 	watchCancel context.CancelFunc
 	done        chan struct{}
 	terminal    domain.JobStatus
 	terminalSet bool
+	abandoned   bool
+	expired     bool
+	enqueued    bool
 }
 
 type flightRegistry struct {
@@ -46,6 +50,7 @@ func (c *Controller) joinFlight(mediaKey string, streamType domain.StreamType, r
 	for id, f := range r.flights {
 		if now.After(f.deadline) {
 			delete(r.flights, id)
+			f.expired = true
 			if f.watchCancel != nil {
 				f.watchCancel()
 			}
@@ -74,7 +79,8 @@ func (c *Controller) joinFlight(mediaKey string, streamType domain.StreamType, r
 		rendition:  rendition,
 		start:      index,
 		end:        end,
-		deadline:   now.Add(c.opts.JobTimeout),
+		startBy:    now.Add(c.opts.JobTimeout),
+		deadline:   now.Add(2 * c.opts.JobTimeout),
 		done:       make(chan struct{}),
 	}
 	r.flights[f.jobID] = f
@@ -101,8 +107,11 @@ func (c *Controller) watchFlight(f *flight, statuses <-chan domain.JobStatus) {
 		select {
 		case <-f.done:
 			return
+		case <-c.lifecycle.Context().Done():
+			c.stopFlight(f)
+			return
 		case <-timer.C:
-			c.finishFlight(f)
+			c.expireFlight(f)
 			return
 		case status, ok := <-statuses:
 			if !ok {
@@ -126,7 +135,7 @@ func (c *Controller) setFlightLock(f *flight, token string) bool {
 	c.flights.mu.Lock()
 	defer c.flights.mu.Unlock()
 	f.token = token
-	return c.flights.flights[f.jobID] == f && f.runID != ""
+	return c.flights.flights[f.jobID] == f
 }
 
 func (c *Controller) setFlightTerminal(f *flight, status domain.JobStatus) {
@@ -145,11 +154,50 @@ func (c *Controller) flightTerminal(f *flight) (domain.JobStatus, bool) {
 	return f.terminal, f.terminalSet
 }
 
+func (c *Controller) flightEnded(f *flight) (abandoned, expired bool) {
+	c.flights.mu.Lock()
+	defer c.flights.mu.Unlock()
+	return f.abandoned, f.expired
+}
+
+func (c *Controller) abandonFlight(f *flight) {
+	c.flights.mu.Lock()
+	if c.flights.flights[f.jobID] == f && !f.terminalSet {
+		f.abandoned = true
+	}
+	c.flights.mu.Unlock()
+	c.finishFlight(f)
+}
+
+func (c *Controller) expireFlight(f *flight) {
+	c.flights.mu.Lock()
+	if c.flights.flights[f.jobID] == f && !f.terminalSet {
+		f.expired = true
+	}
+	c.flights.mu.Unlock()
+	c.finishFlight(f)
+}
+
+func (c *Controller) markEnqueued(f *flight) {
+	c.flights.mu.Lock()
+	f.enqueued = true
+	c.flights.mu.Unlock()
+}
+
 func (c *Controller) finishFlight(f *flight) {
+	c.endFlight(f, true)
+}
+
+func (c *Controller) stopFlight(f *flight) {
+	c.endFlight(f, false)
+}
+
+func (c *Controller) endFlight(f *flight, releaseEnqueued bool) {
 	r := c.flights
 	r.mu.Lock()
 	current, ok := r.flights[f.jobID]
 	ok = ok && current == f && current.runID == f.runID
+	release := ok && (releaseEnqueued || !f.enqueued)
 	if ok {
 		delete(r.flights, f.jobID)
 		if f.watchCancel != nil {
@@ -158,10 +206,33 @@ func (c *Controller) finishFlight(f *flight) {
 		close(f.done)
 	}
 	r.mu.Unlock()
-	if !ok {
-		return
+	if release {
+		c.releaseFlightLocks([]*flight{f})
 	}
-	c.releaseFlightLocks([]*flight{f})
+}
+
+func (c *Controller) finishAllFlights() {
+	c.flights.mu.Lock()
+	pending := make([]*flight, 0, len(c.flights.flights))
+	for _, f := range c.flights.flights {
+		pending = append(pending, f)
+	}
+	c.flights.mu.Unlock()
+	for _, f := range pending {
+		c.stopFlight(f)
+	}
+}
+
+func (c *Controller) startFlightWatch(f *flight, statuses <-chan domain.JobStatus) bool {
+	if !c.lifecycle.Enter() {
+		c.stopFlight(f)
+		return false
+	}
+	go func() {
+		defer c.lifecycle.Exit()
+		c.watchFlight(f, statuses)
+	}()
+	return true
 }
 
 func (c *Controller) finishFlightRun(jobID, runID string) {

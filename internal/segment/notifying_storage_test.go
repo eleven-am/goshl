@@ -43,15 +43,6 @@ func (s *stubStorage) ReadSprite(ctx context.Context, mediaID string, index int)
 func (s *stubStorage) SpriteExists(ctx context.Context, mediaID string, index int) (bool, error) {
 	return false, nil
 }
-func (s *stubStorage) WriteSpriteVTT(ctx context.Context, mediaID string, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadSpriteVTT(ctx context.Context, mediaID string) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) SpriteVTTExists(ctx context.Context, mediaID string) (bool, error) {
-	return false, nil
-}
 func (s *stubStorage) WriteSubtitleVTT(ctx context.Context, mediaID string, lang string, data []byte) error {
 	return nil
 }
@@ -180,8 +171,47 @@ func TestNotifyingStorageKeepsDurableSuccessWhenPublishFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("durable write must remain successful: %v", err)
 	}
-	if len(pubsub.publishes) != 3 {
-		t.Fatalf("expected three notification attempts, got %d", len(pubsub.publishes))
+	if len(pubsub.publishes) != 1 {
+		t.Fatalf("expected a single notification attempt, got %d", len(pubsub.publishes))
+	}
+	if len(events) != 1 || events[0].Type != domain.EventSegmentNotifyFailed {
+		t.Fatalf("expected notification failure event, got %#v", events)
+	}
+}
+
+type blockingPubSub struct {
+	stubPubSub
+	calls int
+}
+
+func (p *blockingPubSub) NotifySegment(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
+	p.calls++
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestNotifyFailureDoesNotDelayUpload(t *testing.T) {
+	pubsub := &blockingPubSub{}
+	var events []domain.Event
+	n := NewNotifyingStorage(&stubStorage{}, pubsub, domain.ObserverFunc(func(ctx context.Context, event domain.Event) {
+		events = append(events, event)
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	start := time.Now()
+	err := n.WriteSegment(ctx, domain.SegmentData{}, nil)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("durable write must remain successful: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("notify delayed the upload by %v", elapsed)
+	}
+	if pubsub.calls != 1 {
+		t.Fatalf("expected one notify attempt, got %d", pubsub.calls)
 	}
 	if len(events) != 1 || events[0].Type != domain.EventSegmentNotifyFailed {
 		t.Fatalf("expected notification failure event, got %#v", events)
@@ -218,15 +248,6 @@ func TestNotifyingStoragePassthroughMethods(t *testing.T) {
 	if _, err := n.SpriteExists(ctx, "src", 0); err != nil {
 		t.Fatalf("SpriteExists: %v", err)
 	}
-	if err := n.WriteSpriteVTT(ctx, "src", []byte("data")); err != nil {
-		t.Fatalf("WriteSpriteVTT: %v", err)
-	}
-	if _, err := n.ReadSpriteVTT(ctx, "src"); err != nil {
-		t.Fatalf("ReadSpriteVTT: %v", err)
-	}
-	if _, err := n.SpriteVTTExists(ctx, "src"); err != nil {
-		t.Fatalf("SpriteVTTExists: %v", err)
-	}
 	if err := n.WriteSubtitleVTT(ctx, "src", "en", []byte("data")); err != nil {
 		t.Fatalf("WriteSubtitleVTT: %v", err)
 	}
@@ -253,5 +274,35 @@ func TestNotifyingStoragePassthroughMethods(t *testing.T) {
 	}
 	if _, err := n.ThumbnailExists(ctx, "src"); err != nil {
 		t.Fatalf("ThumbnailExists: %v", err)
+	}
+}
+
+type deadlineRecordingPubSub struct {
+	stubPubSub
+	remaining time.Duration
+	hasLimit  bool
+}
+
+func (p *deadlineRecordingPubSub) NotifySegment(ctx context.Context, info domain.SegmentData, status domain.SegmentStatus) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		p.hasLimit = true
+		p.remaining = time.Until(deadline)
+	}
+	return nil
+}
+
+func TestNotifyIsBoundedToTwoSeconds(t *testing.T) {
+	pubsub := &deadlineRecordingPubSub{}
+	n := NewNotifyingStorage(&stubStorage{}, pubsub, nil)
+
+	if err := n.WriteSegment(context.Background(), domain.SegmentData{}, nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if !pubsub.hasLimit {
+		t.Fatal("notification must run under a deadline")
+	}
+	if pubsub.remaining > 2*time.Second || pubsub.remaining < time.Second {
+		t.Fatalf("notification deadline = %v from now, want just under 2s", pubsub.remaining)
 	}
 }

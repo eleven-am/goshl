@@ -3,8 +3,8 @@ package probe
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,107 +12,10 @@ import (
 	"testing"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/testmedia"
 )
 
-type stubStorage struct {
-	exists    bool
-	metaData  []byte
-	existsCnt int
-	getCnt    int
-	setCnt    int
-}
-
-func (s *stubStorage) MetadataExists(ctx context.Context, sourceURL string) (bool, error) {
-	s.existsCnt++
-	return s.exists, nil
-}
-
-func (s *stubStorage) GetMetadata(ctx context.Context, sourceURL string) ([]byte, error) {
-	s.getCnt++
-	return s.metaData, nil
-}
-
-func (s *stubStorage) SetMetadata(ctx context.Context, sourceURL string, data []byte) error {
-	s.setCnt++
-	s.metaData = data
-	s.exists = true
-	return nil
-}
-
-func (s *stubStorage) WriteSegment(ctx context.Context, info domain.SegmentData, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadSegment(ctx context.Context, info domain.SegmentData) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) SegmentExists(ctx context.Context, info domain.SegmentData) (bool, error) {
-	return false, nil
-}
-func (s *stubStorage) WriteSprite(ctx context.Context, sourceURL string, index int, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadSprite(ctx context.Context, sourceURL string, index int) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) SpriteExists(ctx context.Context, sourceURL string, index int) (bool, error) {
-	return false, nil
-}
-func (s *stubStorage) WriteSpriteVTT(ctx context.Context, sourceURL string, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadSpriteVTT(ctx context.Context, sourceURL string) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) SpriteVTTExists(ctx context.Context, sourceURL string) (bool, error) {
-	return false, nil
-}
-func (s *stubStorage) WriteSubtitleVTT(ctx context.Context, sourceURL string, lang string, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadSubtitleVTT(ctx context.Context, sourceURL string, lang string) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) SubtitleVTTExists(ctx context.Context, sourceURL string, lang string) (bool, error) {
-	return false, nil
-}
-func (s *stubStorage) WritePreview(ctx context.Context, sourceURL string, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadPreview(ctx context.Context, sourceURL string) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) PreviewExists(ctx context.Context, sourceURL string) (bool, error) {
-	return false, nil
-}
-func (s *stubStorage) WriteThumbnail(ctx context.Context, sourceURL string, data []byte) error {
-	return nil
-}
-func (s *stubStorage) ReadThumbnail(ctx context.Context, sourceURL string) ([]byte, error) {
-	return nil, nil
-}
-func (s *stubStorage) ThumbnailExists(ctx context.Context, sourceURL string) (bool, error) {
-	return false, nil
-}
-
-func TestProbe_UsesCacheAndSkipsFFProbe(t *testing.T) {
-	cached := &domain.Metadata{Duration: 5}
-	cachedBytes, _ := json.Marshal(cached)
-	storage := &stubStorage{exists: true, metaData: cachedBytes}
-	p := NewProber(storage)
-	got, err := p.Probe(context.Background(), "file:///cached")
-	if err != nil {
-		t.Fatalf("probe returned error: %v", err)
-	}
-
-	if got.Duration != cached.Duration {
-		t.Fatalf("expected cached metadata duration %v, got %v", cached.Duration, got.Duration)
-	}
-	if storage.setCnt != 0 {
-		t.Fatalf("cache hit should not attempt to set metadata")
-	}
-}
-
-func TestProbe_InvokesFFProbeAndPersistsMetadata(t *testing.T) {
+func TestProbe_InvokesFFProbe(t *testing.T) {
 	tmpDir := t.TempDir()
 	script := filepath.Join(tmpDir, "ffprobe")
 	if err := os.WriteFile(script, []byte(ffprobeScript), 0755); err != nil {
@@ -125,8 +28,7 @@ func TestProbe_InvokesFFProbeAndPersistsMetadata(t *testing.T) {
 		t.Fatalf("failed to update PATH: %v", err)
 	}
 
-	storage := &stubStorage{}
-	p := NewProber(storage)
+	p := NewProber()
 
 	meta, err := p.Probe(context.Background(), "file:///input")
 	if err != nil {
@@ -159,36 +61,6 @@ func TestProbe_InvokesFFProbeAndPersistsMetadata(t *testing.T) {
 	if meta.Keyframes[0] != 0 || meta.Keyframes[1] != 3 || meta.Keyframes[2] != 6.2 {
 		t.Fatalf("unexpected keyframes parsed: %#v", meta.Keyframes)
 	}
-
-	if storage.setCnt != 1 {
-		t.Fatalf("metadata should be persisted once, got %d", storage.setCnt)
-	}
-}
-
-func TestProbeUncachedSkipsStorage(t *testing.T) {
-	tmpDir := t.TempDir()
-	script := filepath.Join(tmpDir, "ffprobe")
-	if err := os.WriteFile(script, []byte(ffprobeScript), 0755); err != nil {
-		t.Fatalf("failed to write fake ffprobe: %v", err)
-	}
-
-	originalPath := os.Getenv("PATH")
-	t.Cleanup(func() { _ = os.Setenv("PATH", originalPath) })
-	if err := os.Setenv("PATH", tmpDir+string(os.PathListSeparator)+originalPath); err != nil {
-		t.Fatalf("failed to update PATH: %v", err)
-	}
-
-	storage := &stubStorage{exists: true, metaData: []byte(`{"duration":99}`)}
-	meta, err := NewProber(storage).ProbeUncached(context.Background(), "file:///input")
-	if err != nil {
-		t.Fatalf("probe returned error: %v", err)
-	}
-	if meta.Duration != 12.5 {
-		t.Fatalf("expected probed duration 12.5, got %v", meta.Duration)
-	}
-	if storage.existsCnt != 0 || storage.getCnt != 0 || storage.setCnt != 0 {
-		t.Fatalf("uncached probe touched storage: exists=%d get=%d set=%d", storage.existsCnt, storage.getCnt, storage.setCnt)
-	}
 }
 
 func TestProbe_UsesStreamBitRateBeforeBPSTag(t *testing.T) {
@@ -204,7 +76,7 @@ func TestProbe_UsesStreamBitRateBeforeBPSTag(t *testing.T) {
 		t.Fatalf("failed to update PATH: %v", err)
 	}
 
-	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), "file:///input")
+	meta, err := NewProber().Probe(context.Background(), "file:///input")
 	if err != nil {
 		t.Fatalf("probe returned error: %v", err)
 	}
@@ -227,7 +99,7 @@ func TestProbe_NormalizesNonZeroStartTimeAndSelectsPlayableVideo(t *testing.T) {
 		t.Fatalf("failed to update PATH: %v", err)
 	}
 
-	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), "file:///input")
+	meta, err := NewProber().Probe(context.Background(), "file:///input")
 	if err != nil {
 		t.Fatalf("probe returned error: %v", err)
 	}
@@ -275,7 +147,7 @@ func TestProbe_NormalizesRealMPEGTSFixture(t *testing.T) {
 		t.Fatalf("create fixture: %v: %s", err, data)
 	}
 
-	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), output)
+	meta, err := NewProber().Probe(context.Background(), output)
 	if err != nil {
 		t.Fatalf("probe fixture: %v", err)
 	}
@@ -420,7 +292,7 @@ func makeMedia(t *testing.T, name string, args ...string) string {
 
 func referenceKeyframes(t *testing.T, path string, meta *domain.Metadata) []float64 {
 	t.Helper()
-	raw, err := NewProber(&stubStorage{}).probeKeyframes(context.Background(), path, meta.Video.Index)
+	raw, err := NewProber().probeKeyframes(context.Background(), path, meta.Video.Index)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +303,7 @@ func TestProbe_MP4UsesHeaderIndexAndMatchesPacketScan(t *testing.T) {
 	logPath := ffprobeCallLog(t)
 	path := makeMedia(t, "indexed.mp4", "-bf", "2", "-movflags", "+faststart")
 
-	meta, err := NewProber(&stubStorage{}).Probe(context.Background(), path)
+	meta, err := NewProber().Probe(context.Background(), path)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
@@ -456,7 +328,7 @@ func TestProbe_FileURLUsesHeaderIndex(t *testing.T) {
 	logPath := ffprobeCallLog(t)
 	path := makeMedia(t, "indexed.mp4")
 
-	if _, err := NewProber(&stubStorage{}).Probe(context.Background(), "file://"+path); err != nil {
+	if _, err := NewProber().Probe(context.Background(), "file://"+path); err != nil {
 		t.Fatalf("probe: %v", err)
 	}
 	if got := packetPassCount(t, logPath); got != 0 {
@@ -484,7 +356,7 @@ func TestProbe_FallsBackToPacketScan(t *testing.T) {
 		name, path := name, path
 		t.Run(name, func(t *testing.T) {
 			before := packetPassCount(t, logPath)
-			meta, err := NewProber(&stubStorage{}).Probe(context.Background(), path)
+			meta, err := NewProber().Probe(context.Background(), path)
 			if err != nil {
 				t.Fatalf("probe: %v", err)
 			}
@@ -501,7 +373,7 @@ func TestProbe_FallsBackToPacketScan(t *testing.T) {
 func TestProbe_MissingHeaderIndexFallsBack(t *testing.T) {
 	logPath := ffprobeCallLog(t)
 	path := makeMedia(t, "plain.mp4")
-	prober := NewProber(&stubStorage{})
+	prober := NewProber()
 
 	if _, ok := prober.indexKeyframes("https://example.com/video.mp4", "mov,mp4,m4a,3gp,3g2,mj2", 0); ok {
 		t.Fatal("remote source must not use the header index")
@@ -560,7 +432,7 @@ func TestProbe_EmptyEditOddTimescaleMatchesPacketScan(t *testing.T) {
 			}
 
 			before := packetPassCount(t, logPath)
-			meta, err := NewProber(&stubStorage{}).Probe(context.Background(), path)
+			meta, err := NewProber().Probe(context.Background(), path)
 			if err != nil {
 				t.Fatalf("probe: %v", err)
 			}
@@ -588,3 +460,82 @@ func TestProbe_EmptyEditOddTimescaleMatchesPacketScan(t *testing.T) {
 }
 
 func boolPtr(value bool) *bool { return &value }
+
+func copyFixture(t *testing.T, container string, dir, name string) string {
+	t.Helper()
+	original := testmedia.H264(t, testmedia.Spec{Container: container, Duration: 4})
+	data, err := os.ReadFile(original)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create dir: %v", err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	return path
+}
+
+func TestPercentEncodedFileURLProbes(t *testing.T) {
+	for _, container := range []string{"mp4", "mkv"} {
+		path := copyFixture(t, container, filepath.Join(t.TempDir(), "My Show: Part 1"), "episode 100%: pilot."+container)
+		encoded := (&url.URL{Scheme: "file", Path: path}).String()
+		if !strings.Contains(encoded, "%20") {
+			t.Fatalf("fixture URL %q is not percent-encoded", encoded)
+		}
+		meta, err := NewProber().ProbeUncached(context.Background(), encoded)
+		if err != nil {
+			t.Fatalf("%s: probe %q: %v", container, encoded, err)
+		}
+		if meta.Duration < 3 || len(meta.Keyframes) == 0 {
+			t.Fatalf("%s: metadata = %+v", container, meta)
+		}
+	}
+}
+
+func TestDashPrefixedSourceCannotInjectOptions(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	copyFixture(t, "mkv", dir, "-show_data.mkv")
+	argvLog := recordFFprobeArgv(t)
+	meta, err := NewProber().ProbeUncached(context.Background(), "-show_data.mkv")
+	if err != nil {
+		t.Fatalf("probe dash-prefixed source: %v", err)
+	}
+	logged, readErr := os.ReadFile(argvLog)
+	if readErr != nil {
+		t.Fatalf("read argv log: %v", readErr)
+	}
+	want := []string{"-protocol_whitelist", "file", "-i", "file:-show_data.mkv"}
+	invocations := strings.Split(strings.TrimSuffix(string(logged), "--END--\n"), "--END--\n")
+	for _, invocation := range invocations {
+		lines := strings.Split(strings.TrimSuffix(invocation, "\n"), "\n")
+		if len(lines) < len(want) || strings.Join(lines[len(lines)-len(want):], " ") != strings.Join(want, " ") {
+			t.Fatalf("ffprobe argv = %q, want it to end with %q", lines, want)
+		}
+	}
+	if meta.Duration < 3 {
+		t.Fatalf("metadata = %+v", meta)
+	}
+	if _, err := NewProber().ProbeUncached(context.Background(), "-version"); err == nil || strings.Contains(err.Error(), "ffprobe version") {
+		t.Fatalf("option-like source was not treated as a file: %v", err)
+	}
+}
+
+func recordFFprobeArgv(t *testing.T) string {
+	t.Helper()
+	real, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe not found on PATH")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "argv.log")
+	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"" + logPath + "\"; done\necho --END-- >> \"" + logPath + "\"\nexec \"" + real + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ffprobe"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffprobe wrapper: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}

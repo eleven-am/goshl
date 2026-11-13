@@ -123,7 +123,7 @@ func TestTranscodeDeadlineIgnoresProbeTimeout(t *testing.T) {
 	segments := []domain.Segment{{Index: 0, Start: 0, End: 6}}
 	video := domain.VideoRendition{Name: "720p", Method: domain.Transcode}
 	job := controller.buildJob("run", time.Now().Add(time.Minute), "source", "key", StreamVideo, video.Name, 0, 0, 0, segments, &video, nil, testVideoMetadata(6, []float64{0}))
-	if remaining := time.Until(job.Deadline); remaining > time.Minute || remaining < 50*time.Second {
+	if remaining := time.Until(job.StartBy); remaining > time.Minute || remaining < 50*time.Second {
 		t.Fatalf("expected deadline near JobTimeout, got %v", remaining)
 	}
 }
@@ -133,17 +133,20 @@ func TestSpriteVTTReadsFromConfiguredSpriteStorage(t *testing.T) {
 	defer cleanup()
 
 	metaBytes, _ := json.Marshal(testVideoMetadata(60, nil))
-	main := &stubStorage{metaData: metaBytes, metaExists: true}
-	sprites := &stubStorage{spriteVTT: []byte("sprite-store-vtt")}
+	main := &mainSpriteTouchSpy{stubStorage: &stubStorage{metaData: metaBytes, metaExists: true}}
+	sprites := &spriteSpy{}
 	svc := NewController(Options{Storage: main, SpriteStorage: sprites, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}})
 
 	out, err := svc.SpriteVTT(context.Background(), "file:///media")
 
-	if err != nil || string(out) != "sprite-store-vtt" {
-		t.Fatalf("expected vtt from sprite storage, got %q %v", out, err)
+	if err != nil || !strings.Contains(string(out), "/sprite-0.jpg#xywh=0,0,160,90") {
+		t.Fatalf("expected vtt rendered from sprites in sprite storage, got %q %v", out, err)
 	}
-	if main.spriteVTT != nil {
-		t.Fatalf("segment storage must not hold sprites")
+	if sprites.existsCalls != 1 {
+		t.Fatalf("expected the configured sprite storage to be consulted once, got %d", sprites.existsCalls)
+	}
+	if sprites.writeCalls != 0 || main.touched != 0 {
+		t.Fatalf("existing sheets must not trigger generation or touch main storage, got writes=%d main=%d", sprites.writeCalls, main.touched)
 	}
 }
 

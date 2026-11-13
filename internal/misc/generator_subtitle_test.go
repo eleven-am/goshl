@@ -3,46 +3,21 @@ package misc
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/eleven-am/goshl/internal/coordination/coordtest"
 	"github.com/eleven-am/goshl/internal/domain"
-	"golang.org/x/sync/singleflight"
+	"github.com/eleven-am/goshl/internal/testmedia"
+	"github.com/eleven-am/goshl/internal/webvtt"
 )
-
-type memCoordinator struct {
-	domain.Coordinator
-	mu    sync.Mutex
-	locks map[string]string
-	next  int
-}
-
-func newMemCoordinator() *memCoordinator {
-	return &memCoordinator{locks: map[string]string{}}
-}
-
-func (c *memCoordinator) AcquireLock(ctx context.Context, key string, ttl time.Duration) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, held := c.locks[key]; held {
-		return "", domain.ErrLockHeld
-	}
-	c.next++
-	token := key + "#" + time.Duration(c.next).String()
-	c.locks[key] = token
-	return token, nil
-}
-
-func (c *memCoordinator) ReleaseLock(ctx context.Context, key string, token string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.locks[key] == token {
-		delete(c.locks, key)
-	}
-	return nil
-}
 
 type vttStore struct {
 	*stubStorage
@@ -71,57 +46,9 @@ func (s *vttStore) SubtitleVTTExists(ctx context.Context, mediaID string, lang s
 	return s.files[mediaID+"/"+lang], nil
 }
 
-func TestLockWaiterTakesOverWhenHolderReleasesWithoutAsset(t *testing.T) {
-	coordinator := newMemCoordinator()
-	gen := NewGeneratorWithCoordinator(newVTTStore(), coordinator, nil)
-	notReady := func(context.Context) (bool, error) { return false, nil }
-
-	holderIn := make(chan struct{})
-	holderOut := make(chan struct{})
-	holderDone := make(chan error, 1)
-	go func() {
-		holderDone <- gen.coordinateGeneration(context.Background(), "k", notReady, func(context.Context) error {
-			close(holderIn)
-			<-holderOut
-			return errors.New("holder failed")
-		})
-	}()
-	<-holderIn
-
-	var ran atomic.Int32
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	waiterDone := make(chan error, 1)
-	start := time.Now()
-	go func() {
-		waiterDone <- gen.coordinateGeneration(ctx, "k", notReady, func(context.Context) error {
-			ran.Add(1)
-			return nil
-		})
-	}()
-	time.Sleep(300 * time.Millisecond)
-	close(holderOut)
-	<-holderDone
-
-	select {
-	case err := <-waiterDone:
-		if err != nil {
-			t.Fatalf("waiter error: %v", err)
-		}
-	case <-time.After(4 * time.Second):
-		t.Fatal("waiter never returned")
-	}
-	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
-		t.Fatalf("waiter took %v after holder released", elapsed)
-	}
-	if ran.Load() != 1 {
-		t.Fatalf("waiter generate ran %d times, want 1", ran.Load())
-	}
-}
-
 func TestSubtitleBatchSurvivesCallerCancel(t *testing.T) {
 	store := newVTTStore()
-	gen := NewGeneratorWithCoordinator(store, newMemCoordinator(), nil)
+	gen := NewGeneratorWithCoordinator(store, coordtest.NewMemCoordinator(), nil)
 	gate := make(chan struct{})
 	started := make(chan struct{})
 	gen.extractSubtitles = func(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error {
@@ -168,7 +95,7 @@ func TestSubtitleBatchSurvivesCallerCancel(t *testing.T) {
 
 func TestConcurrentSubtitleBatchesExtractOnce(t *testing.T) {
 	store := newVTTStore()
-	gen := NewGeneratorWithCoordinator(store, newMemCoordinator(), nil)
+	gen := NewGeneratorWithCoordinator(store, coordtest.NewMemCoordinator(), nil)
 	var extractions atomic.Int32
 	gate := make(chan struct{})
 	gen.extractSubtitles = func(ctx context.Context, sourceURL string, jobs []SubtitleJob, failures map[string]error) error {
@@ -208,35 +135,67 @@ func TestConcurrentSubtitleBatchesExtractOnce(t *testing.T) {
 	}
 }
 
-func TestGenerationTimeoutComesFromOptions(t *testing.T) {
-	run := func(timeout time.Duration) (time.Duration, bool) {
-		gen := NewGeneratorWithCoordinator(newVTTStore(), newMemCoordinator(), nil)
-		gen.generationTimeout = timeout
-		var group singleflight.Group
-		ended := make(chan time.Time, 1)
-		start := time.Now()
-		go func() {
-			_ = gen.generateOnce(context.Background(), &group, "k",
-				func(context.Context) (bool, error) { return false, nil },
-				func(ctx context.Context) error {
-					<-ctx.Done()
-					ended <- time.Now()
-					return ctx.Err()
-				})
-		}()
-		select {
-		case at := <-ended:
-			return at.Sub(start), true
-		case <-time.After(400 * time.Millisecond):
-			return 0, false
-		}
-	}
+type capturingVTTStore struct {
+	*stubStorage
+	mu   sync.Mutex
+	data map[string][]byte
+}
 
-	elapsed, ended := run(150 * time.Millisecond)
-	if !ended || elapsed < 100*time.Millisecond || elapsed > 300*time.Millisecond {
-		t.Fatalf("configured timeout: ended=%v elapsed=%v, want about 150ms", ended, elapsed)
+func newCapturingVTTStore() *capturingVTTStore {
+	return &capturingVTTStore{stubStorage: &stubStorage{}, data: map[string][]byte{}}
+}
+
+func (s *capturingVTTStore) WriteSubtitleVTT(ctx context.Context, mediaID string, lang string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[mediaID+"/"+lang] = append([]byte(nil), data...)
+	return nil
+}
+
+func TestHLSSubtitleVTTCarriesTimestampMap(t *testing.T) {
+	testmedia.Require(t)
+	source := testmedia.H264(t, testmedia.Spec{Container: "mkv", Duration: 6, Subtitles: true})
+	store := newCapturingVTTStore()
+	gen := NewGeneratorWithCoordinator(store, coordtest.NewMemCoordinator(), nil)
+	failures := map[string]error{}
+
+	err := gen.extractSubtitleBatchFFmpeg(context.Background(), source, []SubtitleJob{{Key: "m", TrackID: "en", StreamIndex: 1, Codec: "subrip"}}, failures)
+	if err != nil || failures["en"] != nil {
+		t.Fatalf("extract: %v, failure %v", err, failures["en"])
 	}
-	if _, ended := run(0); ended {
-		t.Fatal("default timeout ended within 400ms")
+	data := string(store.data["m/en"])
+	wantMap := fmt.Sprintf("X-TIMESTAMP-MAP=MPEGTS:%d,LOCAL:00:00:00.000", int64(domain.OutputTimelineOffset.Seconds()*90000))
+	if !strings.HasPrefix(data, "WEBVTT\n"+wantMap+"\n\n") {
+		t.Fatalf("ffmpeg-path vtt lacks %q:\n%s", wantMap, data)
+	}
+	cues, err := webvtt.Parse([]byte(data))
+	if err != nil || len(cues) == 0 || cues[0].Text != "cue 1" {
+		t.Fatalf("re-emitted vtt does not parse back: %v %+v\n%s", err, cues, data)
+	}
+}
+
+func TestFFmpegSubtitleOutputThatCannotBeParsedFailsTheTrack(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "ffmpeg")
+	body := "#!/bin/sh\nfor last; do :; done\nprintf 'this is not webvtt' > \"$last\"\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skipf("sh is unavailable: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	store := newCapturingVTTStore()
+	gen := NewGeneratorWithCoordinator(store, coordtest.NewMemCoordinator(), nil)
+	failures := map[string]error{}
+
+	if err := gen.extractSubtitleBatchFFmpeg(context.Background(), "file:///media", []SubtitleJob{{Key: "m", TrackID: "en", StreamIndex: 1}}, failures); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if failures["en"] == nil || !strings.Contains(failures["en"].Error(), "parse extracted subtitle") {
+		t.Fatalf("failure = %v, want parse extracted subtitle", failures["en"])
+	}
+	if len(store.data) != 0 {
+		t.Fatalf("unparsable track was stored: %v", store.data)
 	}
 }

@@ -18,6 +18,8 @@ const (
 	validationHeight = 180
 )
 
+var validationLevels = []string{"3.0", "5.2"}
+
 func Detect(ctx context.Context) ([]domain.Accelerator, error) {
 	hwaccels, err := detectHWAccels(ctx)
 	if err != nil {
@@ -201,13 +203,16 @@ func Validate(ctx context.Context, config *domain.HWAccelConfig) error {
 	if err := mediaexec.Run(ctx, "ffmpeg", "-v", "error", "-f", "lavfi", "-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=24", validationWidth, validationHeight), "-frames:v", "12", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", input); err != nil {
 		return fmt.Errorf("create validation input: %w", err)
 	}
-	args := []string{"-v", "error"}
-	args = append(args, config.DecodeFlags...)
-	args = append(args, "-i", input, "-vf", fmt.Sprintf(config.ScaleFilter, validationWidth, validationHeight))
-	args = append(args, config.EncodeFlags...)
-	args = append(args, "-frames:v", "1", "-f", "null", "-")
-	if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {
-		return fmt.Errorf("validate %s pipeline: %w", config.Accelerator, err)
+	for _, level := range validationLevels {
+		args := []string{"-v", "error"}
+		args = append(args, config.DecodeFlags...)
+		args = append(args, "-i", input, "-vf", fmt.Sprintf(config.ScaleFilter, validationWidth, validationHeight))
+		args = append(args, config.EncodeFlags...)
+		args = append(args, "-profile:v", "high", "-level:v", level)
+		args = append(args, "-frames:v", "1", "-f", "null", "-")
+		if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {
+			return fmt.Errorf("validate %s pipeline at level %s: %w", config.Accelerator, level, err)
+		}
 	}
 	return nil
 }
