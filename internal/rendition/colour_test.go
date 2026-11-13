@@ -29,16 +29,45 @@ func TestDirectStreamRejectsHDRTransfer(t *testing.T) {
 	}
 }
 
-func TestEightBitHDRTransferIsRetaggedNotToneMapped(t *testing.T) {
+func TestEightBitHDRTransferIsToneMappedNotDirectStreamed(t *testing.T) {
+	cases := map[string]domain.ColourPlan{
+		"bt2020":  {Tonemap: true, AssumeMatrix: "bt2020nc"},
+		"":        {Tonemap: true, AssumeMatrix: "bt2020nc", AssumePrimaries: "bt2020"},
+		"unknown": {Tonemap: true, AssumeMatrix: "bt2020nc", AssumePrimaries: "bt2020"},
+	}
 	for _, transfer := range []string{"smpte2084", "arib-std-b67"} {
-		source := eligibleSource()
-		source.ColorTransfer = transfer
-		for _, rendition := range mustVideo(t, source) {
-			if rendition.Method != domain.Transcode {
-				t.Errorf("%s source rendition %s uses %s, want transcode", transfer, rendition.Name, rendition.Method)
+		for primaries, want := range cases {
+			source := eligibleSource()
+			source.ColorTransfer = transfer
+			source.ColorPrimaries = primaries
+			for _, rendition := range mustVideo(t, source) {
+				if rendition.Method != domain.Transcode {
+					t.Errorf("%s/%q source rendition %s uses %s, want transcode", transfer, primaries, rendition.Name, rendition.Method)
+				}
+				if rendition.Colour != want {
+					t.Errorf("%s/%q source rendition %s colour %+v, want %+v", transfer, primaries, rendition.Name, rendition.Colour, want)
+				}
 			}
-			if rendition.Colour != (domain.ColourPlan{Retag: true}) {
-				t.Errorf("%s source rendition %s colour %+v, want retag only", transfer, rendition.Name, rendition.Colour)
+		}
+	}
+}
+
+func TestHDRTransferWithSDRPrimariesIsRetaggedNotToneMapped(t *testing.T) {
+	for _, transfer := range []string{"smpte2084", "arib-std-b67"} {
+		for _, primaries := range []string{"bt709", "smpte170m", "bt470bg", "bt470m"} {
+			for _, depth := range []int{8, 10} {
+				source := eligibleSource()
+				source.BitDepth = depth
+				source.ColorTransfer = transfer
+				source.ColorPrimaries = primaries
+				for _, rendition := range mustVideo(t, source) {
+					if rendition.Method != domain.Transcode {
+						t.Errorf("%s/%s %d-bit source rendition %s uses %s, want transcode", transfer, primaries, depth, rendition.Name, rendition.Method)
+					}
+					if rendition.Colour != (domain.ColourPlan{Retag: true}) {
+						t.Errorf("%s/%s %d-bit source rendition %s colour %+v, want retag only", transfer, primaries, depth, rendition.Name, rendition.Colour)
+					}
+				}
 			}
 		}
 	}

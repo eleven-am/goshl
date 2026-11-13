@@ -107,3 +107,53 @@ func TestTonemapCapabilityCachesVerdictsButNotRunFailures(t *testing.T) {
 		t.Fatalf("detector ran %d times, want 2", calls.Load())
 	}
 }
+
+func eightBitHDRMetadata(transfer, primaries string) *domain.Metadata {
+	meta := testVideoMetadata(60, []float64{0, 6, 12, 18, 24, 30, 36, 42, 48, 54})
+	meta.Video.BitDepth = 8
+	meta.Video.ColorSpace = "bt2020nc"
+	meta.Video.ColorTransfer = transfer
+	meta.Video.ColorPrimaries = primaries
+	return meta
+}
+
+func TestEightBitHDRPlaylistsFailWithoutTonemapFilter(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+	for _, transfer := range []string{domain.TransferPQ, domain.TransferHLG} {
+		for _, primaries := range []string{"bt2020", "", "unknown"} {
+			controller := gatedController(t, eightBitHDRMetadata(transfer, primaries), missingZscale)
+			if out, err := controller.MasterPlaylist(context.Background(), "file:///hdr8"); !errors.Is(err, ErrTonemapUnavailable) || out != "" {
+				t.Errorf("%s/%q master = %q, err = %v, want ErrTonemapUnavailable", transfer, primaries, out, err)
+			}
+			if out, err := controller.VariantPlaylist(context.Background(), "file:///hdr8", domain.StreamVideo, "360p"); !errors.Is(err, ErrTonemapUnavailable) || out != "" {
+				t.Errorf("%s/%q variant = %q, err = %v, want ErrTonemapUnavailable", transfer, primaries, out, err)
+			}
+		}
+	}
+}
+
+func TestHDRTransferWithSDRPrimariesNeverProbesTonemapCapability(t *testing.T) {
+	cleanup := installFakeFFmpeg(t)
+	defer cleanup()
+	for _, primaries := range []string{"bt709", "smpte170m", "bt470bg", "bt470m"} {
+		for _, depth := range []int{8, 10} {
+			var calls atomic.Int32
+			meta := eightBitHDRMetadata(domain.TransferPQ, primaries)
+			meta.Video.BitDepth = depth
+			controller := gatedController(t, meta, func(context.Context) (string, error) {
+				calls.Add(1)
+				return "", errors.New("must not run")
+			})
+			if out, err := controller.MasterPlaylist(context.Background(), "file:///mistagged"); err != nil || out == "" {
+				t.Errorf("%s %d-bit master = %q, err = %v", primaries, depth, out, err)
+			}
+			if out, err := controller.VariantPlaylist(context.Background(), "file:///mistagged", domain.StreamVideo, "360p"); err != nil || out == "" {
+				t.Errorf("%s %d-bit variant = %q, err = %v", primaries, depth, out, err)
+			}
+			if calls.Load() != 0 {
+				t.Errorf("%s %d-bit: detector ran %d times for a retagged source", primaries, depth, calls.Load())
+			}
+		}
+	}
+}

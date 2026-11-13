@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.0.27] - 2026-11-13
+
+Cache `goshl-cache-v6`; job contract version unchanged (5). See MIGRATION.md.
+
+- fix(colour): PQ and HLG sources are tone mapped at any bit depth, including 8-bit, when their primaries are BT.2020 or unspecified (assumed BT.2020); v0.0.26 retagged every 8-bit PQ or HLG source as BT.709 without tone mapping, which washed out genuinely PQ-graded 8-bit files
+- fix(colour): PQ or HLG with BT.709, SMPTE 170M or BT.470 (BG or M) primaries is treated as mis-tagged SDR and retagged BT.709 at any bit depth (previously only below 10-bit)
+- feat(cache): cache schema `goshl-cache-v6`; every source is re-probed and re-transcoded once
+
 ## [0.0.26] - 2026-11-13
 
 Output correctness release R2 (cache `goshl-cache-v5`, job contract version 5). See MIGRATION.md.

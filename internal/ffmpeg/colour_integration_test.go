@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -206,6 +207,167 @@ func TestHDRToneMapDarkensShadowsBelowRetag(t *testing.T) {
 	if mapped <= 16 || mapped >= retagged-5 {
 		t.Fatalf("tone mapped 10-nit PQ patch has mean luma %.1f, want above black (16) and clearly below the plain retag %.1f", mapped, retagged)
 	}
+}
+
+func eightBitHDRSpecs() map[string]testmedia.ColourSpec {
+	return map[string]testmedia.ColourSpec{
+		"pq bt2020":              {Width: 320, Height: 180, PixelFormat: "yuv420p", Primaries: "bt2020", Transfer: "smpte2084", Matrix: "bt2020nc", Range: "tv"},
+		"pq unspecified":         {Width: 320, Height: 180, PixelFormat: "yuv420p", Transfer: "smpte2084", Matrix: "bt2020nc", Range: "tv"},
+		"pq unspecified matrix":  {Width: 320, Height: 180, PixelFormat: "yuv420p", Transfer: "smpte2084", Range: "tv"},
+		"hlg bt2020":             {Width: 320, Height: 180, PixelFormat: "yuv420p", Primaries: "bt2020", Transfer: "arib-std-b67", Matrix: "bt2020nc", Range: "tv"},
+		"hlg unspecified matrix": {Width: 320, Height: 180, PixelFormat: "yuv420p", Transfer: "arib-std-b67", Range: "tv"},
+	}
+}
+
+func TestEightBitHDRSourceFailsExplicitlyWithoutTonemapFilter(t *testing.T) {
+	missing := func(context.Context) (string, error) {
+		return "", fmt.Errorf("%w: ffmpeg has no zscale filter", hwaccel.ErrTonemapUnavailable)
+	}
+	for name, spec := range eightBitHDRSpecs() {
+		_, err := softwareBuilder(missing).Video(VideoParams{InputURL: "/media/hdr8.mp4", Rendition: colourRendition(spec, 320, 180), Segments: []domain.Segment{{Index: 0, Start: 0, End: 2, Duration: 2}}, OutputDir: t.TempDir()})
+		if !errors.Is(err, hwaccel.ErrTonemapUnavailable) {
+			t.Errorf("%s: 8-bit HDR job without a tonemap filter returned %v, want ErrTonemapUnavailable", name, err)
+		}
+	}
+}
+
+func TestEightBitHDRJobCarriesTheToneMapChain(t *testing.T) {
+	chain, err := hwaccel.DetectTonemap(fakeFilters(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped := fmt.Sprintf(chain, 320, 180)
+	prefixes := map[string]string{
+		"pq bt2020":              "",
+		"pq unspecified":         "setparams=color_primaries=bt2020,",
+		"pq unspecified matrix":  "setparams=color_primaries=bt2020:colorspace=bt2020nc,",
+		"hlg bt2020":             "",
+		"hlg unspecified matrix": "setparams=color_primaries=bt2020:colorspace=bt2020nc,",
+	}
+	for name, spec := range eightBitHDRSpecs() {
+		builder := softwareBuilder(func(context.Context) (string, error) { return chain, nil })
+		args, err := builder.Video(VideoParams{InputURL: "/media/hdr8.mp4", Rendition: colourRendition(spec, 320, 180), Segments: []domain.Segment{{Index: 0, Start: 0, End: 2, Duration: 2}}, OutputDir: t.TempDir()})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !slices.Contains(args, prefixes[name]+mapped) {
+			t.Errorf("%s: job -vf is not %q: %v", name, prefixes[name]+mapped, args)
+		}
+		if slices.Contains(args, "-color_trc") {
+			t.Errorf("%s: job retags the source instead of tone mapping it: %v", name, args)
+		}
+	}
+}
+
+func TestHDRTransferWithSDRPrimariesIsRetaggedAtAnyDepth(t *testing.T) {
+	unreachable := func(context.Context) (string, error) { return "", errors.New("must not run") }
+	scale := fmt.Sprintf(hwaccel.NewConfig(domain.AccelNone).ScaleFilter, 320, 180)
+	for _, transfer := range []string{"smpte2084", "arib-std-b67"} {
+		for _, primaries := range []string{"bt709", "smpte170m", "bt470bg", "bt470m"} {
+			for _, format := range []string{"yuv420p", "yuv420p10le"} {
+				spec := testmedia.ColourSpec{Width: 320, Height: 180, PixelFormat: format, Primaries: primaries, Transfer: transfer, Matrix: "bt2020nc"}
+				args, err := softwareBuilder(unreachable).Video(VideoParams{InputURL: "/media/mistagged.mp4", Rendition: colourRendition(spec, 320, 180), Segments: []domain.Segment{{Index: 0, Start: 0, End: 2, Duration: 2}}, OutputDir: t.TempDir()})
+				if err != nil {
+					t.Errorf("%s/%s/%s: %v", transfer, primaries, format, err)
+					continue
+				}
+				if !slices.Contains(args, "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"+scale) {
+					t.Errorf("%s/%s/%s: job is not a BT.709 retag: %v", transfer, primaries, format, args)
+				}
+			}
+		}
+	}
+}
+
+func TestEightBitHDRSourceTranscodesToTaggedSDR(t *testing.T) {
+	testmedia.Require(t)
+	if _, err := hwaccel.DetectTonemap(context.Background()); err != nil {
+		t.Skipf("tone mapping is unavailable on this host: %v", err)
+	}
+	for name, spec := range eightBitHDRSpecs() {
+		t.Run(name, func(t *testing.T) {
+			spec.Duration = 2
+			input := testmedia.Colour(t, spec)
+			if got := testmedia.Tags(t, input); got.Transfer != spec.Transfer || got.PixelFormat != "yuv420p" {
+				t.Fatalf("fixture is not 8-bit HDR: %+v", got)
+			}
+			dir := t.TempDir()
+			args, err := softwareBuilder(nil).Video(VideoParams{InputURL: input, Rendition: colourRendition(spec, 320, 180), Segments: []domain.Segment{{Index: 0, Start: 0, End: 2, Duration: 2}}, OutputDir: dir})
+			if !slices.ContainsFunc(args, func(arg string) bool { return strings.Contains(arg, "tonemap=tonemap=hable") }) {
+				t.Fatalf("job is not tone mapped: %v", args)
+			}
+			runJob(t, args, err)
+			if got := testmedia.Tags(t, filepath.Join(dir, "segment-00000.ts")); got != sdrTags {
+				t.Fatalf("output colour %+v, want %+v", got, sdrTags)
+			}
+		})
+	}
+}
+
+func TestEightBitPQToneMapDarkensShadowsBelowRetag(t *testing.T) {
+	testmedia.Require(t)
+	if _, err := hwaccel.DetectTonemap(context.Background()); err != nil {
+		t.Skipf("tone mapping is unavailable on this host: %v", err)
+	}
+	for name, primaries := range map[string]string{"bt2020": "bt2020", "unspecified": ""} {
+		t.Run(name, func(t *testing.T) {
+			spec := testmedia.ColourSpec{Width: 320, Height: 180, PixelFormat: "yuv420p", Primaries: primaries, Transfer: "smpte2084", Matrix: "bt2020nc", Range: "tv", Duration: 2, FlatLuma8: 82}
+			input := testmedia.Colour(t, spec)
+			dir := t.TempDir()
+			args, err := softwareBuilder(nil).Video(VideoParams{InputURL: input, Rendition: colourRendition(spec, 320, 180), Segments: []domain.Segment{{Index: 0, Start: 0, End: 2, Duration: 2}}, OutputDir: dir})
+			runJob(t, args, err)
+			mapped := meanLuma(t, filepath.Join(dir, "segment-00000.ts"), "format=gray")
+			retagged := meanLuma(t, input, "format=gray")
+			if mapped <= 16 || mapped >= retagged-5 {
+				t.Fatalf("tone mapped 8-bit 10-nit PQ patch has mean luma %.1f, want above black (16) and clearly below the plain retag %.1f", mapped, retagged)
+			}
+		})
+	}
+}
+
+func TestEightBitToneMapChainMatchesTheExplicitReference(t *testing.T) {
+	testmedia.Require(t)
+	if _, err := hwaccel.DetectTonemap(context.Background()); err != nil {
+		t.Skipf("tone mapping is unavailable on this host: %v", err)
+	}
+	const reference = "zscale=t=linear:npl=100:tin=%s:min=bt2020nc:pin=bt2020:rin=tv%s,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+	for name, spec := range eightBitHDRSpecs() {
+		t.Run(name, func(t *testing.T) {
+			spec.Duration = 1
+			input := testmedia.Colour(t, spec)
+			builder := softwareBuilder(nil)
+			rendition := colourRendition(spec, 320, 180)
+			config, chain, err := builder.pipelineFor(rendition)
+			if err != nil {
+				t.Fatal(err)
+			}
+			linearPrimaries := ""
+			if spec.Primaries == "" {
+				linearPrimaries = ":p=bt2020"
+			}
+			hash := func(filter string) string {
+				out, err := exec.Command("ffmpeg", "-v", "error", "-i", input, "-vf", filter, "-frames:v", "5", "-f", "md5", "-").CombinedOutput()
+				if err != nil {
+					t.Fatalf("hash %s: %v: %s", filter, err, out)
+				}
+				return string(out)
+			}
+			if got, want := hash(videoFilter(config, chain, rendition)), hash(fmt.Sprintf(reference, spec.Transfer, linearPrimaries)); got != want {
+				t.Fatalf("goshl chain %q differs from the explicit reference: %s vs %s", videoFilter(config, chain, rendition), got, want)
+			}
+		})
+	}
+}
+
+func fakeFilters(t *testing.T) context.Context {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncat <<'LIST'\nFilters:\n .S tonemap           V->V       Conversion to/from different dynamic ranges.\n .S zscale            V->V       Apply resizing, colorspace and bit depth conversion.\nLIST\n"
+	if err := os.WriteFile(filepath.Join(dir, "ffmpeg"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return context.Background()
 }
 
 func meanLuma(t *testing.T, path, filter string) float64 {

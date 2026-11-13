@@ -20,6 +20,7 @@ type ColourSpec struct {
 	KeyframeFrames []int
 	Duration       float64
 	FlatLuma10     int
+	FlatLuma8      int
 }
 
 type ColourTags struct {
@@ -42,6 +43,10 @@ func Colour(t testing.TB, spec ColourSpec) string {
 	if spec.FlatLuma10 > 0 {
 		source = fmt.Sprintf("color=c=black:size=%dx%d:rate=%s", base.Width, base.Height, base.FPS)
 		filters = []string{"format=yuv420p10le", fmt.Sprintf("geq=lum=%d:cb=512:cr=512", spec.FlatLuma10)}
+	}
+	if spec.FlatLuma8 > 0 {
+		source = fmt.Sprintf("color=c=black:size=%dx%d:rate=%s", base.Width, base.Height, base.FPS)
+		filters = []string{"format=yuv420p", fmt.Sprintf("geq=lum=%d:cb=128:cr=128", spec.FlatLuma8)}
 	}
 	var tags []string
 	for name, value := range map[string]string{"color_primaries": spec.Primaries, "color_trc": spec.Transfer, "colorspace": spec.Matrix, "range": spec.Range} {

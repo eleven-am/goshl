@@ -17,7 +17,15 @@ func HDRTransfer(transfer string) bool {
 }
 
 func MistaggedHDR(video VideoStream) bool {
-	return HDRTransfer(video.ColorTransfer) && video.BitDepth > 0 && video.BitDepth < 10
+	return HDRTransfer(video.ColorTransfer) && sdrPrimaries(video.ColorPrimaries)
+}
+
+func sdrPrimaries(primaries string) bool {
+	switch primaries {
+	case "bt709", "smpte170m", "bt470bg", "bt470m":
+		return true
+	}
+	return false
 }
 
 func PlanColour(video VideoStream) ColourPlan {

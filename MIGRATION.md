@@ -1,6 +1,13 @@
 # Goshl Migration Guide
 
-This guide covers upgrading to the current release: cache schema `goshl-cache-v5` and job contract version 5. The previous published version is v0.0.25 (cache `goshl-cache-v3`). Between the two, an unpublished intermediate stage used cache v4 and job contract 4, so the guide has two parts. Read both when upgrading from v0.0.25 or earlier.
+This guide covers upgrading to the current release: cache schema `goshl-cache-v5` and job contract version 5. The previous published version is v0.0.25 (cache `goshl-cache-v3`). Between the two, an unpublished intermediate stage used cache v4 and job contract 4, so the guide has two parts. Read both when upgrading from v0.0.25 or earlier. v0.0.27 then moves the cache schema to `goshl-cache-v6`; see the next section.
+
+## v0.0.27: HDR is decided by primaries, not bit depth (cache v6)
+
+- Cache schema is now `goshl-cache-v6`. The job contract version stays 5 and `ColourPlan` is unchanged, so coordinators need no change. The schema is part of the pipeline profile: v5 and v6 replicas never exchange jobs, so roll every replica together. Expect a cold cache: every source is re-probed and re-transcoded once and every generated asset is produced again; remove cold v5 data when operationally safe.
+- A PQ (`smpte2084`) or HLG (`arib-std-b67`) source is now tone mapped at any bit depth, including 8-bit, when its primaries are `bt2020` or are unspecified (assumed BT.2020). v0.0.26 retagged every 8-bit PQ or HLG source as BT.709 without tone mapping, which left genuinely PQ-graded 8-bit files washed out with lifted blacks.
+- A PQ or HLG source whose primaries are `bt709`, `smpte170m`, `bt470bg` or `bt470m` is treated as mis-tagged SDR and retagged BT.709 without tone mapping, at any bit depth. In v0.0.26 a 10-bit source tagged this way was tone mapped.
+- Operational impact: 8-bit PQ or HLG sources with BT.2020 or unspecified primaries now need an `ffmpeg` with `zscale` and `tonemap`. Without it, their `MasterPlaylist` and video `VariantPlaylist` return an error wrapping `ErrTonemapUnavailable`, where v0.0.26 served them retagged. HDR sources are still never direct-streamed.
 
 ## Summary
 
@@ -65,14 +72,14 @@ Besides the digest, a worker refuses a job with an unknown `Method`, a transcode
 ### Runtime requirements
 
 - `ffmpeg` and `ffprobe` 6.1 or newer. The constructor runs both at startup and returns an error wrapping `ErrInvalidOptions` for an older or unrecognised version. Development builds are accepted.
-- For HDR (PQ or HLG) sources, an `ffmpeg` with the `zscale` (libzimg) and `tonemap` filters, for example Homebrew `ffmpeg-full` or `jellyfin-ffmpeg`, the same build on every replica. It is detected on first use, not at startup. Without it, `MasterPlaylist` and the video `VariantPlaylist` of an HDR source return an error wrapping `ErrTonemapUnavailable`. SDR sources are unaffected, and 8-bit sources tagged PQ or HLG are treated as mis-tagged SDR and encoded normally.
+- For HDR (PQ or HLG) sources, an `ffmpeg` with the `zscale` (libzimg) and `tonemap` filters, for example Homebrew `ffmpeg-full` or `jellyfin-ffmpeg`, the same build on every replica. It is detected on first use, not at startup. Without it, `MasterPlaylist` and the video `VariantPlaylist` of an HDR source return an error wrapping `ErrTonemapUnavailable`. SDR sources are unaffected. As of v0.0.27 the HDR decision uses the primaries, not the bit depth (see the v0.0.27 section).
 - The trust model for source URLs is documented in the README: goshl does not restrict hosts, its own range reader follows at most 5 redirects, and FFmpeg follows redirects under its own limits. Inputs are now restricted to container formats with `-format_whitelist`, so a source that is an HLS or ffconcat playlist is rejected.
 
 ### Segment plan
 
 Segments last at most `max(2 x target, 12 s)`. A long keyframe gap is split into equal pieces, the planner cuts early at the previous keyframe to stay under the cap, and a tail sliver shorter than `min(0.5 s, target / 2)` merges into the previous segment. Cuts tolerate rounding noise, so millisecond-rounded MKV keyframes no longer merge segments. Segment counts and indices therefore change for most sources, which is part of why the cache schema changed.
 
-Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the default target). Such sources transcode their source-resolution rung. Direct stream is also not offered for 8-bit H.264 tagged PQ or HLG, and for a video that ends more than 0.5 s before the end of the file.
+Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the default target). Such sources transcode their source-resolution rung. Direct stream is also not offered for H.264 tagged PQ or HLG, and for a video that ends more than 0.5 s before the end of the file.
 
 ### Probe and metadata
 
