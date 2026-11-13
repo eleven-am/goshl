@@ -72,10 +72,18 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 		}
 	}
 
+	if !cutShort {
+		if err := p.confirmAudioEnds(ctx, url, streams); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.measureStreamEnds(ctx, url, streams); err != nil {
 		return nil, err
 	}
 
+	if latest, complete := latestStreamEnd(streams); complete && streamTimings(formatName) == timingMeasured {
+		streams.Duration = math.Max(streams.Duration, latest)
+	}
 	streams.Duration = boundedDuration(streams)
 	if cutShort {
 		clampToVideoEnd(streams)
@@ -233,7 +241,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 	}
 	metadata.Bitrate = parseBitrate(ff.Format.BitRate)
 
-	ends := endReader{formatStart: metadata.StartTime, timestampTags: writtenByLibavformat(ff.Format.Tags)}
+	ends := endReader{formatStart: metadata.StartTime, timestampTags: writtenByLibavformat(ff.Format.Tags), container: streamTimings(ff.Format.FormatName)}
 	videoIndex := selectVideoStream(ff.Streams)
 	for _, s := range ff.Streams {
 		switch s.CodecType {
@@ -391,7 +399,7 @@ func (p *Prober) measureStreamEnds(ctx context.Context, url string, metadata *do
 	}
 
 	tail := math.Max(math.Max(metadata.Duration, metadata.Video.End)-streamEndTail, 0)
-	ends, err := p.probeStreamEnds(budget, url, metadata.StartTime+tail, 0)
+	ends, err := p.probeStreamEnds(budget, url, metadata.StartTime+tail, math.Inf(1))
 	if err != nil {
 		if exhausted() {
 			return nil
@@ -423,11 +431,67 @@ func (p *Prober) measureStreamEnds(ctx context.Context, url string, metadata *do
 	return nil
 }
 
+const audioTailCheck = 2.0
+
+func (p *Prober) confirmAudioEnds(ctx context.Context, url string, metadata *domain.Metadata) error {
+	floor := 0.0
+	if metadata.Video.Codec != "" {
+		if metadata.Video.End <= 0 {
+			return nil
+		}
+		floor = metadata.Video.End + audioTailCheck
+	}
+	latest := 0.0
+	for _, audio := range metadata.Audios {
+		latest = math.Max(latest, audio.End)
+	}
+	if latest <= floor {
+		return nil
+	}
+	budget, stop := context.WithTimeout(ctx, streamEndBudget)
+	defer stop()
+	from := math.Max(latest-streamEndTail, 0)
+	ends, err := p.probeStreamEnds(budget, url, metadata.StartTime+from, math.Inf(1))
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		if errors.Is(budget.Err(), context.DeadlineExceeded) {
+			return nil
+		}
+		ends = nil
+	}
+	cut := false
+	for position := range metadata.Audios {
+		audio := &metadata.Audios[position]
+		if audio.End <= floor || audio.End < from {
+			continue
+		}
+		readable := 0.0
+		if end, found := ends[audio.Index]; found && end > metadata.StartTime {
+			readable = roundMicros(end - metadata.StartTime)
+		}
+		if readable < audio.End-durationSlack {
+			audio.End = readable
+			cut = true
+		}
+	}
+	if !cut {
+		return nil
+	}
+	for position := range metadata.Audios {
+		if audio := &metadata.Audios[position]; audio.End > floor && audio.End < from {
+			audio.End = 0
+		}
+	}
+	return nil
+}
+
 func (p *Prober) searchStreamEnd(ctx context.Context, url string, start float64, index int, absentFrom float64) (float64, error) {
 	alive, absent := 0.0, absentFrom
 	for absent-alive > streamEndTail {
 		middle := (alive + absent) / 2
-		ends, err := p.probeStreamEnds(ctx, url, start+middle, streamEndSample)
+		ends, err := p.probeStreamEnds(ctx, url, start+middle, start+middle+streamEndSample)
 		if err != nil {
 			return 0, err
 		}
@@ -437,7 +501,7 @@ func (p *Prober) searchStreamEnd(ctx context.Context, url string, start float64,
 			absent = middle
 		}
 	}
-	ends, err := p.probeStreamEnds(ctx, url, start+alive, absentFrom-alive+streamEndSample)
+	ends, err := p.probeStreamEnds(ctx, url, start+alive, start+absentFrom+streamEndSample)
 	if err != nil {
 		return 0, err
 	}
@@ -451,10 +515,10 @@ func roundMicros(seconds float64) float64 {
 	return math.Round(seconds*1e6) / 1e6
 }
 
-func streamEndArgs(from, span float64) []string {
+func streamEndArgs(from, until float64) []string {
 	interval := strconv.FormatFloat(from, 'f', 6, 64) + "%"
-	if span > 0 {
-		interval += "+" + strconv.FormatFloat(span, 'f', 6, 64)
+	if !math.IsInf(until, 1) {
+		interval += strconv.FormatFloat(until, 'f', 6, 64)
 	}
 	return []string{
 		"-v", "error",
@@ -464,12 +528,12 @@ func streamEndArgs(from, span float64) []string {
 	}
 }
 
-func (p *Prober) probeStreamEnds(ctx context.Context, url string, from, span float64) (map[int]float64, error) {
+func (p *Prober) probeStreamEnds(ctx context.Context, url string, from, until float64) (map[int]float64, error) {
 	input, err := source.InputArgs(url)
 	if err != nil {
 		return nil, err
 	}
-	args := append(streamEndArgs(from, span), input...)
+	args := append(streamEndArgs(from, until), input...)
 	scanCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	cmd, output, stderr, err := mediaexec.StartOutput(scanCtx, "ffprobe", args...)
@@ -569,7 +633,7 @@ func assignKeyframeBytes(raw []float64, groups []int64, startTime float64, keyfr
 	assigned := make([]int64, len(keyframes))
 	for position, keyframe := range raw {
 		value := keyframe - startTime
-		target := sort.Search(len(keyframes), func(i int) bool { return keyframes[i] > value+0.000001 }) - 1
+		target := sort.Search(len(keyframes), func(i int) bool { return keyframes[i] > value+domain.BoundaryTolerance }) - 1
 		if target < 0 {
 			target = 0
 		}
@@ -598,10 +662,10 @@ func normalizeKeyframes(keyframes []float64, startTime, duration float64) []floa
 	normalized := make([]float64, 0, len(keyframes))
 	for _, keyframe := range keyframes {
 		value := keyframe - startTime
-		if math.Abs(value) < 0.000001 {
+		if math.Abs(value) < domain.BoundaryTolerance {
 			value = 0
 		}
-		if value < 0 || value > duration+0.000001 || math.IsNaN(value) || math.IsInf(value, 0) {
+		if value < 0 || value > duration+domain.BoundaryTolerance || math.IsNaN(value) || math.IsInf(value, 0) {
 			continue
 		}
 		normalized = append(normalized, value)
@@ -609,7 +673,7 @@ func normalizeKeyframes(keyframes []float64, startTime, duration float64) []floa
 	sort.Float64s(normalized)
 	result := normalized[:0]
 	for _, value := range normalized {
-		if len(result) == 0 || math.Abs(result[len(result)-1]-value) > 0.000001 {
+		if len(result) == 0 || math.Abs(result[len(result)-1]-value) > domain.BoundaryTolerance {
 			result = append(result, value)
 		}
 	}
@@ -716,9 +780,30 @@ func statisticsTag(tags map[string]string, name string) string {
 	return ""
 }
 
+type streamTiming int
+
+const (
+	timingDeclared streamTiming = iota
+	timingTagged
+	timingMeasured
+)
+
+func streamTimings(formatName string) streamTiming {
+	for _, name := range strings.Split(formatName, ",") {
+		switch name {
+		case "matroska", "webm":
+			return timingTagged
+		case "mpegts":
+			return timingMeasured
+		}
+	}
+	return timingDeclared
+}
+
 type endReader struct {
 	formatStart   float64
 	timestampTags bool
+	container     streamTiming
 }
 
 func writtenByLibavformat(formatTags map[string]string) bool {
@@ -739,13 +824,18 @@ func (r endReader) streamStart(s ffprobeStream) float64 {
 }
 
 func (r endReader) streamEnd(s ffprobeStream) float64 {
+	if r.container == timingMeasured {
+		return 0
+	}
 	start, startErr := strconv.ParseFloat(s.StartTime, 64)
+	duration, durationErr := strconv.ParseFloat(s.Duration, 64)
+	filled := durationErr == nil && duration > 0
 	end := 0.0
-	if duration, err := strconv.ParseFloat(s.Duration, 64); err == nil && startErr == nil && duration > 0 {
+	if r.container == timingDeclared && filled && startErr == nil {
 		end = start + duration
 	} else if r.timestampTags {
 		end = parseClock(s.Tags["DURATION"])
-	} else if tagged := parseClock(statisticsTag(s.Tags, "DURATION")); tagged > 0 && startErr == nil {
+	} else if tagged := parseClock(statisticsTag(s.Tags, "DURATION")); tagged > 0 && startErr == nil && !filled {
 		end = start + tagged
 	}
 	if end == 0 {
@@ -755,7 +845,7 @@ func (r endReader) streamEnd(s ffprobeStream) float64 {
 	if end <= 0 || math.IsNaN(end) || math.IsInf(end, 0) {
 		return 0
 	}
-	return math.Round(end*1e6) / 1e6
+	return roundMicros(end)
 }
 
 func parseClock(value string) float64 {

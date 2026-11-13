@@ -3,6 +3,7 @@ package mkvindex
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/bits"
@@ -23,6 +24,11 @@ const (
 	maxSubtitleBytes    = 64 << 20
 	frameCountTag       = "NUMBER_OF_FRAMES"
 	subtitleReadWorkers = 8
+	cueingWriter        = "Lavf"
+	leadScanLimit       = 1 << 20
+	maxTopLevelElements = 64
+	elementHeadWindow   = 2 * maxSizeLength
+	leadWalkWindow      = 4 << 10
 )
 
 type SubtitlePacket struct {
@@ -110,6 +116,114 @@ type SubtitleLayout struct {
 	MuxingApp      string
 	TimestampScale uint64
 	Tracks         map[int]SubtitleCandidate
+	CuedFromStart  bool
+}
+
+type clusterLead struct {
+	Timestamp uint64       `ebml:"Timestamp"`
+	Simple    []ebml.Block `ebml:"SimpleBlock"`
+	Groups    []struct {
+		Block ebml.Block `ebml:"Block"`
+	} `ebml:"BlockGroup"`
+}
+
+func (l *SubtitleLayout) Complete(stream int) bool {
+	candidate, found := l.Tracks[stream]
+	if !found {
+		return false
+	}
+	if l.CuedFromStart {
+		return candidate.Complete(l.MuxingApp)
+	}
+	return candidate.Complete("")
+}
+
+func elementHead(data []byte) (uint32, int64, int64, bool) {
+	if len(data) == 0 || data[0] == 0 {
+		return 0, 0, 0, false
+	}
+	idLength := bits.LeadingZeros8(data[0]) + 1
+	if idLength > elementIDLength || len(data) <= idLength || data[idLength] == 0 {
+		return 0, 0, 0, false
+	}
+	var id uint32
+	for _, value := range data[:idLength] {
+		id = id<<8 | uint32(value)
+	}
+	sizeLength := bits.LeadingZeros8(data[idLength]) + 1
+	if len(data) < idLength+sizeLength {
+		return 0, 0, 0, false
+	}
+	length := uint64(data[idLength]) & (0xff >> uint(sizeLength))
+	for _, value := range data[idLength+1 : idLength+sizeLength] {
+		length = length<<8 | uint64(value)
+	}
+	if length == 1<<uint(7*sizeLength)-1 {
+		return id, int64(idLength + sizeLength), -1, true
+	}
+	return id, int64(idLength + sizeLength), int64(length), true
+}
+
+func (c *cursor) peek(position, length int64) []byte {
+	c.pos, c.window, c.end, c.budget, c.failed = position, leadWalkWindow, min(position+length, c.size), 0, nil
+	head := make([]byte, c.end-position)
+	if _, err := io.ReadFull(c, head); err != nil {
+		return nil
+	}
+	return head
+}
+
+func firstCluster(c *cursor, segment int64) (int64, int64, bool) {
+	clusterID := binary.BigEndian.Uint32(ebml.ElementCluster.Bytes())
+	size := c.size
+	position := segment
+	for scanned := 0; scanned < maxTopLevelElements && position < size; scanned++ {
+		id, headLength, length, ok := elementHead(c.peek(position, elementHeadWindow))
+		if !ok {
+			return 0, 0, false
+		}
+		if id == clusterID {
+			return position, position + headLength, true
+		}
+		if length < 0 || length > size-position-headLength {
+			return 0, 0, false
+		}
+		position += headLength + length
+	}
+	return 0, 0, false
+}
+
+func cuedFromStart(r io.ReaderAt, size, cluster, data int64, cues map[uint64][]SubtitleCue) bool {
+	lead := int64(0)
+	for _, list := range cues {
+		for _, cue := range list {
+			if cue.Cluster == cluster && cue.Relative > 0 && (lead == 0 || cue.Relative < lead) {
+				lead = cue.Relative
+			}
+		}
+	}
+	if lead == 0 || lead > leadScanLimit {
+		return false
+	}
+	buffer, err := readWindow(r, size, data, lead)
+	if err != nil || int64(len(buffer)) != lead {
+		return false
+	}
+	var blocks clusterLead
+	if err := ebml.Unmarshal(bytes.NewReader(buffer), &blocks, ebml.WithIgnoreUnknown(true), ebml.WithMaxLeafElementSize(uint64(lead))); err != nil && err != io.EOF {
+		return false
+	}
+	for _, block := range blocks.Simple {
+		if int64(blocks.Timestamp)+int64(block.Timecode) < 0 {
+			return false
+		}
+	}
+	for _, group := range blocks.Groups {
+		if int64(blocks.Timestamp)+int64(group.Block.Timecode) < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 type SubtitleCandidate struct {
@@ -160,6 +274,10 @@ func ReadSubtitleLayout(r io.ReaderAt, size int64) (*SubtitleLayout, error) {
 			}
 		}
 	}
+	cluster, clusterData, clusterFound := int64(0), int64(0), false
+	if strings.HasPrefix(layout.MuxingApp, cueingWriter) {
+		cluster, clusterData, clusterFound = firstCluster(c, segment)
+	}
 	var cueList subtitleCues
 	if err := c.decode(&cueList, positions[ebml.ElementCues], cueWindow, maxCueBytes, maxCueElements); err != nil {
 		return nil, err
@@ -173,6 +291,7 @@ func ReadSubtitleLayout(r io.ReaderAt, size int64) (*SubtitleLayout, error) {
 			byNumber[position.Track] = append(byNumber[position.Track], SubtitleCue{Time: point.Time, Duration: position.Duration, Cluster: segment + int64(position.Cluster), Relative: int64(position.Relative)})
 		}
 	}
+	layout.CuedFromStart = clusterFound && cuedFromStart(r, size, cluster, clusterData, byNumber)
 	stream := 0
 	for _, entry := range trackList.Tracks.Entries {
 		switch entry.Type {
@@ -204,7 +323,7 @@ func (c SubtitleCandidate) Complete(muxingApp string) bool {
 			return false
 		}
 	}
-	return c.FrameCount == len(c.Cues) || strings.HasPrefix(muxingApp, "Lavf")
+	return c.FrameCount == len(c.Cues) || strings.HasPrefix(muxingApp, cueingWriter)
 }
 
 type blockReference struct {

@@ -107,7 +107,7 @@ func CompactMatroska(ctx context.Context, sourceURL string, tracks []Track, dir 
 	candidates := make(map[int]mkvindex.SubtitleCandidate)
 	for _, track := range tracks {
 		candidate, found := layout.Tracks[track.StreamIndex]
-		if found && matroskaCodecMatches(track.Codec, candidate.CodecID) && candidate.Complete(layout.MuxingApp) {
+		if found && matroskaCodecMatches(track.Codec, candidate.CodecID) && layout.Complete(track.StreamIndex) {
 			candidates[track.StreamIndex] = candidate
 		}
 	}

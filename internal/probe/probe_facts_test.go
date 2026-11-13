@@ -216,7 +216,7 @@ func TestStreamEndReadsEachDeclaredShape(t *testing.T) {
 }
 
 func TestProbeUsesStreamDurationWhenFormatDurationMissing(t *testing.T) {
-	fakeFFprobe(t, `{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1280,"height":720,"start_time":"0.500000","duration":"12.000000"},{"index":1,"codec_name":"aac","codec_type":"audio","channels":2,"start_time":"0.500000","duration":"9.000000"}],"format":{"format_name":"mpegts","start_time":"0.500000"}}`, "0.500000,0.040000,K_\n6.500000,0.040000,K_\n12.460000,0.040000,__\n")
+	fakeFFprobe(t, `{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1280,"height":720,"start_time":"0.500000","duration":"12.000000"},{"index":1,"codec_name":"aac","codec_type":"audio","channels":2,"start_time":"0.500000","duration":"9.000000"}],"format":{"format_name":"avi","start_time":"0.500000"}}`, "0.500000,0.040000,K_\n6.500000,0.040000,K_\n12.460000,0.040000,__\n")
 	meta, err := NewProber().Probe(context.Background(), "/input.ts")
 	if err != nil {
 		t.Fatalf("probe: %v", err)

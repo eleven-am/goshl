@@ -196,13 +196,13 @@ func TestProbeKeepsDeclaredAudioEnds(t *testing.T) {
 }
 
 func TestStreamEndReadNeverSelectsAStream(t *testing.T) {
-	for span, want := range map[float64]string{0: "2083.912000%", 5: "2083.912000%+5.000000"} {
-		args := streamEndArgs(2083.912, span)
+	for until, want := range map[float64]string{math.Inf(1): "2083.912000%", 2088.912: "2083.912000%2088.912000"} {
+		args := streamEndArgs(2083.912, until)
 		if slices.Contains(args, "-select_streams") {
 			t.Fatalf("selecting a stream makes a Matroska interval read scan the whole file: %v", args)
 		}
 		if position := slices.Index(args, "-read_intervals"); position < 0 || args[position+1] != want {
-			t.Fatalf("span %.0f: the read interval must be %s: %v", span, want, args)
+			t.Fatalf("until %.3f: the read interval must be %s: %v", until, want, args)
 		}
 		if !slices.Contains(args, "packet=stream_index,pts_time,duration_time") {
 			t.Fatalf("the read must report stream, time and duration per packet: %v", args)
