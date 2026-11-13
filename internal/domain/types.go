@@ -87,6 +87,7 @@ type VideoStream struct {
 	SampleAspect       string
 	Rotation           int
 	Default            bool
+	ClosedCaptions     bool
 	StartsWithKeyframe bool
 	Start              float64
 	End                float64

@@ -195,6 +195,7 @@ type ffprobeStream struct {
 	SAR         string            `json:"sample_aspect_ratio"`
 	Tags        map[string]string `json:"tags"`
 	Disposition ffprobeDisp       `json:"disposition"`
+	ClosedCaps  int               `json:"closed_captions"`
 	SideData    []ffprobeSideData `json:"side_data_list"`
 }
 
@@ -221,7 +222,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 	if err != nil {
 		return nil, "", err
 	}
-	args := append([]string{"-v", "error", "-show_format", "-show_streams", "-of", "json"}, input...)
+	args := append([]string{"-v", "error", "-show_format", "-show_streams", "-analyze_frames", "-read_intervals", "%+#120", "-of", "json"}, input...)
 	output, err := mediaexec.Output(ctx, "ffprobe", args...)
 	if err != nil {
 		return nil, "", err
@@ -269,6 +270,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 					SampleAspect:   s.SAR,
 					Rotation:       rotation,
 					Default:        s.Disposition.Default == 1,
+					ClosedCaptions: s.ClosedCaps == 1,
 					Start:          ends.streamStart(s),
 					End:            ends.streamEnd(s),
 				}

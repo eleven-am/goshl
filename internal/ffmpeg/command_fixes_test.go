@@ -9,9 +9,13 @@ import (
 )
 
 func copyVideoParams(strip bool) VideoParams {
+	return copyVideoParamsWith(strip, false)
+}
+
+func copyVideoParamsWith(stripParameterSets, stripSEI bool) VideoParams {
 	return VideoParams{
 		InputURL:  "input.mp4",
-		Rendition: domain.VideoRendition{Method: domain.DirectStream, Width: 1920, Height: 1080, Bitrate: 8_000_000, StripParameterSets: strip},
+		Rendition: domain.VideoRendition{Method: domain.DirectStream, Width: 1920, Height: 1080, Bitrate: 8_000_000, StripParameterSets: stripParameterSets, StripSEI: stripSEI},
 		Segments:  []domain.Segment{{Index: 5, Start: 30, End: 36}},
 		OutputDir: "/tmp/out",
 		Landing:   landing(29.5),
@@ -29,6 +33,25 @@ func TestVideoCommand_Avc1CopyStripsInBandParameterSets(t *testing.T) {
 	joined = mustArgs(t, args, err)
 	if strings.Contains(joined, "filter_units") || !strings.Contains(joined, "-bsf:v h264_mp4toannexb,dump_extra") {
 		t.Fatalf("other copy sources must keep the plain filter chain: %s", joined)
+	}
+}
+
+func TestVideoCommand_CopyRemovedUnitTypesFollowFlags(t *testing.T) {
+	cases := []struct {
+		parameterSets, sei bool
+		want               string
+	}{
+		{false, false, "-bsf:v h264_mp4toannexb,dump_extra"},
+		{true, false, "-bsf:v filter_units=remove_types=7-8,h264_mp4toannexb,dump_extra"},
+		{false, true, "-bsf:v filter_units=remove_types=6,h264_mp4toannexb,dump_extra"},
+		{true, true, "-bsf:v filter_units=remove_types=6|7-8,h264_mp4toannexb,dump_extra"},
+	}
+	for _, c := range cases {
+		args, err := NewCommandBuilder(testHW).Video(copyVideoParamsWith(c.parameterSets, c.sei))
+		joined := mustArgs(t, args, err)
+		if !strings.Contains(joined, c.want) {
+			t.Fatalf("parameterSets=%v sei=%v: want %q in %s", c.parameterSets, c.sei, c.want, joined)
+		}
 	}
 }
 

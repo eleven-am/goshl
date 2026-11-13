@@ -8,6 +8,7 @@ Output correctness release R2 (cache `goshl-cache-v5`, job contract version 5). 
 - feat(probe): `Metadata.Bitrate`, `VideoStream.End` and `AudioStream.End`; ends are measured from the file tail when undeclared; average frame rate; MKV and WebM keyframes from Matroska Cues; MP4 header I/O errors fail the probe
 - fix(audio): every audio frame belongs to exactly one job at a join (AAC grid-owned cuts, trailing segment for audio jobs, AC-3 passthrough join)
 - fix(video): parameter-set-only access units stripped from copied avc1 segments
+- fix(video): SEI stripped from copied H.264 without closed captions, fixing Safari rejecting sources with an empty SEI
 - fix(playlist): AVERAGE-BANDWIDTH reflects the real mean segment bitrate; HDR sources without zscale fail the master and video variant playlists with ErrTonemapUnavailable
 - fix(colour): 8-bit sources tagged PQ or HLG are treated as mis-tagged SDR
 - feat(colour): all transcodes tagged BT.709 limited range; PQ and HLG sources tone mapped with `zscale` and `tonemap` (an ffmpeg with libzimg is required for HDR); HDR is not direct-streamed

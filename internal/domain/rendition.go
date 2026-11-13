@@ -22,6 +22,7 @@ type VideoRendition struct {
 	Method             PlaybackMethod
 	Colour             ColourPlan
 	StripParameterSets bool
+	StripSEI           bool
 	SourceEnd          float64
 }
 

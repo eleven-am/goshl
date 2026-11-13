@@ -88,6 +88,25 @@ func TestProbe_UsesStreamBitRateBeforeBPSTag(t *testing.T) {
 	}
 }
 
+func TestProbe_ReadsClosedCaptions(t *testing.T) {
+	for _, flag := range []int{0, 1} {
+		tmpDir := t.TempDir()
+		script := strings.Replace(ffprobeClosedCaptionsScript, "CC_FLAG", fmt.Sprint(flag), 1)
+		if err := os.WriteFile(filepath.Join(tmpDir, "ffprobe"), []byte(script), 0755); err != nil {
+			t.Fatalf("failed to write fake ffprobe: %v", err)
+		}
+		t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		meta, err := NewProber().Probe(context.Background(), "file:///input")
+		if err != nil {
+			t.Fatalf("probe returned error: %v", err)
+		}
+		if meta.Video.ClosedCaptions != (flag == 1) {
+			t.Fatalf("closed_captions=%d parsed as %v", flag, meta.Video.ClosedCaptions)
+		}
+	}
+}
+
 func TestProbe_NormalizesNonZeroStartTimeAndSelectsPlayableVideo(t *testing.T) {
 	tmpDir := t.TempDir()
 	script := filepath.Join(tmpDir, "ffprobe")
@@ -224,6 +243,27 @@ fi
 if printf "%s" "$*" | grep -q "show_format"; then
   cat <<'EOF'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"r_frame_rate":"30/1","bit_rate":"4000000","tags":{"BPS":"6000000"}}],"format":{"duration":"12.5"}}
+EOF
+  exit 0
+fi
+
+exit 1
+`
+
+const ffprobeClosedCaptionsScript = `#!/bin/sh
+if printf "%s" "$*" | grep -q "show_entries"; then
+  printf '0.000000,K\n'
+  exit 0
+fi
+
+if printf "%s" "$*" | grep -q "show_format"; then
+  if printf "%s" "$*" | grep -q -e "-analyze_frames"; then
+    cc=CC_FLAG
+  else
+    cc=0
+  fi
+  cat <<EOF
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":1920,"height":1080,"r_frame_rate":"30/1","closed_captions":$cc}],"format":{"duration":"12.5"}}
 EOF
   exit 0
 fi

@@ -168,6 +168,17 @@ func TestDirectAverageUsesStreamBitrateAndStripsAvc1ParameterSets(t *testing.T) 
 	}
 }
 
+func TestDirectStripsSEIOnlyWithoutClosedCaptions(t *testing.T) {
+	source := directSource()
+	if !mustVideo(t, source)[0].StripSEI {
+		t.Fatalf("direct rung without captions must strip SEI")
+	}
+	source.ClosedCaptions = true
+	if mustVideo(t, source)[0].StripSEI {
+		t.Fatalf("direct rung carrying closed captions must keep SEI")
+	}
+}
+
 func TestAudioAverageBandwidth(t *testing.T) {
 	encoded := audioAverageBandwidth(128_000, 48000, domain.Transcode)
 	if encoded <= 128_000 || encoded >= audioPeakBandwidth(128_000, 48000, domain.Transcode) {

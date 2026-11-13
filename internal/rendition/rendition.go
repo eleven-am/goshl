@@ -129,6 +129,7 @@ func directRendition(video domain.VideoStream, bitrate int) domain.VideoRenditio
 		Level:              video.Level,
 		Method:             domain.DirectStream,
 		StripParameterSets: video.CodecTag == "avc1",
+		StripSEI:           !video.ClosedCaptions,
 	}
 }
 

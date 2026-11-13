@@ -175,8 +175,15 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 		}
 		timeline.reference = *p.Landing
 		filters := "h264_mp4toannexb,dump_extra"
+		var removed []string
+		if p.Rendition.StripSEI {
+			removed = append(removed, "6")
+		}
 		if p.Rendition.StripParameterSets {
-			filters = "filter_units=remove_types=7-8," + filters
+			removed = append(removed, "7-8")
+		}
+		if len(removed) > 0 {
+			filters = "filter_units=remove_types=" + strings.Join(removed, "|") + "," + filters
 		}
 		timeline.encodeArgs = []string{"-c:v", "copy", "-bsf:v", filters}
 		if p.Trailing != nil {
