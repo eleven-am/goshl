@@ -131,8 +131,8 @@ func TestAudioCommand_TranscodeAndCopy(t *testing.T) {
 	if !strings.Contains(joined, "-c:a aac") || !strings.Contains(joined, "-ac 2") || !strings.Contains(joined, "-b:a 192000") || !strings.Contains(joined, "-ar 48000") {
 		t.Fatalf("transcode audio args missing: %s", joined)
 	}
-	if !strings.Contains(joined, "-segment_times 5.021333 ") {
-		t.Fatalf("audio cut must be measured from the priming packet one frame before the seek: %s", joined)
+	if !strings.Contains(joined, "-segment_times 5.024000 ") {
+		t.Fatalf("audio cut must sit half a frame before the owning frame, measured from the priming packet: %s", joined)
 	}
 	if !strings.Contains(joined, "-to 10.000000") || strings.Contains(joined, "-t 10.000000") {
 		t.Fatalf("audio should clip at the absolute end time, got %s", joined)
@@ -186,7 +186,7 @@ func TestAACJobSeeksOnTheFrameGrid(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse cut: %v", err)
 		}
-		if want := boundary - (seek - frame); math.Abs(got-want) > 0.000002 {
+		if want := aacCutTime(boundary) - (seek - frame); math.Abs(got-want) > 0.000002 {
 			t.Fatalf("cut %d is %.6f, want %.6f measured from the priming packet", index, got, want)
 		}
 	}

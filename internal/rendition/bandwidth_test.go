@@ -131,3 +131,50 @@ func TestAudioRenditionsAdvertisePeakBandwidth(t *testing.T) {
 		}
 	}
 }
+
+func TestMeanTransportRateModel(t *testing.T) {
+	got := meanTransportRate(125_000, 24)
+	want := int(math.Ceil((125_000.0*188/184 + 24*120 + 4700) * 8))
+	if got != want {
+		t.Fatalf("mean rate %d, want %d", got, want)
+	}
+}
+
+func TestEncodedAverageStaysBelowPeak(t *testing.T) {
+	renditions := mustVideo(t, directSource())
+	for _, rendition := range renditions {
+		if rendition.AverageBandwidth <= rendition.Bitrate {
+			t.Errorf("%s average %d does not include transport overhead over %d", rendition.Name, rendition.AverageBandwidth, rendition.Bitrate)
+		}
+		if rendition.AverageBandwidth > rendition.PeakBandwidth {
+			t.Errorf("%s average %d exceeds peak %d", rendition.Name, rendition.AverageBandwidth, rendition.PeakBandwidth)
+		}
+	}
+}
+
+func TestDirectAverageUsesStreamBitrateAndStripsAvc1ParameterSets(t *testing.T) {
+	source := directSource()
+	source.CodecTag = "avc1"
+	direct := mustVideo(t, source)[0]
+	if direct.Method != domain.DirectStream || !direct.StripParameterSets {
+		t.Fatalf("avc1 direct rung %+v must strip parameter sets", direct)
+	}
+	if want := encodedAverageBandwidth(direct); direct.AverageBandwidth != min(want, direct.PeakBandwidth) {
+		t.Fatalf("direct average %d, want %d", direct.AverageBandwidth, want)
+	}
+	source.CodecTag = "avc3"
+	if mustVideo(t, source)[0].StripParameterSets {
+		t.Fatalf("avc3 source must keep in-band parameter sets")
+	}
+}
+
+func TestAudioAverageBandwidth(t *testing.T) {
+	encoded := audioAverageBandwidth(128_000, 48000, domain.Transcode)
+	if encoded <= 128_000 || encoded >= audioPeakBandwidth(128_000, 48000, domain.Transcode) {
+		t.Fatalf("encoded audio average %d outside (bitrate, peak)", encoded)
+	}
+	direct := audioAverageBandwidth(384_000, 48000, domain.DirectStream)
+	if direct <= 384_000 {
+		t.Fatalf("direct audio average %d must exceed payload bitrate", direct)
+	}
+}

@@ -5,6 +5,7 @@ import (
 
 	"github.com/eleven-am/goshl/internal/coordination"
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/hwaccel"
 	"github.com/eleven-am/goshl/internal/source"
 )
 
@@ -21,6 +22,8 @@ var (
 )
 
 var ErrEnqueueRejected = domain.ErrEnqueueRejected
+
+var ErrTonemapUnavailable = hwaccel.ErrTonemapUnavailable
 
 var ErrUnsupportedSource = source.ErrUnsupportedSource
 

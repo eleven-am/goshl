@@ -16,6 +16,7 @@ func TestDirectStreamRejectsHDRTransfer(t *testing.T) {
 	}
 	for _, transfer := range []string{"smpte2084", "arib-std-b67"} {
 		source := eligibleSource()
+		source.BitDepth = 10
 		source.ColorTransfer = transfer
 		for _, rendition := range mustVideo(t, source) {
 			if rendition.Method != domain.Transcode {
@@ -23,6 +24,21 @@ func TestDirectStreamRejectsHDRTransfer(t *testing.T) {
 			}
 			if !rendition.Colour.Tonemap {
 				t.Errorf("%s source rendition %s is not tone mapped", transfer, rendition.Name)
+			}
+		}
+	}
+}
+
+func TestEightBitHDRTransferIsRetaggedNotToneMapped(t *testing.T) {
+	for _, transfer := range []string{"smpte2084", "arib-std-b67"} {
+		source := eligibleSource()
+		source.ColorTransfer = transfer
+		for _, rendition := range mustVideo(t, source) {
+			if rendition.Method != domain.Transcode {
+				t.Errorf("%s source rendition %s uses %s, want transcode", transfer, rendition.Name, rendition.Method)
+			}
+			if rendition.Colour != (domain.ColourPlan{Retag: true}) {
+				t.Errorf("%s source rendition %s colour %+v, want retag only", transfer, rendition.Name, rendition.Colour)
 			}
 		}
 	}

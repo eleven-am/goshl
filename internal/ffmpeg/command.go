@@ -37,7 +37,7 @@ const (
 var (
 	ErrNoSegments           = errors.New("job has no segments")
 	ErrLandingRequired      = errors.New("stream copy requires a measured seek landing")
-	ErrTrailingNotSupported = errors.New("trailing segment is only supported for copied video")
+	ErrTrailingNotSupported = errors.New("trailing segment is only supported for copied video or audio")
 	ErrTrailingNotAdjacent  = errors.New("trailing segment does not follow the last segment")
 	ErrOverlapNotAdjacent   = errors.New("overlap segment does not precede the first segment")
 	ErrRenditionIncomplete  = errors.New("transcode rendition lacks encoder facts")
@@ -100,6 +100,7 @@ type AudioParams struct {
 	Rendition   domain.AudioRendition
 	Segments    []domain.Segment
 	Overlap     *domain.Segment
+	Trailing    *domain.Segment
 	Landing     *float64
 	OutputDir   string
 }
@@ -173,7 +174,11 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 			return nil, ErrLandingRequired
 		}
 		timeline.reference = *p.Landing
-		timeline.encodeArgs = []string{"-c:v", "copy", "-bsf:v", "h264_mp4toannexb,dump_extra"}
+		filters := "h264_mp4toannexb,dump_extra"
+		if p.Rendition.StripParameterSets {
+			filters = "filter_units=remove_types=7-8," + filters
+		}
+		timeline.encodeArgs = []string{"-c:v", "copy", "-bsf:v", filters}
 		if p.Trailing != nil {
 			timeline.cuts = append(timeline.cuts, p.Trailing.Start)
 			timeline.end = math.Min(p.Trailing.End, p.Trailing.Start+trailingGuardSeconds)
@@ -213,6 +218,9 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if p.Trailing != nil && !domain.Adjacent(last, *p.Trailing) {
+		return nil, ErrTrailingNotAdjacent
+	}
 	input, err := source.InputArgs(p.InputURL)
 	if err != nil {
 		return nil, err
@@ -229,6 +237,11 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 		timeDelta:   audioSegmentTimeDelta,
 		only:        audioOnlyArgs,
 	}
+	if p.Trailing != nil {
+		timeline.cuts = append(timeline.cuts, p.Trailing.Start)
+		timeline.end = math.Min(p.Trailing.End, p.Trailing.Start+trailingGuardSeconds)
+	}
+	jobEnd := timeline.end
 
 	coverage := audioCoverageOf(p.Rendition, first, last)
 	if p.Rendition.Method == domain.DirectStream {
@@ -249,7 +262,7 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 		}
 		if coverage == audioPadded {
 			timeline.inputFlags = []string{"-noaccurate_seek", "-flags2", "+skip_manual"}
-			timeline.end = last.End - math.Min(*p.Landing, 0)
+			timeline.end = jobEnd - math.Min(*p.Landing, 0)
 			timeline.encodeArgs = append(timeline.encodeArgs, "-af", "apad")
 			return timeline.args(), nil
 		}
@@ -261,6 +274,9 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 	}
 
 	frames := int64(math.Floor(first.Start * aacSampleRate / aacFrameSamples))
+	for position, cut := range timeline.cuts {
+		timeline.cuts[position] = aacCutTime(cut)
+	}
 	timeline.seek = float64(frames*aacFrameSamples) / aacSampleRate
 	timeline.reference = float64((frames-1)*aacFrameSamples) / aacSampleRate
 	timeline.encodeArgs = []string{
@@ -275,6 +291,18 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 	}
 	timeline.encodeArgs = append(timeline.encodeArgs, "-af", fmt.Sprintf("aresample=%d,aresample=%d:first_pts=%d,apad", aacSampleRate, aacSampleRate, frames*aacFrameSamples))
 	return timeline.args(), nil
+}
+
+func aacOwnerFrame(boundary float64) int64 {
+	owned := (micros(boundary)-1)*aacSampleRate + aacFrameSamples*1000000 - 1
+	if owned < 0 {
+		return 0
+	}
+	return owned / (aacFrameSamples * 1000000)
+}
+
+func aacCutTime(boundary float64) float64 {
+	return (float64(aacOwnerFrame(boundary)) - 0.5) * aacFrameSamples / aacSampleRate
 }
 
 func sourceSampleRate(rendition domain.AudioRendition) int {
@@ -521,6 +549,9 @@ func videoFilter(config *domain.HWAccelConfig, chain string, rendition domain.Vi
 	var filters []string
 	if !config.DeviceFrames {
 		var assumed []string
+		if rendition.Colour.Retag {
+			assumed = append(assumed, "color_primaries=bt709", "color_trc=bt709", "colorspace=bt709")
+		}
 		if rendition.Colour.AssumePrimaries != "" {
 			assumed = append(assumed, "color_primaries="+rendition.Colour.AssumePrimaries)
 		}
@@ -547,6 +578,9 @@ func transcodeVideoArgs(config *domain.HWAccelConfig, tail, chain string, rendit
 	}
 
 	args := append([]string(nil), config.EncodeFlags...)
+	if rendition.Colour.Retag {
+		args = append(args, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
+	}
 	return append(args,
 		"-vf", strings.TrimPrefix(tail+","+videoFilter(config, chain, rendition), ","),
 		"-profile:v", "high",

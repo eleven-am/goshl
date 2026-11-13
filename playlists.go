@@ -25,6 +25,14 @@ func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (stri
 	if err != nil {
 		return "", fmt.Errorf("master playlist: %w", err)
 	}
+	for _, video := range videos {
+		if video.Colour.Tonemap {
+			if err := c.tonemap.check(ctx); err != nil {
+				return "", fmt.Errorf("master playlist: %w", err)
+			}
+			break
+		}
+	}
 	audios := rendition.GenerateAudioTracks(meta.Audios)
 
 	subtitles := convertibleSubtitles(meta.Subtitles)
@@ -67,8 +75,14 @@ func (c *Controller) VariantPlaylist(ctx context.Context, sourceURL string, stre
 	}
 
 	segments := playlist.CalculateSegments(meta.Keyframes, meta.Duration, c.opts.TargetDuration)
-	if _, _, err := c.resolveRendition(meta, streamType, renditionName); err != nil {
+	video, _, err := c.resolveRendition(meta, streamType, renditionName)
+	if err != nil {
 		return "", err
+	}
+	if video != nil && video.Colour.Tonemap {
+		if err := c.tonemap.check(ctx); err != nil {
+			return "", fmt.Errorf("variant playlist: %w", err)
+		}
 	}
 
 	out, err := c.playlist.Variant(sourceURL, renditionName, streamType, segments)

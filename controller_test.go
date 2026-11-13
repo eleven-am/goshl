@@ -1433,11 +1433,14 @@ func TestBuildJobOverlapAndTrailingRules(t *testing.T) {
 		if job.Overlap == nil || *job.Overlap != segments[0] {
 			t.Fatalf("%s must carry the preceding segment as overlap, got %+v", audio.Name, job.Overlap)
 		}
-		if job.Trailing != nil {
-			t.Fatalf("%s must not carry a trailing segment, got %+v", audio.Name, job.Trailing)
+		if job.Trailing == nil || *job.Trailing != segments[3] {
+			t.Fatalf("%s must carry the following segment as trailing, got %+v", audio.Name, job.Trailing)
 		}
-		if start := build(StreamAudio, nil, &audio, 0, 1); start.Overlap != nil || start.Trailing != nil {
-			t.Fatalf("%s from segment 0 has no neighbours, got %+v / %+v", audio.Name, start.Overlap, start.Trailing)
+		if start := build(StreamAudio, nil, &audio, 0, 1); start.Overlap != nil || start.Trailing == nil || *start.Trailing != segments[2] {
+			t.Fatalf("%s from segment 0 has no overlap but a trailing segment, got %+v / %+v", audio.Name, start.Overlap, start.Trailing)
+		}
+		if end := build(StreamAudio, nil, &audio, 2, 3); end.Overlap == nil || end.Trailing != nil {
+			t.Fatalf("%s ending at the last segment has no trailing segment, got %+v / %+v", audio.Name, end.Overlap, end.Trailing)
 		}
 	}
 }

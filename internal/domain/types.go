@@ -71,6 +71,7 @@ type Metadata struct {
 type VideoStream struct {
 	Index              int
 	Codec              string
+	CodecTag           string
 	Profile            string
 	Level              int
 	PixelFormat        string

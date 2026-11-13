@@ -173,6 +173,7 @@ type ffprobeStream struct {
 	Index       int               `json:"index"`
 	CodecName   string            `json:"codec_name"`
 	CodecType   string            `json:"codec_type"`
+	CodecTag    string            `json:"codec_tag_string"`
 	Width       int               `json:"width"`
 	Height      int               `json:"height"`
 	Profile     string            `json:"profile"`
@@ -252,6 +253,7 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 				metadata.Video = domain.VideoStream{
 					Index:          s.Index,
 					Codec:          s.CodecName,
+					CodecTag:       s.CodecTag,
 					Profile:        s.Profile,
 					Level:          s.Level,
 					PixelFormat:    s.PixelFormat,

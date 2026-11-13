@@ -560,6 +560,18 @@ func TestProbe_ReportsVideoStartAndAudioSampleRate(t *testing.T) {
 	}
 }
 
+func TestProbe_ReportsVideoCodecTag(t *testing.T) {
+	testmedia.Require(t)
+	path := testmedia.H264(t, testmedia.Spec{Container: "mp4", Duration: 2})
+	meta, err := NewProber().Probe(context.Background(), path)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if meta.Video.CodecTag != "avc1" {
+		t.Errorf("CodecTag = %q, want avc1", meta.Video.CodecTag)
+	}
+}
+
 func sumBytes(values []int64) int64 {
 	var total int64
 	for _, value := range values {

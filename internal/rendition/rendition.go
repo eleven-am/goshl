@@ -68,12 +68,14 @@ func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.Vide
 	if direct {
 		renditions = append(renditions, directRendition(video, topBitrate))
 		renditions[0].PeakBandwidth = directPeakBandwidth(meta, window)
+		renditions[0].AverageBandwidth = min(encodedAverageBandwidth(renditions[0]), renditions[0].PeakBandwidth)
 	} else if top, err := transcodedRendition(width, height, topBitrate, video.FrameRate); err != nil {
 		dropped = append(dropped, Dropped{Name: rungName(width, height), Reason: err.Error()})
 	} else {
 		top.Colour = colour
 		top.SourceEnd = sourceEnd
 		top.PeakBandwidth = encodedPeakBandwidth(top, window)
+		top.AverageBandwidth = encodedAverageBandwidth(top)
 		renditions = append(renditions, top)
 	}
 
@@ -93,6 +95,7 @@ func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.Vide
 		candidate.Colour = colour
 		candidate.SourceEnd = sourceEnd
 		candidate.PeakBandwidth = encodedPeakBandwidth(candidate, window)
+		candidate.AverageBandwidth = encodedAverageBandwidth(candidate)
 		renditions = append(renditions, candidate)
 		ceiling = bitrate
 	}
@@ -116,15 +119,16 @@ func videoEndBeforePlan(meta *domain.Metadata) float64 {
 
 func directRendition(video domain.VideoStream, bitrate int) domain.VideoRendition {
 	return domain.VideoRendition{
-		Name:        rungName(video.Width, video.Height),
-		Width:       video.Width,
-		Height:      video.Height,
-		Bitrate:     bitrate,
-		PeakBitrate: peakBitrate(bitrate),
-		FrameRate:   video.FrameRate,
-		Codec:       sourceVideoCodecString(video),
-		Level:       video.Level,
-		Method:      domain.DirectStream,
+		Name:               rungName(video.Width, video.Height),
+		Width:              video.Width,
+		Height:             video.Height,
+		Bitrate:            bitrate,
+		PeakBitrate:        peakBitrate(bitrate),
+		FrameRate:          video.FrameRate,
+		Codec:              sourceVideoCodecString(video),
+		Level:              video.Level,
+		Method:             domain.DirectStream,
+		StripParameterSets: video.CodecTag == "avc1",
 	}
 }
 
@@ -285,19 +289,20 @@ func audioRendition(name, codec string, bitrate, channels int, method domain.Pla
 	}
 
 	return domain.AudioRendition{
-		Name:          name,
-		Codec:         codec,
-		CodecString:   audioCodecString(codec),
-		Bitrate:       bitrate,
-		PeakBandwidth: audioPeakBandwidth(bitrate, audio.SampleRate, method),
-		Channels:      channels,
-		Method:        method,
-		StreamIndex:   streamIndex,
-		Language:      audio.Language,
-		Title:         audio.Title,
-		Default:       isDefault,
-		SourceEnd:     audio.End,
-		SampleRate:    audio.SampleRate,
+		Name:             name,
+		Codec:            codec,
+		CodecString:      audioCodecString(codec),
+		Bitrate:          bitrate,
+		PeakBandwidth:    audioPeakBandwidth(bitrate, audio.SampleRate, method),
+		AverageBandwidth: audioAverageBandwidth(bitrate, audio.SampleRate, method),
+		Channels:         channels,
+		Method:           method,
+		StreamIndex:      streamIndex,
+		Language:         audio.Language,
+		Title:            audio.Title,
+		Default:          isDefault,
+		SourceEnd:        audio.End,
+		SampleRate:       audio.SampleRate,
 	}
 }
 

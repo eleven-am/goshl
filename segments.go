@@ -358,7 +358,7 @@ func (c *Controller) buildJob(runID string, startBy time.Time, sourceURL, mediaK
 		value := allSegments[startIdx-1]
 		overlap = &value
 	}
-	if copiedVideo && endIdx+1 < len(allSegments) {
+	if (copiedVideo || streamType == domain.StreamAudio) && endIdx+1 < len(allSegments) {
 		value := allSegments[endIdx+1]
 		trailing = &value
 	}

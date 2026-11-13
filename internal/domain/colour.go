@@ -7,6 +7,7 @@ const (
 
 type ColourPlan struct {
 	Tonemap         bool
+	Retag           bool
 	AssumeMatrix    string
 	AssumePrimaries string
 }
@@ -15,7 +16,14 @@ func HDRTransfer(transfer string) bool {
 	return transfer == TransferPQ || transfer == TransferHLG
 }
 
+func MistaggedHDR(video VideoStream) bool {
+	return HDRTransfer(video.ColorTransfer) && video.BitDepth > 0 && video.BitDepth < 10
+}
+
 func PlanColour(video VideoStream) ColourPlan {
+	if MistaggedHDR(video) {
+		return ColourPlan{Retag: true}
+	}
 	plan := ColourPlan{Tonemap: HDRTransfer(video.ColorTransfer)}
 	if plan.Tonemap {
 		if untagged(video.ColorSpace) {

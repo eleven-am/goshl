@@ -31,7 +31,7 @@ A coordinator must serialize and restore every field below without rounding, rec
 - `Segments`: exact boundaries (`Index`, `Start`, `End`, `Duration`, all float64 seconds). Do not round them: adjacency between segments is compared with a tolerance of 1e-6 seconds.
 - `EnqueuedAt`, `StartBy`: `StartBy` is the latest moment a worker may begin the job.
 - `Overlap`: the segment before the first one. Set for audio jobs and for copied-video jobs that do not start at segment 0. A coordinator that drops it breaks the join between jobs.
-- `Trailing`: one segment after the last one, for copied video only.
+- `Trailing`: one segment after the last one, for copied video and for audio jobs.
 - `VideoStreamIndex`: the source video stream the worker encodes.
 - `Digest`: a SHA-256 hex string over every other job field except `EnqueuedAt` and `StartBy`, set by the producer. Carry it unchanged. The two times are excluded, so they may be stored at any precision or in any zone.
 - `VideoRendition`, `AudioRendition`: see below.
@@ -65,7 +65,7 @@ Besides the digest, a worker refuses a job with an unknown `Method`, a transcode
 ### Runtime requirements
 
 - `ffmpeg` and `ffprobe` 6.1 or newer. The constructor runs both at startup and returns an error wrapping `ErrInvalidOptions` for an older or unrecognised version. Development builds are accepted.
-- For HDR (PQ or HLG) sources, an `ffmpeg` with the `zscale` (libzimg) and `tonemap` filters, for example Homebrew `ffmpeg-full` or `jellyfin-ffmpeg`, the same build on every replica. It is detected on first use, not at startup. Without it, the HDR renditions of that source fail explicitly. SDR sources are unaffected.
+- For HDR (PQ or HLG) sources, an `ffmpeg` with the `zscale` (libzimg) and `tonemap` filters, for example Homebrew `ffmpeg-full` or `jellyfin-ffmpeg`, the same build on every replica. It is detected on first use, not at startup. Without it, `MasterPlaylist` and the video `VariantPlaylist` of an HDR source return an error wrapping `ErrTonemapUnavailable`. SDR sources are unaffected, and 8-bit sources tagged PQ or HLG are treated as mis-tagged SDR and encoded normally.
 - The trust model for source URLs is documented in the README: goshl does not restrict hosts, its own range reader follows at most 5 redirects, and FFmpeg follows redirects under its own limits. Inputs are now restricted to container formats with `-format_whitelist`, so a source that is an HLS or ffconcat playlist is rejected.
 
 ### Segment plan
@@ -89,6 +89,9 @@ Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the de
 ### Video and audio output
 
 - Software transcodes use libx264 `superfast` instead of `ultrafast`. Output is High profile as advertised (previously Constrained Baseline). Expect about 1.5 times the CPU per software video job.
+- Audio jobs carry a trailing segment and cut AAC on its frame grid, so each audio frame belongs to exactly one job at every join (previously a frame could repeat at a boundary just above the grid, and AC-3 passthrough could drop one).
+- Copied H.264 segments from MP4 sources (`avc1`) have trailing parameter-set-only access units removed; decoded frames are unchanged.
+- `AVERAGE-BANDWIDTH` is the mean segment bitrate including transport overhead, not the nominal encoder bitrate.
 - All transcodes are tagged BT.709 limited range. Untagged sources are assumed BT.709 (1280 pixels wide or more, or over 576 lines) or SMPTE 170M. Full-range sources are converted instead of being emitted as `yuvj420p`. HDR sources are tone mapped with `zscale` and `tonemap`.
 - Transcoded audio from sources that are not 48 kHz (44.1 kHz, 32 kHz) now joins frame-exactly across jobs. Previously every job after the first started late and long sources failed.
 - Sources whose video starts after the container start are cut on the plan. Every job's output is validated against its expected segment times, and a mismatch fails the job instead of caching misplaced segments.

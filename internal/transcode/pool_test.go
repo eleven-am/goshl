@@ -243,11 +243,21 @@ func TestValidateJobNeighbourRules(t *testing.T) {
 		t.Fatalf("audio with an adjacent overlap must be valid: %v", err)
 	}
 
+	withTrailing := base(domain.StreamAudio)
+	withTrailing.Trailing = &trailing
+	if err := audio.validateJob(sealed(withTrailing)); err != nil {
+		t.Fatalf("audio with an adjacent trailing segment must be valid: %v", err)
+	}
+
 	rejected := map[string]struct {
 		pool *Pool
 		job  func() domain.Job
 	}{
-		"audio trailing": {audio, func() domain.Job { job := base(domain.StreamAudio); job.Trailing = &trailing; return job }},
+		"audio trailing wrong index": {audio, func() domain.Job {
+			job := base(domain.StreamAudio)
+			job.Trailing = &domain.Segment{Index: 3, Start: 12, End: 18, Duration: 6}
+			return job
+		}},
 		"transcoded video trailing": {video, func() domain.Job {
 			job := base(domain.StreamVideo)
 			job.VideoRendition = &domain.VideoRendition{Name: "r", Method: domain.Transcode}

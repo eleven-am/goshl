@@ -2,7 +2,9 @@ package goshl
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/eleven-am/goshl/internal/coordination"
@@ -29,6 +31,32 @@ type Controller struct {
 	pipelineVersion string
 	flights         *flightRegistry
 	lifecycle       *coordination.Lifecycle
+	tonemap         tonemapCapability
+}
+
+type tonemapCapability struct {
+	mu     sync.Mutex
+	known  bool
+	err    error
+	detect func(context.Context) (string, error)
+}
+
+func (t *tonemapCapability) check(ctx context.Context) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.known {
+		return t.err
+	}
+	detect := t.detect
+	if detect == nil {
+		detect = hwaccel.DetectTonemap
+	}
+	_, err := detect(ctx)
+	if err == nil || errors.Is(err, hwaccel.ErrTonemapUnavailable) {
+		t.known = true
+		t.err = err
+	}
+	return err
 }
 
 func NewController(opts Options) *Controller {

@@ -356,6 +356,7 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 			Rendition:   *job.AudioRendition,
 			Segments:    segments,
 			Overlap:     job.Overlap,
+			Trailing:    job.Trailing,
 			OutputDir:   tmpDir,
 		}
 		if job.AudioRendition.Method == domain.DirectStream {
@@ -525,7 +526,7 @@ func (p *Pool) validateJob(job domain.Job) error {
 	}
 	if job.Trailing != nil {
 		last := job.Segments[len(job.Segments)-1]
-		if !copiedVideo || !domain.Adjacent(last, *job.Trailing) {
+		if !copiedVideo && p.streamType != domain.StreamAudio || !domain.Adjacent(last, *job.Trailing) {
 			return fmt.Errorf("invalid job contract: trailing is inconsistent")
 		}
 	}

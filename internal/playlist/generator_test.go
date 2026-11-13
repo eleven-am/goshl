@@ -811,3 +811,26 @@ func TestMasterAudioOnlyBandwidthUsesPeakBandwidth(t *testing.T) {
 		t.Fatalf("BANDWIDTH=%d AVERAGE=%d\n%s", variant.Bandwidth, variant.AverageBandwidth, parsed.raw)
 	}
 }
+
+func TestMasterAverageBandwidthUsesAverageFacts(t *testing.T) {
+	video := video1080()
+	video.AverageBandwidth = 4_200_000
+	audios := twoTrackAudio()[:2]
+	audios[0].AverageBandwidth = 100_000
+	audios[1].AverageBandwidth = 120_000
+	parsed := parseMaster(t, buildMaster(t, []domain.VideoRendition{video}, audios, nil))
+	variant := variantByURI(t, parsed, "/media/video/1080p/playlist.m3u8", "audio-mp4a-40-2-2")
+	if want := uint32(4_200_000 + 120_000); variant.AverageBandwidth != want {
+		t.Fatalf("AVERAGE-BANDWIDTH = %d, want %d", variant.AverageBandwidth, want)
+	}
+}
+
+func TestMasterAudioOnlyAverageBandwidthUsesAverageFacts(t *testing.T) {
+	audios := twoTrackAudio()[:2]
+	audios[0].AverageBandwidth = 100_000
+	audios[1].AverageBandwidth = 120_000
+	parsed := parseMaster(t, buildMaster(t, nil, audios, nil))
+	if variant := parsed.playlist.Variants[0]; variant.AverageBandwidth != 120_000 {
+		t.Fatalf("AVERAGE=%d\n%s", variant.AverageBandwidth, parsed.raw)
+	}
+}

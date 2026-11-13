@@ -49,13 +49,14 @@ type audioMember struct {
 }
 
 type audioGroup struct {
-	ID            string
-	Codec         string
-	Channels      int
-	Codecs        []string
-	MaxBandwidth  int
-	PeakBandwidth int
-	Members       []audioMember
+	ID               string
+	Codec            string
+	Channels         int
+	Codecs           []string
+	MaxBandwidth     int
+	PeakBandwidth    int
+	AverageBandwidth int
+	Members          []audioMember
 }
 
 type subtitleMember struct {
@@ -225,6 +226,9 @@ func audioGroups(tracks []*audioTrack) ([]audioGroup, error) {
 			if rendition.Bitrate > group.MaxBandwidth {
 				group.MaxBandwidth = rendition.Bitrate
 			}
+			if average := audioAverage(rendition); average > group.AverageBandwidth {
+				group.AverageBandwidth = average
+			}
 			if peak := audioPeak(rendition); peak > group.PeakBandwidth {
 				group.PeakBandwidth = peak
 			}
@@ -238,6 +242,13 @@ func audioGroups(tracks []*audioTrack) ([]audioGroup, error) {
 		groups = append(groups, *group)
 	}
 	return groups, nil
+}
+
+func audioAverage(audio domain.AudioRendition) int {
+	if audio.AverageBandwidth > 0 {
+		return audio.AverageBandwidth
+	}
+	return audio.Bitrate
 }
 
 func audioPeak(audio domain.AudioRendition) int {
@@ -372,7 +383,11 @@ func variantAttributes(group audioGroup, hasSubtitles bool) string {
 }
 
 func writeVideoVariant(b *strings.Builder, pathGen domain.PathGenerator, sourceURL string, video domain.VideoRendition, group audioGroup, hasSubtitles bool) {
-	average := video.Bitrate + group.MaxBandwidth
+	average := video.AverageBandwidth
+	if average <= 0 {
+		average = video.Bitrate
+	}
+	average += group.AverageBandwidth
 	peak := video.PeakBandwidth
 	if peak <= 0 {
 		peak = video.PeakBitrate
@@ -408,7 +423,7 @@ func writeAudioVariant(b *strings.Builder, pathGen domain.PathGenerator, sourceU
 	}
 	b.WriteString(fmt.Sprintf(
 		"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=%d,BANDWIDTH=%d,CODECS=\"%s\"%s\n",
-		group.MaxBandwidth,
+		group.AverageBandwidth,
 		group.PeakBandwidth,
 		escapeAttribute(strings.Join(group.Codecs, ",")),
 		variantAttributes(group, hasSubtitles),

@@ -12,6 +12,7 @@ const (
 	transportPacketBytes  = 188
 	transportPayloadBytes = 184
 	transportFrameBytes   = 216
+	transportMeanBytes    = 120
 	transportSecondBytes  = 4700
 	transportSegmentBytes = 1128
 	encodedAudioPeak      = 1.25
@@ -40,6 +41,26 @@ func planWindow(meta *domain.Metadata, targetDuration float64) peakWindow {
 func transportBits(payloadBytes, frames, seconds float64) float64 {
 	bytes := payloadBytes*transportPacketBytes/transportPayloadBytes + frames*transportFrameBytes + seconds*transportSecondBytes + transportSegmentBytes
 	return bytes * 8
+}
+
+func meanTransportRate(payloadBytes, frames float64) int {
+	return int(math.Ceil((payloadBytes*transportPacketBytes/transportPayloadBytes + frames*transportMeanBytes + transportSecondBytes) * 8))
+}
+
+func encodedAverageBandwidth(rendition domain.VideoRendition) int {
+	return meanTransportRate(float64(rendition.Bitrate)/8, rendition.FrameRate)
+}
+
+func audioAverageBandwidth(bitrate, sampleRate int, method domain.PlaybackMethod) int {
+	rate := float64(defaultAudioRate)
+	samples := 1024.0
+	if method == domain.DirectStream {
+		samples = 1536
+		if sampleRate > 0 {
+			rate = float64(sampleRate)
+		}
+	}
+	return meanTransportRate(float64(bitrate)/8, rate/samples)
 }
 
 func encodedPeakBandwidth(rendition domain.VideoRendition, window peakWindow) int {
