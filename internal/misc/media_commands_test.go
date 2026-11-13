@@ -175,8 +175,8 @@ func TestEveryMediaCommandCarriesProtocolWhitelist(t *testing.T) {
 			t.Fatalf("%s %q lacks %q", command.tool, command.args, want)
 		}
 	}
-	if seen["ffprobe"] != 2 || seen["ffmpeg"] < 7 {
-		t.Fatalf("recorded invocations = %v, want 2 ffprobe and at least 7 ffmpeg", seen)
+	if seen["ffprobe"] != 3 || seen["ffmpeg"] < 7 {
+		t.Fatalf("recorded invocations = %v, want 3 ffprobe (streams, keyframes, stream ends) and at least 7 ffmpeg", seen)
 	}
 }
 

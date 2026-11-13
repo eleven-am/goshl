@@ -9,6 +9,7 @@ const (
 	OutputTimelineOffset = 10 * time.Second
 	JobContractVersion   = 5
 	BoundaryTolerance    = 0.000001
+	StreamTailSlack      = 0.5
 )
 
 func Adjacent(previous, next Segment) bool {

@@ -773,3 +773,41 @@ func TestMasterSubtitleLanguageIsRFC5646(t *testing.T) {
 		t.Fatalf("unparseable subtitle language leaked\n%s", out)
 	}
 }
+
+func TestMasterBandwidthUsesPeakBandwidthFacts(t *testing.T) {
+	video := video1080()
+	video.PeakBandwidth = 11_000_000
+	audios := twoTrackAudio()[:2]
+	audios[0].PeakBandwidth = 220_000
+	audios[1].PeakBandwidth = 290_000
+	parsed := parseMaster(t, buildMaster(t, []domain.VideoRendition{video}, audios, nil))
+	variant := variantByURI(t, parsed, "/media/video/1080p/playlist.m3u8", "audio-mp4a-40-2-2")
+	if want := uint32(11_000_000 + 290_000); variant.Bandwidth != want {
+		t.Fatalf("BANDWIDTH = %d, want %d", variant.Bandwidth, want)
+	}
+	if want := uint32(5_000_000 + 128_000); variant.AverageBandwidth != want {
+		t.Fatalf("AVERAGE-BANDWIDTH = %d, want %d", variant.AverageBandwidth, want)
+	}
+}
+
+func TestMasterBandwidthFallsBackWhenPeakBandwidthZero(t *testing.T) {
+	parsed := parseMaster(t, buildMaster(t, []domain.VideoRendition{video1080()}, twoTrackAudio()[:2], nil))
+	variant := variantByURI(t, parsed, "/media/video/1080p/playlist.m3u8", "audio-mp4a-40-2-2")
+	if want := uint32(7_500_000 + 128_000); variant.Bandwidth != want {
+		t.Fatalf("BANDWIDTH = %d, want %d", variant.Bandwidth, want)
+	}
+}
+
+func TestMasterAudioOnlyBandwidthUsesPeakBandwidth(t *testing.T) {
+	audios := twoTrackAudio()[:2]
+	audios[0].PeakBandwidth = 220_000
+	audios[1].PeakBandwidth = 290_000
+	parsed := parseMaster(t, buildMaster(t, nil, audios, nil))
+	if len(parsed.playlist.Variants) != 1 {
+		t.Fatalf("variants = %d\n%s", len(parsed.playlist.Variants), parsed.raw)
+	}
+	variant := parsed.playlist.Variants[0]
+	if variant.Bandwidth != 290_000 || variant.AverageBandwidth != 128_000 {
+		t.Fatalf("BANDWIDTH=%d AVERAGE=%d\n%s", variant.Bandwidth, variant.AverageBandwidth, parsed.raw)
+	}
+}

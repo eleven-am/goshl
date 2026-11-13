@@ -734,3 +734,115 @@ func TestPassthroughJobPastSourceEndGeneratesSilenceOnTheSourceGrid(t *testing.T
 		t.Fatalf("silence for a passthrough rendition needs a grid anchor, got %v", err)
 	}
 }
+
+func TestPassthroughTailFollowsSourceSampleRate(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := audioEndSegments()
+	for _, rate := range []int{44100, 32000, 48000} {
+		rendition := domain.AudioRendition{Method: domain.DirectStream, Codec: "ac3", Channels: 2, Bitrate: 192000, SourceEnd: 7.5, SampleRate: rate}
+		frame := 1536.0 / float64(rate)
+		delay := 256.0 / float64(rate)
+		offset := domain.OutputTimelineOffset.Seconds()
+
+		padded, err := builder.Audio(AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: rendition, Segments: segments[7:9], Overlap: &segments[6], Landing: landing(5.99), OutputDir: "/tmp/a"})
+		joined := mustArgs(t, padded, err)
+		if got, want := optionValue(t, joined, "-output_ts_offset"), formatSeconds(offset+delay); got != want {
+			t.Errorf("%d Hz padded job: offset = %s, want %s (256 samples at the source rate)", rate, got, want)
+		}
+		if strings.Contains(joined, "-ar ") {
+			t.Errorf("%d Hz padded job must keep the source sample rate: %s", rate, joined)
+		}
+
+		anchor := 6.9
+		silent, err := builder.Audio(AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: rendition, Segments: segments[9:10], Overlap: &segments[8], Landing: landing(anchor), OutputDir: "/tmp/a"})
+		joined = mustArgs(t, silent, err)
+		grid := anchor + math.Floor((8-anchor)/frame+domain.BoundaryTolerance)*frame
+		for option, want := range map[string]string{
+			"-i":                "anullsrc=r=" + strconv.Itoa(rate) + ":cl=stereo",
+			"-output_ts_offset": formatSeconds(offset + delay + grid),
+			"-to":               formatSeconds(10 - grid),
+			"-segment_times":    formatSeconds(9 - grid),
+		} {
+			if got := optionValue(t, joined, option); got != want {
+				t.Errorf("%d Hz silent job: %s = %s, want %s", rate, option, got, want)
+			}
+		}
+	}
+	stereo := domain.AudioRendition{Method: domain.Transcode, Codec: "aac", Channels: 2, Bitrate: 128000, SourceEnd: 7.5, SampleRate: 44100}
+	resampled, err := builder.Audio(AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: stereo, Segments: segments[9:10], Overlap: &segments[8], OutputDir: "/tmp/a"})
+	if got := optionValue(t, mustArgs(t, resampled, err), "-i"); got != "anullsrc=r=48000:cl=stereo" {
+		t.Fatalf("AAC renditions are always 48000 Hz, silence was generated from %s", got)
+	}
+	unknown := domain.AudioRendition{Method: domain.DirectStream, Codec: "eac3", Channels: 2, Bitrate: 192000, SourceEnd: 7.5}
+	args, err := builder.Audio(AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: unknown, Segments: segments[9:10], Overlap: &segments[8], Landing: landing(6.9), OutputDir: "/tmp/a"})
+	if got := optionValue(t, mustArgs(t, args, err), "-i"); got != "anullsrc=r=48000:cl=stereo" {
+		t.Fatalf("an unknown sample rate falls back to 48000, got %s", got)
+	}
+}
+
+func TestVideoJobPastSourceEndClonesTheLastFrame(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := []domain.Segment{
+		{Index: 6, Start: 30, End: 36, Duration: 6},
+		{Index: 7, Start: 36, End: 42, Duration: 6},
+		{Index: 8, Start: 42, End: 48, Duration: 6},
+		{Index: 9, Start: 48, End: 53, Duration: 5},
+	}
+	rendition := completeRendition()
+	rendition.SourceEnd = 40
+	scale := "scale=1280:720"
+	build := func(r domain.VideoRendition, job []domain.Segment) string {
+		args, err := builder.Video(VideoParams{InputURL: "in.mkv", Rendition: r, Segments: job, OutputDir: "/tmp/v"})
+		return mustArgs(t, args, err)
+	}
+
+	covered := build(rendition, segments[0:1])
+	if filter := optionValue(t, covered, "-vf"); strings.Contains(filter, "tpad") || !strings.HasPrefix(filter, scale) {
+		t.Fatalf("a job inside the video needs no padding: %s", filter)
+	}
+	exact := rendition
+	exact.SourceEnd = 36
+	if filter := optionValue(t, build(exact, segments[0:1]), "-vf"); strings.Contains(filter, "tpad") {
+		t.Fatalf("a job that ends exactly with the video needs no padding: %s", filter)
+	}
+
+	padded := build(rendition, segments[0:3])
+	if got, want := optionValue(t, padded, "-vf"), "tpad=stop_mode=clone:stop_duration=9.000000,"+scale; !strings.HasPrefix(got, want) || strings.Contains(got, "trim") {
+		t.Fatalf("padded job filter = %s, want it to start with %s and not trim", got, want)
+	}
+	if !strings.Contains(padded, "-ss 29.999000 ") || optionValue(t, padded, "-to") != "47.999000" {
+		t.Fatalf("a padded job seeks and ends like any transcode job: %s", padded)
+	}
+
+	near := build(rendition, segments[1:2])
+	if got := optionValue(t, near, "-vf"); !strings.HasPrefix(got, "tpad=stop_mode=clone:stop_duration=3.000000,"+scale) || !strings.Contains(near, "-ss 35.999000 ") {
+		t.Fatalf("a job starting well inside the video seeks to its own start: %s", near)
+	}
+
+	frozen := build(rendition, segments[2:4])
+	if got, want := optionValue(t, frozen, "-vf"), "tpad=stop_mode=clone:stop_duration=14.000000,trim=start=41.999000,"+scale; !strings.HasPrefix(got, want) {
+		t.Fatalf("frozen job filter = %s, want it to start with %s", got, want)
+	}
+	if !strings.Contains(frozen, "-ss 38.000000 ") || optionValue(t, frozen, "-to") != "52.999000" {
+		t.Fatalf("a job past the video end must seek two seconds before that end: %s", frozen)
+	}
+	for _, option := range []string{"-segment_times", "-segment_start_number", "-force_key_frames", "-output_ts_offset"} {
+		real := rendition
+		real.SourceEnd = 0
+		if got, want := optionValue(t, frozen, option), optionValue(t, build(real, segments[2:4]), option); got != want {
+			t.Errorf("%s = %s, a job over real video uses %s", option, got, want)
+		}
+	}
+
+	short := rendition
+	short.SourceEnd = 1.5
+	if early := build(short, []domain.Segment{{Index: 1, Start: 6, End: 12, Duration: 6}}); !strings.Contains(early, "-ss 0.000000 ") {
+		t.Fatalf("the seek before a very early video end must not go negative: %s", early)
+	}
+
+	unknown := rendition
+	unknown.SourceEnd = 0
+	if filter := optionValue(t, build(unknown, segments[2:4]), "-vf"); strings.Contains(filter, "tpad") {
+		t.Fatalf("without a known early end nothing is padded: %s", filter)
+	}
+}

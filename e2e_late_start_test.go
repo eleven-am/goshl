@@ -74,7 +74,7 @@ func TestControllerLateVideoStartDirectStreamSharesOneTimeline(t *testing.T) {
 	if len(source.segments) < 8 {
 		t.Fatalf("fixture must plan at least 8 segments, planned %d", len(source.segments))
 	}
-	videos, err := rendition.GenerateVideo(meta, 2)
+	videos, _, err := rendition.GenerateVideo(meta, 2)
 	if err != nil {
 		t.Fatalf("generate video renditions: %v", err)
 	}

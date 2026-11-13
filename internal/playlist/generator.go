@@ -49,12 +49,13 @@ type audioMember struct {
 }
 
 type audioGroup struct {
-	ID           string
-	Codec        string
-	Channels     int
-	Codecs       []string
-	MaxBandwidth int
-	Members      []audioMember
+	ID            string
+	Codec         string
+	Channels      int
+	Codecs        []string
+	MaxBandwidth  int
+	PeakBandwidth int
+	Members       []audioMember
 }
 
 type subtitleMember struct {
@@ -224,6 +225,9 @@ func audioGroups(tracks []*audioTrack) ([]audioGroup, error) {
 			if rendition.Bitrate > group.MaxBandwidth {
 				group.MaxBandwidth = rendition.Bitrate
 			}
+			if peak := audioPeak(rendition); peak > group.PeakBandwidth {
+				group.PeakBandwidth = peak
+			}
 		}
 		group.Codecs = []string{group.Codec}
 		for _, member := range group.Members {
@@ -234,6 +238,13 @@ func audioGroups(tracks []*audioTrack) ([]audioGroup, error) {
 		groups = append(groups, *group)
 	}
 	return groups, nil
+}
+
+func audioPeak(audio domain.AudioRendition) int {
+	if audio.PeakBandwidth > 0 {
+		return audio.PeakBandwidth
+	}
+	return audio.Bitrate
 }
 
 func groupRendition(group audioGroup, track *audioTrack) (domain.AudioRendition, error) {
@@ -362,11 +373,14 @@ func variantAttributes(group audioGroup, hasSubtitles bool) string {
 
 func writeVideoVariant(b *strings.Builder, pathGen domain.PathGenerator, sourceURL string, video domain.VideoRendition, group audioGroup, hasSubtitles bool) {
 	average := video.Bitrate + group.MaxBandwidth
-	peak := video.PeakBitrate
+	peak := video.PeakBandwidth
+	if peak <= 0 {
+		peak = video.PeakBitrate
+	}
 	if peak <= 0 {
 		peak = video.Bitrate
 	}
-	peak += group.MaxBandwidth
+	peak += group.PeakBandwidth
 	codecs := strings.Join(append([]string{video.Codec}, group.Codecs...), ",")
 	frameRate := ""
 	if video.FrameRate > 0 {
@@ -395,7 +409,7 @@ func writeAudioVariant(b *strings.Builder, pathGen domain.PathGenerator, sourceU
 	b.WriteString(fmt.Sprintf(
 		"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=%d,BANDWIDTH=%d,CODECS=\"%s\"%s\n",
 		group.MaxBandwidth,
-		group.MaxBandwidth,
+		group.PeakBandwidth,
 		escapeAttribute(strings.Join(group.Codecs, ",")),
 		variantAttributes(group, hasSubtitles),
 	))

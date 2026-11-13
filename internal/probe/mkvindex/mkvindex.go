@@ -30,11 +30,19 @@ const (
 	trackTypeSubtitle     = 0x11
 	trackTypeMetadata     = 0x21
 	maxCueGap             = 11.5
+	clusterHeaderSlack    = maxSizeLength - 1
 )
 
 type cueIndex struct {
-	Keyframes []float64
-	Duration  float64
+	Keyframes  []float64
+	GroupBytes []int64
+	Duration   float64
+}
+
+type cuedKeyframe struct {
+	time     float64
+	offset   int64
+	relative bool
 }
 
 func (i *cueIndex) longestGap() float64 {
@@ -84,7 +92,9 @@ type cues struct {
 		Points []struct {
 			Time      uint64 `ebml:"CueTime"`
 			Positions []struct {
-				Track uint64 `ebml:"CueTrack"`
+				Track    uint64 `ebml:"CueTrack"`
+				Cluster  uint64 `ebml:"CueClusterPosition"`
+				Relative uint64 `ebml:"CueRelativePosition"`
 			} `ebml:"CueTrackPositions"`
 		} `ebml:"CuePoint"`
 	} `ebml:"Cues,stop"`
@@ -112,6 +122,20 @@ func KeyframesFrom(r io.ReaderAt, size int64, streamIndex int) ([]float64, error
 		return nil, fmt.Errorf("%w: cue points leave a %.3f s gap", ErrUnsupported, gap)
 	}
 	return index.Keyframes, nil
+}
+
+func KeyframeGroupsFrom(r io.ReaderAt, size int64, streamIndex int) ([]float64, []int64, error) {
+	index, err := readIndex(r, size, streamIndex)
+	if err != nil {
+		return nil, nil, err
+	}
+	if gap := index.longestGap(); gap > maxCueGap {
+		return nil, nil, fmt.Errorf("%w: cue points leave a %.3f s gap", ErrUnsupported, gap)
+	}
+	if index.GroupBytes == nil {
+		return nil, nil, fmt.Errorf("%w: cue points do not locate their blocks in file order", ErrUnsupported)
+	}
+	return index.Keyframes, index.GroupBytes, nil
 }
 
 type segmentLayout struct {
@@ -192,26 +216,63 @@ func readIndex(r io.ReaderAt, size int64, streamIndex int) (*cueIndex, error) {
 		return nil, err
 	}
 	delay := math.Round(float64(video.CodecDelay) / float64(scale))
-	var keyframes []float64
+	var cued []cuedKeyframe
 	for _, point := range cueList.Cues.Points {
 		for _, position := range point.Positions {
 			if position.Track == video.Number {
-				keyframes = append(keyframes, microseconds((float64(point.Time)-delay)*float64(scale)/1e9))
+				if position.Cluster > uint64(size) || position.Relative > uint64(size) {
+					return nil, fmt.Errorf("%w: cue position past the end", ErrUnsupported)
+				}
+				cued = append(cued, cuedKeyframe{
+					time:     microseconds((float64(point.Time) - delay) * float64(scale) / 1e9),
+					offset:   layout.start + int64(position.Cluster) + int64(position.Relative),
+					relative: position.Relative != 0,
+				})
 				break
 			}
 		}
 	}
-	if len(keyframes) == 0 {
+	if len(cued) == 0 {
 		return nil, fmt.Errorf("%w: no cue points for the video track", ErrUnsupported)
 	}
-	sort.Float64s(keyframes)
-	unique := keyframes[:1]
-	for _, keyframe := range keyframes[1:] {
-		if keyframe != unique[len(unique)-1] {
+	sort.SliceStable(cued, func(i, j int) bool { return cued[i].time < cued[j].time })
+	unique := cued[:1]
+	for _, keyframe := range cued[1:] {
+		if keyframe.time != unique[len(unique)-1].time {
 			unique = append(unique, keyframe)
 		}
 	}
-	return &cueIndex{Keyframes: unique, Duration: duration}, nil
+	index := &cueIndex{Keyframes: make([]float64, len(unique)), Duration: duration}
+	for position, keyframe := range unique {
+		index.Keyframes[position] = keyframe.time
+	}
+	index.GroupBytes = groupBytes(unique, clusterEnd(positions, unique[len(unique)-1].offset, size))
+	return index, nil
+}
+
+func clusterEnd(positions map[ebml.ElementType]int64, after, size int64) int64 {
+	end := size
+	for _, position := range positions {
+		if position > after && position < end {
+			end = position
+		}
+	}
+	return end
+}
+
+func groupBytes(keyframes []cuedKeyframe, end int64) []int64 {
+	sizes := make([]int64, len(keyframes))
+	for position, keyframe := range keyframes {
+		next := end
+		if position+1 < len(keyframes) {
+			next = keyframes[position+1].offset
+		}
+		if !keyframe.relative || next <= keyframe.offset {
+			return nil
+		}
+		sizes[position] = next - keyframe.offset + clusterHeaderSlack
+	}
+	return sizes
 }
 
 func microseconds(seconds float64) float64 {

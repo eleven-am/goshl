@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/playlist"
 	"github.com/eleven-am/goshl/internal/rendition"
 )
@@ -12,12 +13,15 @@ func (c *Controller) MasterPlaylist(ctx context.Context, sourceURL string) (stri
 	if err := c.ensureRunning(); err != nil {
 		return "", err
 	}
-	meta, _, err := c.getMetadataResolved(ctx, sourceURL)
+	meta, mediaKey, err := c.getMetadataResolved(ctx, sourceURL)
 	if err != nil {
 		return "", fmt.Errorf("get metadata: %w", err)
 	}
 
-	videos, err := rendition.GenerateVideo(meta, c.opts.TargetDuration)
+	videos, dropped, err := rendition.GenerateVideo(meta, c.opts.TargetDuration)
+	for _, rung := range dropped {
+		c.observe(ctx, domain.Event{Type: domain.EventRenditionDropped, MediaKey: mediaKey, StreamType: domain.StreamVideo, Rendition: rung.Name, Error: rung.Reason})
+	}
 	if err != nil {
 		return "", fmt.Errorf("master playlist: %w", err)
 	}

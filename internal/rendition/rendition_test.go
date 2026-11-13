@@ -15,7 +15,7 @@ func alignedMeta(video domain.VideoStream) *domain.Metadata {
 
 func mustVideo(t *testing.T, video domain.VideoStream) []domain.VideoRendition {
 	t.Helper()
-	renditions, err := GenerateVideo(alignedMeta(video), 6)
+	renditions, _, err := GenerateVideo(alignedMeta(video), 6)
 	if err != nil {
 		t.Fatalf("GenerateVideo: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestLevelPolicyStaysWithinEncoderRange(t *testing.T) {
 	shapes := [][2]int{{176, 144}, {426, 240}, {640, 360}, {720, 576}, {854, 480}, {1280, 720}, {1920, 800}, {1920, 1080}, {1080, 1920}, {2560, 1440}, {3840, 2160}, {4096, 2160}, {7680, 4320}}
 	for _, shape := range shapes {
 		for _, rate := range rates {
-			renditions, err := GenerateVideo(alignedMeta(hevcSource(shape[0], shape[1], 0, rate)), 6)
+			renditions, _, err := GenerateVideo(alignedMeta(hevcSource(shape[0], shape[1], 0, rate)), 6)
 			if err != nil {
 				t.Fatalf("%dx%d at %.3f: %v", shape[0], shape[1], rate, err)
 			}
@@ -281,7 +281,7 @@ func TestRungAboveLevelCeilingIsDropped(t *testing.T) {
 }
 
 func TestGenerateVideoFailsWhenNoRungIsEncodable(t *testing.T) {
-	renditions, err := GenerateVideo(alignedMeta(hevcSource(1920, 1080, 5_000_000, 5000)), 6)
+	renditions, _, err := GenerateVideo(alignedMeta(hevcSource(1920, 1080, 5_000_000, 5000)), 6)
 	if !errors.Is(err, ErrNoEncodableVideo) || len(renditions) != 0 {
 		t.Fatalf("expected ErrNoEncodableVideo and no renditions, got %v and %#v", err, renditions)
 	}
@@ -293,7 +293,7 @@ func TestGenerateVideoFailsWhenNoRungIsEncodable(t *testing.T) {
 }
 
 func TestGenerateVideoOffersNothingWithoutAVideoStream(t *testing.T) {
-	renditions, err := GenerateVideo(&domain.Metadata{Duration: 10, Audios: []domain.AudioStream{{Codec: "aac", Channels: 2}}}, 6)
+	renditions, _, err := GenerateVideo(&domain.Metadata{Duration: 10, Audios: []domain.AudioStream{{Codec: "aac", Channels: 2}}}, 6)
 	if err != nil || len(renditions) != 0 {
 		t.Fatalf("an audio-only source has no video ladder and no error, got %v and %#v", err, renditions)
 	}
@@ -372,7 +372,7 @@ func TestGenerateVideoUsesFormatBitrateFallback(t *testing.T) {
 		meta := alignedMeta(video)
 		meta.Bitrate = c.format
 		meta.Audios = c.audios
-		renditions, err := GenerateVideo(meta, 6)
+		renditions, _, err := GenerateVideo(meta, 6)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -382,7 +382,7 @@ func TestGenerateVideoUsesFormatBitrateFallback(t *testing.T) {
 	}
 	tagged := alignedMeta(h264Source(1920, 1080, 7_000_000))
 	tagged.Bitrate = 40_000_000
-	renditions, err := GenerateVideo(tagged, 6)
+	renditions, _, err := GenerateVideo(tagged, 6)
 	if err != nil || renditions[0].Bitrate != 7_000_000 {
 		t.Fatalf("a declared stream bitrate wins over the container, got %v and %#v", err, renditions)
 	}
@@ -423,7 +423,7 @@ func TestDirectStreamRequiresKeyframeAlignedPlan(t *testing.T) {
 		{"same source, longer target", []float64{0, 20, 26}, 32, 12, domain.DirectStream},
 	}
 	for _, c := range cases {
-		renditions, err := GenerateVideo(&domain.Metadata{Duration: c.duration, Keyframes: c.keyframes, Video: video}, c.target)
+		renditions, _, err := GenerateVideo(&domain.Metadata{Duration: c.duration, Keyframes: c.keyframes, Video: video}, c.target)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -575,6 +575,73 @@ func TestGenerateAudioTracksCarriesSampleRate(t *testing.T) {
 	for _, track := range tracks {
 		if track.SampleRate != 44100 {
 			t.Errorf("%s SampleRate = %d, want 44100", track.Name, track.SampleRate)
+		}
+	}
+}
+
+func TestGenerateVideoReportsEveryDroppedRung(t *testing.T) {
+	cases := []struct {
+		name   string
+		video  domain.VideoStream
+		want   []string
+		failed bool
+	}{
+		{"nothing dropped", hevcSource(1920, 1080, 5_000_000, 24), nil, false},
+		{"8K source rung", hevcSource(7680, 4320, 80_000_000, 30), []string{"4320p"}, false},
+		{"2160p at 120 fps", hevcSource(3840, 2160, 40_000_000, 120), []string{"2160p"}, false},
+		{"no rung left", hevcSource(1920, 1080, 5_000_000, 5000), []string{"1080p", "720p", "480p", "360p"}, true},
+	}
+	for _, c := range cases {
+		renditions, dropped, err := GenerateVideo(alignedMeta(c.video), 6)
+		if (err != nil) != c.failed {
+			t.Fatalf("%s: error = %v", c.name, err)
+		}
+		var names []string
+		for _, rung := range dropped {
+			names = append(names, rung.Name)
+			if !strings.Contains(rung.Reason, rung.Name) || !strings.Contains(rung.Reason, "5.2") {
+				t.Errorf("%s: reason for %s must name the rung and the level ceiling, got %q", c.name, rung.Name, rung.Reason)
+			}
+			for _, kept := range renditions {
+				if kept.Name == rung.Name {
+					t.Errorf("%s: %s is both offered and reported as dropped", c.name, rung.Name)
+				}
+			}
+		}
+		if strings.Join(names, ",") != strings.Join(c.want, ",") {
+			t.Errorf("%s: dropped rungs = %v, want %v", c.name, names, c.want)
+		}
+	}
+}
+
+func TestVideoEndingBeforeThePlanIsPaddedNotCopied(t *testing.T) {
+	cases := []struct {
+		name     string
+		videoEnd float64
+		duration float64
+		want     domain.PlaybackMethod
+		padFrom  float64
+	}{
+		{"video ends 13 s early", 40, 53, domain.Transcode, 40},
+		{"video ends just over the slack early", 17.49, 18, domain.Transcode, 17.49},
+		{"video ends within the slack", 17.5, 18, domain.DirectStream, 0},
+		{"video outlasts the plan", 18.02, 18, domain.DirectStream, 0},
+		{"video end unknown", 0, 18, domain.DirectStream, 0},
+	}
+	for _, c := range cases {
+		video := h264Source(1920, 1080, 6_000_000)
+		video.End = c.videoEnd
+		ladder, _, err := GenerateVideo(&domain.Metadata{Duration: c.duration, Keyframes: []float64{0, 6, 12}, Video: video}, 6)
+		if err != nil || len(ladder) < 2 {
+			t.Fatalf("%s: ladder %v, %v", c.name, ladder, err)
+		}
+		if ladder[0].Method != c.want {
+			t.Errorf("%s: source rung method = %s, want %s", c.name, ladder[0].Method, c.want)
+		}
+		for _, rung := range ladder {
+			if rung.SourceEnd != c.padFrom {
+				t.Errorf("%s: rendition %s carries video end %.3f, want %.3f", c.name, rung.Name, rung.SourceEnd, c.padFrom)
+			}
 		}
 	}
 }

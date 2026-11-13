@@ -323,7 +323,7 @@ func (c *Controller) readStoredSegment(ctx context.Context, info domain.SegmentD
 func (c *Controller) resolveRendition(meta *domain.Metadata, streamType domain.StreamType, name string) (*domain.VideoRendition, *domain.AudioRendition, error) {
 	switch streamType {
 	case domain.StreamVideo:
-		videos, err := rendition.GenerateVideo(meta, c.opts.TargetDuration)
+		videos, _, err := rendition.GenerateVideo(meta, c.opts.TargetDuration)
 		if err != nil {
 			return nil, nil, fmt.Errorf("%w: %s: %v", ErrRenditionNotFound, name, err)
 		}

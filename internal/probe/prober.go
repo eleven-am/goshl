@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/mediaexec"
@@ -44,13 +45,16 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 	}
 
 	var keyframes []float64
+	var groupBytes []int64
 	cutShort := false
 	if streams.Video.Codec != "" {
 		var indexed bool
-		keyframes, indexed, err = p.indexKeyframes(ctx, url, formatName, streams.Video.Index)
+		var header headerFacts
+		header, indexed, err = p.indexKeyframes(ctx, url, formatName, streams.Video.Index)
 		if err != nil {
 			return nil, err
 		}
+		keyframes, groupBytes = header.keyframes, header.bytes
 		if !indexed {
 			scan, err := p.probeKeyframes(ctx, url, streams.Video.Index)
 			if err != nil {
@@ -59,13 +63,17 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 			if scan.packets == 0 {
 				return nil, fmt.Errorf("video stream has no readable packets")
 			}
-			keyframes = scan.keyframes
+			keyframes, groupBytes = scan.keyframes, scan.bytes
 			declared := streams.Video.End
 			if scan.end > streams.StartTime {
 				streams.Video.End = scan.end - streams.StartTime
 			}
 			cutShort = declared > 0 && streams.Video.End < declared-durationSlack
 		}
+	}
+
+	if err := p.measureStreamEnds(ctx, url, streams); err != nil {
+		return nil, err
 	}
 
 	streams.Duration = boundedDuration(streams)
@@ -77,6 +85,7 @@ func (p *Prober) probe(ctx context.Context, url string) (*domain.Metadata, error
 	}
 
 	streams.Keyframes = normalizeKeyframes(keyframes, streams.StartTime, streams.Duration)
+	streams.KeyframeBytes = assignKeyframeBytes(keyframes, groupBytes, streams.StartTime, streams.Keyframes)
 	streams.Video.StartsWithKeyframe = len(streams.Keyframes) > 0 && math.Abs(streams.Keyframes[0]-streams.Video.Start) < streamStartTolerance
 	return streams, nil
 }
@@ -261,8 +270,8 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 				Language:      s.Tags["language"],
 				Title:         s.Tags["title"],
 				Channels:      s.Channels,
-				SampleRate:    parseBitrate(s.SampleRate),
 				ChannelLayout: s.Layout,
+				SampleRate:    parseBitrate(s.SampleRate),
 				Bitrate:       parseBitrate(firstNonEmpty(s.BitRate, statisticsTag(s.Tags, "BPS"))),
 				Default:       s.Disposition.Default == 1,
 				End:           ends.streamEnd(s),
@@ -285,8 +294,34 @@ func (p *Prober) probeStreams(ctx context.Context, url string) (*domain.Metadata
 
 type keyframeScan struct {
 	keyframes []float64
+	bytes     []int64
+	leading   int64
 	end       float64
 	packets   int
+}
+
+func (scan *keyframeScan) add(parts []string) {
+	scan.packets++
+	var size int64
+	if len(parts) >= 4 {
+		size, _ = strconv.ParseInt(parts[2], 10, 64)
+	}
+	pts, err := strconv.ParseFloat(parts[0], 64)
+	if err == nil {
+		if duration, err := strconv.ParseFloat(parts[1], 64); err == nil && duration > 0 {
+			scan.end = math.Max(scan.end, pts+duration)
+		}
+		if strings.Contains(strings.Join(parts[1:], ","), "K") {
+			scan.keyframes = append(scan.keyframes, pts)
+			scan.bytes = append(scan.bytes, scan.leading)
+			scan.leading = 0
+		}
+	}
+	if len(scan.bytes) == 0 {
+		scan.leading += size
+		return
+	}
+	scan.bytes[len(scan.bytes)-1] += size
 }
 
 func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int) (keyframeScan, error) {
@@ -297,7 +332,7 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int
 	args := append([]string{
 		"-v", "error",
 		"-select_streams", strconv.Itoa(streamIndex),
-		"-show_entries", "packet=pts_time,duration_time,flags",
+		"-show_entries", "packet=pts_time,duration_time,size,flags",
 		"-of", "csv=p=0",
 	}, input...)
 	scanCtx, stop := context.WithCancel(ctx)
@@ -315,17 +350,7 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int
 		if len(parts) < 2 {
 			continue
 		}
-		scan.packets++
-		pts, err := strconv.ParseFloat(parts[0], 64)
-		if err != nil {
-			continue
-		}
-		if duration, err := strconv.ParseFloat(parts[1], 64); err == nil && duration > 0 {
-			scan.end = math.Max(scan.end, pts+duration)
-		}
-		if strings.Contains(strings.Join(parts[1:], ","), "K") {
-			scan.keyframes = append(scan.keyframes, pts)
-		}
+		scan.add(parts)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -340,39 +365,217 @@ func (p *Prober) probeKeyframes(ctx context.Context, url string, streamIndex int
 	return scan, nil
 }
 
-func (p *Prober) indexKeyframes(ctx context.Context, url, formatName string, streamIndex int) ([]float64, bool, error) {
+var (
+	streamEndTail   = 15.0
+	streamEndSample = 5.0
+	streamEndBudget = 20 * time.Second
+)
+
+func (p *Prober) measureStreamEnds(ctx context.Context, url string, metadata *domain.Metadata) error {
+	unknown := make(map[int]*float64)
+	if metadata.Video.Codec != "" && metadata.Video.End <= 0 {
+		unknown[metadata.Video.Index] = &metadata.Video.End
+	}
+	for position := range metadata.Audios {
+		if metadata.Audios[position].End <= 0 {
+			unknown[metadata.Audios[position].Index] = &metadata.Audios[position].End
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	budget, stop := context.WithTimeout(ctx, streamEndBudget)
+	defer stop()
+	exhausted := func() bool {
+		return ctx.Err() == nil && errors.Is(budget.Err(), context.DeadlineExceeded)
+	}
+
+	tail := math.Max(math.Max(metadata.Duration, metadata.Video.End)-streamEndTail, 0)
+	ends, err := p.probeStreamEnds(budget, url, metadata.StartTime+tail, 0)
+	if err != nil {
+		if exhausted() {
+			return nil
+		}
+		return err
+	}
+	indexes := make([]int, 0, len(unknown))
+	for index, target := range unknown {
+		if end, found := ends[index]; found && end > metadata.StartTime {
+			*target = roundMicros(end - metadata.StartTime)
+			continue
+		}
+		indexes = append(indexes, index)
+	}
+	if tail == 0 {
+		return nil
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
+		end, err := p.searchStreamEnd(budget, url, metadata.StartTime, index, tail)
+		if err != nil {
+			if exhausted() {
+				return nil
+			}
+			return err
+		}
+		*unknown[index] = end
+	}
+	return nil
+}
+
+func (p *Prober) searchStreamEnd(ctx context.Context, url string, start float64, index int, absentFrom float64) (float64, error) {
+	alive, absent := 0.0, absentFrom
+	for absent-alive > streamEndTail {
+		middle := (alive + absent) / 2
+		ends, err := p.probeStreamEnds(ctx, url, start+middle, streamEndSample)
+		if err != nil {
+			return 0, err
+		}
+		if _, found := ends[index]; found {
+			alive = middle
+		} else {
+			absent = middle
+		}
+	}
+	ends, err := p.probeStreamEnds(ctx, url, start+alive, absentFrom-alive+streamEndSample)
+	if err != nil {
+		return 0, err
+	}
+	if end, found := ends[index]; found && end > start {
+		return roundMicros(end - start), nil
+	}
+	return 0, nil
+}
+
+func roundMicros(seconds float64) float64 {
+	return math.Round(seconds*1e6) / 1e6
+}
+
+func streamEndArgs(from, span float64) []string {
+	interval := strconv.FormatFloat(from, 'f', 6, 64) + "%"
+	if span > 0 {
+		interval += "+" + strconv.FormatFloat(span, 'f', 6, 64)
+	}
+	return []string{
+		"-v", "error",
+		"-show_entries", "packet=stream_index,pts_time,duration_time",
+		"-of", "csv=p=0",
+		"-read_intervals", interval,
+	}
+}
+
+func (p *Prober) probeStreamEnds(ctx context.Context, url string, from, span float64) (map[int]float64, error) {
+	input, err := source.InputArgs(url)
+	if err != nil {
+		return nil, err
+	}
+	args := append(streamEndArgs(from, span), input...)
+	scanCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	cmd, output, stderr, err := mediaexec.StartOutput(scanCtx, "ffprobe", args...)
+	if err != nil {
+		return nil, err
+	}
+
+	ends := make(map[int]float64)
+	scanner := bufio.NewScanner(output)
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), ",")
+		if len(parts) < 2 {
+			continue
+		}
+		index, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		end, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			continue
+		}
+		if len(parts) > 2 {
+			if duration, err := strconv.ParseFloat(parts[2], 64); err == nil && duration > 0 {
+				end += duration
+			}
+		}
+		if current, found := ends[index]; !found || end > current {
+			ends[index] = end
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		stop()
+		_ = cmd.Wait()
+		return nil, err
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, mediaexec.Error("ffprobe", args, stderr.String(), err)
+	}
+	return ends, nil
+}
+
+type headerFacts struct {
+	keyframes []float64
+	bytes     []int64
+}
+
+func (p *Prober) indexKeyframes(ctx context.Context, url, formatName string, streamIndex int) (headerFacts, bool, error) {
 	read := headerIndex(formatName)
 	if read == nil {
-		return nil, false, nil
+		return headerFacts{}, false, nil
 	}
 	reader, err := mediasource.Open(ctx, url)
 	if err != nil {
 		if errors.Is(err, mediasource.ErrUnsupported) {
-			return nil, false, nil
+			return headerFacts{}, false, nil
 		}
-		return nil, false, err
+		return headerFacts{}, false, err
 	}
 	defer reader.Close()
-	keyframes, err := read(reader, reader.Size(), streamIndex)
+	facts, err := read(reader, reader.Size(), streamIndex)
 	if err != nil {
 		if errors.Is(err, mp4index.ErrUnsupported) || errors.Is(err, mkvindex.ErrUnsupported) || errors.Is(err, mediasource.ErrUnsupported) {
-			return nil, false, nil
+			return headerFacts{}, false, nil
 		}
-		return nil, false, err
+		return headerFacts{}, false, err
 	}
-	return keyframes, true, nil
+	return facts, true, nil
 }
 
-func headerIndex(formatName string) func(io.ReaderAt, int64, int) ([]float64, error) {
+func headerIndex(formatName string) func(io.ReaderAt, int64, int) (headerFacts, error) {
 	for _, name := range strings.Split(formatName, ",") {
 		switch name {
 		case "mp4", "mov":
-			return mp4index.KeyframesFrom
+			return func(r io.ReaderAt, size int64, streamIndex int) (headerFacts, error) {
+				index, err := mp4index.IndexFrom(r, size, streamIndex)
+				return headerFacts{keyframes: index.Keyframes, bytes: index.GroupBytes}, err
+			}
 		case "matroska", "webm":
-			return mkvindex.KeyframesFrom
+			return func(r io.ReaderAt, size int64, streamIndex int) (headerFacts, error) {
+				keyframes, groups, err := mkvindex.KeyframeGroupsFrom(r, size, streamIndex)
+				if errors.Is(err, mkvindex.ErrUnsupported) {
+					keyframes, err = mkvindex.KeyframesFrom(r, size, streamIndex)
+					groups = nil
+				}
+				return headerFacts{keyframes: keyframes, bytes: groups}, err
+			}
 		}
 	}
 	return nil
+}
+
+func assignKeyframeBytes(raw []float64, groups []int64, startTime float64, keyframes []float64) []int64 {
+	if len(groups) == 0 || len(groups) != len(raw) || len(keyframes) == 0 {
+		return nil
+	}
+	assigned := make([]int64, len(keyframes))
+	for position, keyframe := range raw {
+		value := keyframe - startTime
+		target := sort.Search(len(keyframes), func(i int) bool { return keyframes[i] > value+0.000001 }) - 1
+		if target < 0 {
+			target = 0
+		}
+		assigned[target] += groups[position]
+	}
+	return assigned
 }
 
 func selectVideoStream(streams []ffprobeStream) int {

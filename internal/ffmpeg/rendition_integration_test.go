@@ -49,7 +49,7 @@ func probedLadder(t *testing.T, path string) (*domain.Metadata, []domain.VideoRe
 		t.Fatalf("probe source: %v", err)
 	}
 	meta.Keyframes = nil
-	ladder, err := rendition.GenerateVideo(meta, 2)
+	ladder, _, err := rendition.GenerateVideo(meta, 2)
 	if err != nil {
 		t.Fatalf("generate ladder: %v", err)
 	}

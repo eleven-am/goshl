@@ -28,6 +28,8 @@ const (
 	ac3FrameSamples        = 1536
 	ac3EncoderDelay        = 256
 	audioEndGuardSeconds   = 0.05
+	videoAnchorLeadSeconds = 2.0
+	videoTailMarginSeconds = 1.0
 	audioAnchorLeadSeconds = 0.5
 	passthroughMaxChannels = 6
 )
@@ -182,8 +184,13 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 	if p.Landing != nil && *p.Landing > first.Start {
 		timeline.reference = *p.Landing
 	}
+	tail := videoTailFilter(p.Rendition, first, last)
+	if tail != "" && first.Start > p.Rendition.SourceEnd-videoAnchorLeadSeconds {
+		timeline.seek = math.Max(p.Rendition.SourceEnd-videoAnchorLeadSeconds, 0)
+		tail += ",trim=start=" + formatSeconds(leadSeconds(first.Start))
+	}
 	timeline.inputFlags = config.DecodeFlags
-	timeline.encodeArgs, err = transcodeVideoArgs(config, chain, p.Rendition)
+	timeline.encodeArgs, err = transcodeVideoArgs(config, tail, chain, p.Rendition)
 	if err != nil {
 		return nil, err
 	}
@@ -523,14 +530,21 @@ func videoFilter(config *domain.HWAccelConfig, chain string, rendition domain.Vi
 	return strings.Join(append(filters, fmt.Sprintf(chain, rendition.Width, rendition.Height)), ",")
 }
 
-func transcodeVideoArgs(config *domain.HWAccelConfig, chain string, rendition domain.VideoRendition) ([]string, error) {
+func videoTailFilter(rendition domain.VideoRendition, first, last domain.Segment) string {
+	if rendition.SourceEnd <= 0 || last.End-rendition.SourceEnd <= domain.BoundaryTolerance {
+		return ""
+	}
+	return "tpad=stop_mode=clone:stop_duration=" + formatSeconds(last.End-rendition.SourceEnd+videoTailMarginSeconds)
+}
+
+func transcodeVideoArgs(config *domain.HWAccelConfig, tail, chain string, rendition domain.VideoRendition) ([]string, error) {
 	if rendition.Width <= 0 || rendition.Height <= 0 || rendition.Bitrate <= 0 || rendition.PeakBitrate <= 0 || rendition.BufferSize <= 0 || rendition.Level <= 0 {
 		return nil, fmt.Errorf("%w: %q", ErrRenditionIncomplete, rendition.Name)
 	}
 
 	args := append([]string(nil), config.EncodeFlags...)
 	return append(args,
-		"-vf", videoFilter(config, chain, rendition),
+		"-vf", strings.TrimPrefix(tail+","+videoFilter(config, chain, rendition), ","),
 		"-profile:v", "high",
 		"-level:v", fmt.Sprintf("%d.%d", rendition.Level/10, rendition.Level%10),
 		"-b:v", strconv.Itoa(rendition.Bitrate),

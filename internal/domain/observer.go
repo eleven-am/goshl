@@ -29,6 +29,7 @@ const (
 	EventHardwareSelected     EventType = "hardware.selected"
 	EventHardwareFallback     EventType = "hardware.fallback"
 	EventLockReleaseFailed    EventType = "lock.release.failed"
+	EventRenditionDropped     EventType = "rendition.dropped"
 )
 
 type Event struct {

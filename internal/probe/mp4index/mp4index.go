@@ -36,18 +36,72 @@ func Keyframes(path string, streamIndex int) ([]float64, error) {
 	return KeyframesFrom(file, info.Size(), streamIndex)
 }
 
+type Index struct {
+	Keyframes  []float64
+	GroupBytes []int64
+}
+
 func KeyframesFrom(r io.ReaderAt, size int64, streamIndex int) ([]float64, error) {
+	index, err := indexFrom(r, size, streamIndex, false)
+	return index.Keyframes, err
+}
+
+func IndexFrom(r io.ReaderAt, size int64, streamIndex int) (Index, error) {
+	return indexFrom(r, size, streamIndex, true)
+}
+
+func indexFrom(r io.ReaderAt, size int64, streamIndex int, withBytes bool) (Index, error) {
 	moov, err := readMoov(r, size)
 	if err != nil {
-		return nil, err
+		return Index{}, err
 	}
 	if moov.Mvex != nil || moov.Mvhd == nil || moov.Mvhd.Timescale == 0 {
-		return nil, fmt.Errorf("%w: fragmented or missing mvhd", ErrUnsupported)
+		return Index{}, fmt.Errorf("%w: fragmented or missing mvhd", ErrUnsupported)
 	}
 	if streamIndex < 0 || streamIndex >= len(moov.Traks) {
-		return nil, fmt.Errorf("%w: no trak at index %d", ErrUnsupported, streamIndex)
+		return Index{}, fmt.Errorf("%w: no trak at index %d", ErrUnsupported, streamIndex)
 	}
-	return trackKeyframes(moov.Traks[streamIndex], uint64(moov.Mvhd.Timescale), size)
+	trak := moov.Traks[streamIndex]
+	keyframes, err := trackKeyframes(trak, uint64(moov.Mvhd.Timescale), size)
+	if err != nil {
+		return Index{}, err
+	}
+	index := Index{Keyframes: keyframes}
+	if withBytes {
+		stbl := trak.Mdia.Minf.Stbl
+		index.GroupBytes = groupBytes(stbl.Stsz, syncSampleNumbers(stbl.Stss, stbl.Stsz.GetNrSamples()))
+	}
+	return index, nil
+}
+
+func groupBytes(stsz *mp4.StszBox, syncSamples []uint32) []int64 {
+	count := stsz.GetNrSamples()
+	groups := make([]int64, len(syncSamples))
+	if len(syncSamples) > 0 {
+		for sample := uint32(1); sample < syncSamples[0] && sample <= count; sample++ {
+			groups[0] += sampleBytes(stsz, sample)
+		}
+	}
+	for position, first := range syncSamples {
+		last := count
+		if position+1 < len(syncSamples) {
+			last = syncSamples[position+1] - 1
+		}
+		for sample := first; sample >= 1 && sample <= last; sample++ {
+			groups[position] += sampleBytes(stsz, sample)
+		}
+	}
+	return groups
+}
+
+func sampleBytes(stsz *mp4.StszBox, sample uint32) int64 {
+	if stsz.SampleUniformSize != 0 {
+		return int64(stsz.SampleUniformSize)
+	}
+	if int(sample) > len(stsz.SampleSize) {
+		return 0
+	}
+	return int64(stsz.SampleSize[sample-1])
 }
 
 func plausibleSampleCount(stsz *mp4.StszBox, size int64) bool {

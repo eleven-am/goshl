@@ -120,3 +120,65 @@ func TestSourceWithoutEncodableVideoFailsWithReason(t *testing.T) {
 		t.Fatalf("no job may be enqueued for a source without an encodable rendition")
 	}
 }
+
+func droppedRenditionEvents(t *testing.T, meta *domain.Metadata) ([]domain.Event, string, error) {
+	t.Helper()
+	raw, err := jsonMetadata(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []domain.Event
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	controller, err := NewControllerWithContext(ctx, Options{
+		Storage:        &segTestStorage{meta: raw},
+		Coordinator:    newSegTestCoordinator(),
+		PathGen:        stubPathGen{},
+		SourceRevision: func(context.Context, string) (string, error) { return "r1", nil },
+		Observer: ObserverFunc(func(_ context.Context, event Event) {
+			if event.Type == EventRenditionDropped {
+				events = append(events, event)
+			}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	master, err := controller.MasterPlaylist(context.Background(), "/x.mkv")
+	return events, master, err
+}
+
+func TestMasterPlaylistReportsEveryDroppedRendition(t *testing.T) {
+	meta := testVideoMetadata(24, []float64{0, 6, 12, 18})
+	meta.Video.Codec = "hevc"
+
+	events, _, err := droppedRenditionEvents(t, meta)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("a 1080p source drops nothing, got %v and %+v", err, events)
+	}
+
+	meta.Video.Width, meta.Video.Height, meta.Video.Bitrate = 7680, 4320, 80_000_000
+	events, master, err := droppedRenditionEvents(t, meta)
+	if err != nil {
+		t.Fatalf("master playlist: %v", err)
+	}
+	if len(events) != 1 || events[0].Rendition != "4320p" || events[0].StreamType != StreamVideo || events[0].MediaKey == "" || !strings.Contains(events[0].Error, "5.2") || events[0].Time.IsZero() {
+		t.Fatalf("expected one dropped-rendition event for 4320p with its reason, got %+v", events)
+	}
+	if strings.Contains(master, "7680x4320") || !strings.Contains(master, "RESOLUTION=3840x2160") {
+		t.Fatalf("master must offer 2160p and not the dropped rung: %s", master)
+	}
+
+	meta.Video.Width, meta.Video.Height, meta.Video.FrameRate = 1920, 1080, 5000
+	events, _, err = droppedRenditionEvents(t, meta)
+	if !errors.Is(err, rendition.ErrNoEncodableVideo) {
+		t.Fatalf("master error = %v, want the no-encodable-rendition error", err)
+	}
+	var names []string
+	for _, event := range events {
+		names = append(names, event.Rendition)
+	}
+	if strings.Join(names, ",") != "1080p,720p,480p,360p" {
+		t.Fatalf("every dropped rung must be reported before the failure, got %v", names)
+	}
+}

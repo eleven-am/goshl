@@ -248,7 +248,7 @@ func TestProbeDerivesDurationFromPacketScanWhenNothingDeclaresIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
-	if want := measuredEnd(t, path, "v:0"); math.Abs(meta.Duration-want) > 0.001 || len(meta.Keyframes) != 6 {
+	if want := math.Max(measuredEnd(t, path, "v:0"), measuredEnd(t, path, "a:0")); math.Abs(meta.Duration-want) > 0.001 || len(meta.Keyframes) != 6 {
 		t.Fatalf("Duration = %v, want %v; keyframes %v", meta.Duration, want, meta.Keyframes)
 	}
 }

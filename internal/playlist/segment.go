@@ -70,7 +70,7 @@ func planSegments(keyframes []float64, duration float64, targetDuration float64)
 		if i+1 < len(candidates) && candidates[i+1] < duration {
 			next = candidates[i+1]
 		}
-		if elapsed >= targetDuration || elapsed >= sliver && next-start > limit {
+		if elapsed >= targetDuration-domain.BoundaryTolerance || elapsed >= sliver && next-start > limit {
 			cut(keyframe)
 		}
 	}

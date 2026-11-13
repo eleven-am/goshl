@@ -279,3 +279,16 @@ func TestCalculateSegmentsInvariants(t *testing.T) {
 		}
 	}
 }
+
+func TestCalculateSegmentsCutsKeyframesThatMissTheTargetByRoundingNoise(t *testing.T) {
+	keyframes := []float64{0, 1.0000004, 1.9999996, 3.0000004, 3.9999996, 5.0000004}
+	segments := CalculateSegments(keyframes, 6, 1)
+	if len(segments) != 6 {
+		t.Fatalf("keyframes one second apart at a one second target must give 6 segments, got %d: %#v", len(segments), segments)
+	}
+	for _, segment := range segments {
+		if math.Abs(segment.Duration-1) > 0.00001 {
+			t.Errorf("segment %d lasts %.7f, want 1", segment.Index, segment.Duration)
+		}
+	}
+}

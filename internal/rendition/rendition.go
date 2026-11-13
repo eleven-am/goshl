@@ -3,6 +3,7 @@ package rendition
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
@@ -32,13 +33,19 @@ var passthroughCeilings = map[string]int{
 	"eac3": 1_536_000,
 }
 
-func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.VideoRendition, error) {
+type Dropped struct {
+	Name   string
+	Reason string
+}
+
+func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.VideoRendition, []Dropped, error) {
 	video := meta.Video
 	if video.Width <= 0 || video.Height <= 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	direct := directStreamCompatible(video) && playlist.KeyframeAligned(meta.Keyframes, meta.Duration, targetDuration)
+	sourceEnd := videoEndBeforePlan(meta)
+	direct := directStreamCompatible(video) && sourceEnd == 0 && playlist.KeyframeAligned(meta.Keyframes, meta.Duration, targetDuration)
 	sourceBitrate := sourceVideoBitrate(meta)
 
 	width, height := video.Width, video.Height
@@ -49,8 +56,9 @@ func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.Vide
 	sourceClass := classFor(sourceShort)
 
 	colour := domain.PlanColour(video)
+	window := planWindow(meta, targetDuration)
 	var renditions []domain.VideoRendition
-	var rejected []string
+	var dropped []Dropped
 
 	topBitrate := sourceBitrate
 	if !direct {
@@ -59,10 +67,13 @@ func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.Vide
 	ceiling := topBitrate
 	if direct {
 		renditions = append(renditions, directRendition(video, topBitrate))
+		renditions[0].PeakBandwidth = directPeakBandwidth(meta, window)
 	} else if top, err := transcodedRendition(width, height, topBitrate, video.FrameRate); err != nil {
-		rejected = append(rejected, err.Error())
+		dropped = append(dropped, Dropped{Name: rungName(width, height), Reason: err.Error()})
 	} else {
 		top.Colour = colour
+		top.SourceEnd = sourceEnd
+		top.PeakBandwidth = encodedPeakBandwidth(top, window)
 		renditions = append(renditions, top)
 	}
 
@@ -76,18 +87,31 @@ func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.Vide
 		bitrate := min(clamp(int(float64(topBitrate)*ratio), rung.minBitrate, rung.maxBitrate), ceiling)
 		candidate, err := transcodedRendition(rungWidth, rungHeight, bitrate, video.FrameRate)
 		if err != nil {
-			rejected = append(rejected, err.Error())
+			dropped = append(dropped, Dropped{Name: rungName(rungWidth, rungHeight), Reason: err.Error()})
 			continue
 		}
 		candidate.Colour = colour
+		candidate.SourceEnd = sourceEnd
+		candidate.PeakBandwidth = encodedPeakBandwidth(candidate, window)
 		renditions = append(renditions, candidate)
 		ceiling = bitrate
 	}
 
 	if len(renditions) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrNoEncodableVideo, strings.Join(rejected, "; "))
+		reasons := make([]string, len(dropped))
+		for index, rung := range dropped {
+			reasons[index] = rung.Reason
+		}
+		return nil, dropped, fmt.Errorf("%w: %s", ErrNoEncodableVideo, strings.Join(reasons, "; "))
 	}
-	return renditions, nil
+	return renditions, dropped, nil
+}
+
+func videoEndBeforePlan(meta *domain.Metadata) float64 {
+	if meta.Duration-meta.Video.End <= domain.StreamTailSlack {
+		return 0
+	}
+	return math.Max(meta.Video.End, 0)
 }
 
 func directRendition(video domain.VideoStream, bitrate int) domain.VideoRendition {
@@ -265,18 +289,19 @@ func audioRendition(name, codec string, bitrate, channels int, method domain.Pla
 	}
 
 	return domain.AudioRendition{
-		Name:        name,
-		Codec:       codec,
-		CodecString: audioCodecString(codec),
-		Bitrate:     bitrate,
-		Channels:    channels,
-		Method:      method,
-		StreamIndex: streamIndex,
-		Language:    audio.Language,
-		Title:       audio.Title,
-		Default:     isDefault,
-		SampleRate:  audio.SampleRate,
-		SourceEnd:   audio.End,
+		Name:          name,
+		Codec:         codec,
+		CodecString:   audioCodecString(codec),
+		Bitrate:       bitrate,
+		PeakBandwidth: audioPeakBandwidth(bitrate, audio.SampleRate, method),
+		Channels:      channels,
+		Method:        method,
+		StreamIndex:   streamIndex,
+		Language:      audio.Language,
+		Title:         audio.Title,
+		Default:       isDefault,
+		SourceEnd:     audio.End,
+		SampleRate:    audio.SampleRate,
 	}
 }
 

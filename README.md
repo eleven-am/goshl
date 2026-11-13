@@ -26,8 +26,10 @@ go get github.com/eleven-am/goshl
 
 ### Runtime requirements
 
-- `ffmpeg` and `ffprobe` in `PATH`, version 6.1 or newer. Transcoded video relies on `-enc_time_base demux`, which older releases do not have; the controller checks both versions at startup and returns an error wrapping `ErrInvalidOptions` if either is older.
-- Source schemes are limited to local paths, `file:`, `http:` and `https:`. Every FFmpeg and FFprobe invocation runs with the protocol whitelist `file,http,https,tcp,tls`; any other scheme (for example `rtmp://`, `concat:` or `data:`) is rejected before FFmpeg starts.
+- `ffmpeg` and `ffprobe` in `PATH`, version 6.1 or newer. Transcoded video relies on `-enc_time_base demux`, which older releases do not have. `NewControllerWithContext` runs both binaries at startup and returns an error wrapping `ErrInvalidOptions` if either is older or its version output is unrecognised. Development builds (`git-...`, `N-...`) are accepted.
+- For HDR sources (PQ or HLG transfer), an `ffmpeg` built with the `zscale` (libzimg) and `tonemap` filters, for example Homebrew `ffmpeg-full` or `jellyfin-ffmpeg`. Use the same build on every replica. This is not checked at startup: it is detected the first time an HDR video job is built, and an `ffmpeg` without these filters fails the HDR renditions of that source explicitly. SDR sources do not need it.
+- Source schemes are limited to local paths, `file:`, `http:` and `https:`. Every FFmpeg and FFprobe invocation runs with the protocol whitelist `file,http,https,tcp,tls`; any other scheme (for example `rtmp://`, `concat:` or `data:`) is rejected before FFmpeg starts. An empty source, an unsupported scheme or a malformed URL returns an error wrapping `ErrUnsupportedSource`.
+- Trust model: goshl treats `sourceURL` as trusted. The host owns URL policy; goshl does not restrict which hosts an http(s) source may point at, including loopback and private IP addresses. FFmpeg, FFprobe and goshl's own range reader fetch the URL as given. goshl's own range reader (used for MP4 and MKV indexing and indexed subtitle extraction) follows at most 5 redirects, only to http(s) URLs, and refuses an https-to-http downgrade. FFmpeg and FFprobe follow redirects themselves under their own limits, which goshl does not control. TLS certificate verification by FFmpeg depends on its TLS backend (SecureTransport, OpenSSL or GnuTLS) and is not enforced by goshl, so hosts should only pass trusted https sources. If source URLs can come from users, validate them in your application and limit outbound network access to the origins you intend. Inputs are restricted to real container formats (`-format_whitelist`). Playlist formats such as HLS or ffconcat are rejected, so a source cannot make FFmpeg open further URLs or files.
 - Generated segments sit on a timeline that starts at 10 seconds rather than 0. Subtitle WebVTT files carry `X-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000` so players keep cues aligned with the video. Sprite, preview and thumbnail output is unaffected.
 
 ## Quick start
@@ -179,7 +181,28 @@ type JobStatus struct {
 
 `JobState` is `JobStateCompleted`, `JobStateFailed` or `JobStateCancelled`; all three are terminal.
 
-`StartBy` is the latest moment a worker may begin the job. A worker refuses a delivery whose `StartBy` has passed, and otherwise runs it with a full `Options.JobTimeout` counted from the start of execution. `Overlap` and `Trailing` are extra media ranges the worker needs so copied segments join without gaps; `VideoStreamIndex` selects the source video stream. A coordinator never interprets them.
+`StartBy` is the latest moment a worker may begin the job. A worker refuses a delivery whose `StartBy` has passed, and otherwise runs it with a full `Options.JobTimeout` counted from the start of execution. `Overlap` and `Trailing` are extra media ranges the worker needs so segments join without gaps: `Overlap` is the segment before the first one (set for audio jobs and copied-video jobs that do not start at segment 0), `Trailing` is one segment after the last one (copied video only). `VideoStreamIndex` selects the source video stream. A coordinator never interprets them.
+
+The rendition structs inside a job are part of the contract too. Round-trip every field, including the ones added since earlier releases:
+
+```go
+type VideoRendition struct {
+    Name, Width, Height, Bitrate, PeakBitrate, BufferSize, FrameRate, Codec, Level, Method
+    Colour    ColourPlan // Tonemap, AssumeMatrix, AssumePrimaries
+    SourceEnd float64    // video end in seconds when it ends early, otherwise 0
+}
+
+type AudioRendition struct {
+    Name, Codec, CodecString, GroupID, Bitrate, Channels, Method
+    SampleRate  int
+    SourceEnd   float64 // end of the source audio stream in seconds, 0 if unknown
+    StreamIndex int
+    Language, Title string
+    Default     bool
+}
+```
+
+The job contract version is 5; it is part of the pipeline profile, so replicas on a different contract never share a queue. [MIGRATION.md](MIGRATION.md) lists what a coordinator must carry.
 
 `Job.ID` is the deterministic batch identity used for locking. `Job.RunID` identifies one execution of that batch and is the queue idempotency key.
 
@@ -217,13 +240,13 @@ type PathGenerator interface {
 |---|---|
 | `NewControllerWithContext(ctx, Options) (*Controller, error)` | Validates options, applies defaults, runs hardware detection and validation. Returns an error wrapping `ErrInvalidOptions` for bad options. |
 | `NewController(Options) *Controller` | Same, panics on error. |
-| `Start(ctx) error` | Starts the video and audio worker pools. |
+| `Start(ctx) error` | Starts the video and audio worker pools. Returns `ErrControllerStopped` if `Stop` has already run, including when it ran during `Start`. |
 | `Stop()` | Idempotent. Cancels detached work (asset generation, metadata probes, flight watchers), waits up to 10 seconds for it, then releases the locks of flights that were never enqueued. A `Segment` call racing `Stop` returns `ErrControllerStopped`. Locks of jobs already enqueued are not released; they expire by their TTL (`StartBy` plus `JobTimeout` plus one minute). A stopped controller cannot be restarted. |
 | `HWAccelConfig() HWAccelConfig` | Copy of the selected hardware configuration: `Accelerator`, `Requested`, `Available`, `Error`, `DecodeMode`, plus the FFmpeg flags in use. |
 
 After `Stop`, every method returns `ErrControllerStopped` (checked before argument validation) except `Stop` itself, `HWAccelConfig` (a pure accessor) and the constructors. This covers `Start`, `Segment`, `Metadata`, `ProbeMetadata`, `MasterPlaylist`, `VariantPlaylist`, `SubtitlePlaylist`, `SpriteVTT`, `Sprite`, `SubtitleVTT`, `SubtitlesVTT`, `Preview`, `Thumbnail`, `MediaKey` and `Invalidate`.
 
-With `HWAccel: true`, construction may take noticeably longer when hardware validation fails: an explicit `HWAccelMode` is validated with a 15-second bound. Auto-detection (`HWAccel: true`) runs detection and validation inside a single 20-second bound.
+With `HWAccel: true` or an explicit `HWAccelMode`, construction runs a hardware self-test. An explicit `HWAccelMode` is validated once with a 15-second bound. Auto-detection (`HWAccel: true`) spends up to 10 seconds detecting accelerators, then validates each detected one in the order CUDA, QSV, VideoToolbox, VAAPI with a 15-second bound per accelerator and keeps the first that passes. On a host where all four are present and every one fails slowly, `NewController` can therefore take up to 70 seconds before it falls back to software. Pass a context with a deadline to `NewControllerWithContext` to cap it.
 
 ### Playlists and segments
 
@@ -243,7 +266,9 @@ With `HWAccel: true`, construction may take noticeably longer when hardware vali
 | `MediaKey(ctx, sourceURL) (string, error)` | The resolved opaque media key. |
 | `Invalidate(ctx, sourceURL) error` | Deletes everything stored for the media, including `SpriteStorage` when configured. Returns `ErrCacheInvalidationUnsupported` if `Storage` (or a configured `SpriteStorage`) has no `DeleteMedia`. |
 
-`Metadata` carries `StartTime`, `Duration`, `Keyframes`, one `Video` stream, and `Audios` and `Subtitles` lists. Each subtitle has a stable `ID` (for example `subtitle-3`) used as the track ID everywhere else.
+`Metadata` carries `StartTime`, `Duration`, `Bitrate` (container bits per second, 0 if unknown), `Keyframes`, one `Video` stream, and `Audios` and `Subtitles` lists. `VideoStream.End` and `AudioStream.End` are the stream ends in seconds on the `Metadata` timeline, 0 if unknown. When the container declares no end they are measured from the last packets (one bounded read of the file tail at probe time; they stay 0 if no packet is found within 15 minutes of the end or the read takes over 20 seconds). `Duration` is bounded by the known stream ends; when the container declares none, it is the latest stream end, audio included. `VideoStream.FrameRate` is the average frame rate when known, so a 50 fields-per-second interlaced source reports 25. Each subtitle has a stable `ID` (for example `subtitle-3`) used as the track ID everywhere else. `Metadata` lists every subtitle track, including ones that cannot be served (see below).
+
+Probing reads an MP4 from its `moov` box and an MKV or WebM from its Matroska Cues element, so neither needs a full packet scan or download. Cues are used when they leave no keyframe gap above 11.5 seconds; otherwise the probe falls back to the scan. A real I/O error reading the MP4 header (local or remote) fails the probe rather than falling back to the packet scan. Remote MP4s are indexed from the `moov` box, which reads a small fraction of the file.
 
 A probe that fails is remembered in process for 10 seconds (at most 1024 sources are remembered; the earliest to expire is evicted first), so repeated requests for a broken source return the same error without re-running ffprobe. `Invalidate(sourceURL)` forgets that source's entry, and a probe that began before any `Invalidate` call is not remembered.
 
@@ -271,9 +296,11 @@ type ThumbnailConfig struct {
 }
 ```
 
-For progressive MP4 sources, Goshl reads the MP4 index and fetches only the bytes belonging to requested `mov_text`/`tx3g` or `wvtt` subtitle samples. Local files use random access and HTTP sources use validated byte-range requests. The generated WebVTT is stored through `Storage`, so later requests do not reopen the source.
+Only text subtitle codecs are served: the allowlist is in `internal/subtitle/codec.go` and covers SubRip, ASS/SSA, `mov_text`/`tx3g`, WebVTT/`wvtt`, MicroDVD, SAMI and similar text formats, plus `eia_608`, which converts only from standalone caption inputs such as `.scc`. Bitmap tracks (PGS, DVD, DVB, XSUB, teletext) and unlisted codecs such as TTML are not listed in the master playlist, and `SubtitlePlaylist`, `SubtitleVTT` and `SubtitlesVTT` return an error wrapping `ErrRenditionNotFound` for them (for `SubtitlesVTT`, in that track's `SubtitleResult.Err`). Unknown track IDs return the same error, with text of the form `rendition not found: subtitle track X`.
 
-Unsupported containers, fragmented MP4 layouts, subtitle codecs, and HTTP servers without byte-range support continue through the FFmpeg fallback. Subtitle extraction remains request driven; probing and ingest do not extract subtitle payloads.
+For progressive MP4 sources, Goshl reads the MP4 index and fetches only the bytes belonging to requested `mov_text`/`tx3g` or `wvtt` subtitle samples. Local files use random access and HTTP sources use validated byte-range requests. For MKV sources whose Cues cover the requested subtitle tracks, only the cued blocks are read and ffmpeg converts them, with output identical to a full read; other tracks use one full pass shared by all tracks requested together. The generated WebVTT is stored through `Storage`, so later requests do not reopen the source.
+
+Unsupported containers, fragmented MP4 layouts, and HTTP servers without byte-range support continue through the FFmpeg fallback. A failed single-track batch is not rerun with the identical command, and a partial batch output is never stored. Subtitle extraction remains request driven; probing and ingest do not extract subtitle payloads.
 
 ## Options
 
@@ -313,7 +340,7 @@ goshl.Options{
 }
 ```
 
-Negative durations, sizes, or out-of-range preview and thumbnail values make construction return `ErrInvalidOptions` (or `ErrInvalidPreviewConfig` / `ErrInvalidThumbnailConfig` wrapped in it).
+Negative durations, sizes, or out-of-range preview and thumbnail values make construction return `ErrInvalidOptions` (or `ErrInvalidPreviewConfig` / `ErrInvalidThumbnailConfig` wrapped in it). `TargetDuration` must be 1-60 seconds, `SegmentsPerJob` at most 1000 and pool sizes at most 1024; violations wrap `ErrInvalidOptions`. Segments are at most `max(2 x TargetDuration, 12 s)` long; see Playback behavior.
 
 A segment request waits up to `SegmentTimeout` for the segment, but the job itself is never cancelled because a waiter left. A queued job that does not start before its `StartBy` (enqueue time plus `JobTimeout`) is settled as failed with a start-by error rather than run.
 
@@ -321,7 +348,7 @@ Local files use size and modification time as their default source revision. Rem
 
 ## Hardware acceleration
 
-Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Intel QSV, Apple VideoToolbox and VAAPI. Detection performs a bounded decode/filter/encode self-test. Auto mode falls back to software and exposes the reason through `controller.HWAccelConfig()` and observer events.
+Set `HWAccel: true` to auto-detect GPU encoding. Supported accelerators are NVIDIA CUDA/NVENC, Intel QSV, Apple VideoToolbox and VAAPI. Detection runs a bounded decode/filter/encode self-test on each detected accelerator in the order CUDA, QSV, VideoToolbox, VAAPI and selects the first that passes. If none passes, auto mode falls back to software. `controller.HWAccelConfig().Error` and the `EventHardwareFallback` event list the failure of every accelerator that was skipped, including when a lower-priority accelerator was selected. Software encoding uses libx264 `superfast`, the fastest preset that produces the High profile the playlists advertise. VideoToolbox encodes with `-g 250`, so only the forced segment keyframes appear.
 
 Set `HWAccelMode` when the caller already knows the desired accelerator:
 
@@ -369,7 +396,8 @@ Workers on different accelerators use different pipeline profiles and never exch
 | `EventJobDeliveryRejected` | A worker refused a malformed delivery (wrong profile or invalid job). A job whose `StartBy` already passed is not a rejection: it is settled failed and reported as `EventJobFailed`. |
 | `EventPoolSubscriptionLost` | A worker pool lost its coordinator subscription. |
 | `EventSegmentReady`, `EventSegmentNotifyFailed` | `EventSegmentReady`: a waiting request learned of its segment through the coordinator's readiness notification (requests satisfied directly from storage do not emit it). `EventSegmentNotifyFailed`: the worker could not publish the notification. |
-| `EventHardwareSelected`, `EventHardwareFallback` | Hardware choice at construction, and the reason when it fell back to software. |
+| `EventHardwareSelected`, `EventHardwareFallback` | Hardware choice at construction, and the reasons when a preferred accelerator was skipped (for a lower-priority one or for software). |
+| `EventRenditionDropped` | A video rendition was left out of the ladder (it would need an H.264 level above 5.2). Emitted per dropped rendition on each master playlist request; `Rendition` and `Error` carry the name and the reason. |
 
 FFmpeg and FFprobe stderr are bounded, and source URLs, credentials, query strings, and media paths are redacted from returned command errors.
 
@@ -377,11 +405,12 @@ FFmpeg and FFprobe stderr are bounded, and source URLs, credentials, query strin
 
 | Error | Returned when |
 |---|---|
-| `ErrInvalidOptions` | `Options` failed validation. |
-| `ErrControllerStopped` | The controller was stopped; build a new one. |
+| `ErrInvalidOptions` | `Options` failed validation, or `ffmpeg` or `ffprobe` is older than 6.1. |
+| `ErrUnsupportedSource` | The source is empty, uses a scheme other than file/http/https, or is a malformed URL. |
+| `ErrControllerStopped` | The controller was stopped; build a new one. Also returned by `Start` when `Stop` has already run, and to waiters on a lock another replica holds when `Stop` runs. |
 | `ErrInvalidPreviewConfig`, `ErrInvalidThumbnailConfig` | A preview or thumbnail config is out of range. |
 | `ErrInvalidStreamType` | `Segment` or `VariantPlaylist` got a stream type other than video or audio. |
-| `ErrRenditionNotFound` | The rendition name is invalid or not offered for this source. |
+| `ErrRenditionNotFound` | The rendition name is invalid or not offered for this source, or the subtitle track ID is unknown or its codec cannot be converted to WebVTT. |
 | `ErrSegmentOutOfRange` | Negative or past-the-end segment index, or a source with no playable segments. |
 | `ErrSegmentTimeout` | A segment did not become available within `SegmentTimeout`. |
 | `ErrMetadataTimeout` | Metadata did not become available in time, including when a probe (this replica's, or the replica holding the lock) hit `ProbeTimeout`; the error also wraps `context.DeadlineExceeded` and the probe error. |
@@ -393,7 +422,15 @@ Match with `errors.Is`.
 
 ## Playback behavior
 
-Direct H.264 remuxing is restricted to compatible 8-bit `yuv420p` Baseline/Main/High streams that start with a keyframe; other inputs transcode to High-profile `yuv420p` H.264. Master playlists distinguish audio codec and channel groups, declare aggregate bandwidth and codecs, support silent and audio-only media, and expose subtitle groups (unless `OmitSubtitleRenditions` is set).
+Segments last at most `max(2 x TargetDuration, 12 s)`. A keyframe gap longer than that is split into equal pieces, the planner cuts early at the previous keyframe to stay under the cap, and a tail sliver shorter than `min(0.5 s, TargetDuration / 2)` merges into the previous segment. Rounding noise in keyframe times (for example millisecond-rounded MKV cues) does not merge segments.
+
+Direct H.264 remuxing (the `DirectStream` method) is restricted to streams that are all of the following: H.264 Baseline, Main or High at a known level of 5.2 or lower; 8-bit `yuv420p` or `yuvj420p`; starting with a keyframe (within 1.5 ms of the video start); no rotation and no anamorphic sample aspect ratio; not tagged PQ or HLG; not ending more than 0.5 s before the end of the file; and with every keyframe gap within the segment cap (12 s at the default target; a source with no keyframe list is never copied). Other inputs transcode to High-profile `yuv420p` H.264, which includes the source-resolution rung of a source that cannot be copied.
+
+Every transcode is tagged BT.709 limited range. Untagged sources are assumed BT.709 (1280 pixels wide or more, or over 576 lines) or SMPTE 170M, and full-range sources are converted rather than emitted as `yuvj420p`. HDR (PQ or HLG) sources are tone mapped to SDR in software with `zscale` and `tonemap`; see the runtime requirements.
+
+Transcoded audio from sources at 44.1 kHz or 32 kHz joins frame-exactly across jobs. Sources whose video starts after the container start are cut on the plan, and every job's output is validated against its expected segment times; a mismatch fails the job instead of caching misplaced segments. When the video ends before the audio, the remaining video segments repeat the last frame.
+
+Master playlists distinguish audio codec and channel groups, declare aggregate bandwidth and codecs, support silent and audio-only media, and expose subtitle groups (unless `OmitSubtitleRenditions` is set). Each audio group has the same members, one per source track, with `NAME` taken from the track title or language label, exactly one `DEFAULT` per group, and `LANGUAGE` as an RFC 5646 tag (`en`, not `eng`). Subtitle `DEFAULT` follows the source disposition, subtitle names are unique, and `FORCED=YES` implies `AUTOSELECT=YES`. An audio-only master carries `BANDWIDTH` and `SUBTITLES`. `MasterPlaylist`, `SubtitlePlaylist` and `VariantPlaylist` return an error rather than write an invalid playlist (no renditions, zero bitrate, empty codec, zero duration or no segments).
 
 ## Upgrading
 

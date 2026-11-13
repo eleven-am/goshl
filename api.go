@@ -139,6 +139,8 @@ const (
 	EventHardwareFallback = domain.EventHardwareFallback
 
 	EventLockReleaseFailed = domain.EventLockReleaseFailed
+
+	EventRenditionDropped = domain.EventRenditionDropped
 )
 
 var (

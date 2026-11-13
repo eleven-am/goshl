@@ -409,7 +409,6 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 const (
 	videoEndTolerance = 0.1
 	audioEndTolerance = 0.06
-	jobTailSlack      = 0.5
 )
 
 func segmentEnds(job domain.Job, isVideo bool) map[int]SegmentEnd {
@@ -425,7 +424,7 @@ func segmentEnds(job domain.Job, isVideo bool) map[int]SegmentEnd {
 	for position, segment := range job.Segments {
 		end := SegmentEnd{Time: offset + segment.End, Early: tolerance, Late: tolerance}
 		if position == len(job.Segments)-1 && job.Trailing == nil {
-			end.Early = jobTailSlack
+			end.Early = domain.StreamTailSlack
 		}
 		ends[segment.Index] = end
 	}

@@ -57,13 +57,14 @@ type SegmentStatus struct {
 }
 
 type Metadata struct {
-	StartTime float64
-	Duration  float64
-	Bitrate   int
-	Keyframes []float64
-	Video     VideoStream
-	Audios    []AudioStream
-	Subtitles []SubtitleStream
+	StartTime     float64
+	Duration      float64
+	Bitrate       int
+	Keyframes     []float64
+	KeyframeBytes []int64
+	Video         VideoStream
+	Audios        []AudioStream
+	Subtitles     []SubtitleStream
 }
 
 type VideoStream struct {

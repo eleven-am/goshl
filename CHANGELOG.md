@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+Output correctness release R2 (cache `goshl-cache-v5`, job contract version 5). See MIGRATION.md.
+
+- feat(planner): segments last at most max(2 x target, 12 s); long keyframe gaps are split, tail slivers merge, rounding noise no longer merges segments
+- feat(probe): `Metadata.Bitrate`, `VideoStream.End` and `AudioStream.End`; ends are measured from the file tail when undeclared; average frame rate; MKV and WebM keyframes from Matroska Cues; MP4 header I/O errors fail the probe
+- feat(colour): all transcodes tagged BT.709 limited range; PQ and HLG sources tone mapped with `zscale` and `tonemap` (an ffmpeg with libzimg is required for HDR); HDR is not direct-streamed
+- feat(hwaccel): auto-detection validates CUDA, QSV, VideoToolbox and VAAPI in order, reports skipped accelerators in `HWAccelConfig().Error` and `EventHardwareFallback`; VideoToolbox uses `-g 250`; software preset is `superfast` (High profile)
+- feat(playlist): RFC 8216 audio groups, RFC 5646 languages, unique subtitle names, valid audio-only masters; invalid playlists return errors
+- feat(subtitles): only text codecs are listed and served, others return `ErrRenditionNotFound`; MKV subtitles read only cued blocks; failed batches are not rerun identically
+- feat(video): a video that ends early repeats its last frame (`VideoRendition.SourceEnd`); renditions above H.264 level 5.2 are dropped with the new `EventRenditionDropped`
+- feat(contract): job contract 5: coordinators must also carry `VideoRendition.BufferSize`, `Colour` and `SourceEnd`, and `AudioRendition.SampleRate`, `SourceEnd` and `Title`
+- fix(audio): non-48 kHz audio joins frame-exactly across jobs; job output is validated against the plan
+- fix(runtime): `Start` returns `ErrControllerStopped` after `Stop`; lock-held waiters, enqueue cancellation and pool shutdown with a cause no longer orphan locks or fail redeliverable jobs
+- fix(options): `TargetDuration` 1-60 s, `SegmentsPerJob` at most 1000, pool sizes at most 1024; inputs restricted with `-format_whitelist`; `ErrUnsupportedSource` for empty, unsupported or malformed sources
+- docs: trust model for source URLs, ffmpeg 6.1 startup check, HDR requirement
+
 ## [0.0.22] - 2026-10-20
 
 - fix(transcode): measure the seek landing for direct-stream jobs so copied segments align with the playlist

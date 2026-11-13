@@ -100,7 +100,7 @@ func TestControllerSubtitleCuesFollowVideoOnOffsetSource(t *testing.T) {
 			if containing < 0 {
 				t.Fatalf("no planned segment contains source cue at %.3f", cueSource)
 			}
-			videos, err := rendition.GenerateVideo(meta, 2)
+			videos, _, err := rendition.GenerateVideo(meta, 2)
 			if err != nil || len(videos) == 0 {
 				t.Fatalf("generate video renditions: %v (%d renditions)", err, len(videos))
 			}

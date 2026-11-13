@@ -353,7 +353,7 @@ func TestControllerSegmentsFormOneContinuousTimeline(t *testing.T) {
 				joinTolerance = 0.001
 			}
 			var direct, transcoded int
-			videos, err := rendition.GenerateVideo(meta, 2)
+			videos, _, err := rendition.GenerateVideo(meta, 2)
 			if err != nil {
 				t.Fatalf("generate video renditions: %v", err)
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"net/url"
 	"os"
@@ -556,5 +557,92 @@ func TestProbe_ReportsVideoStartAndAudioSampleRate(t *testing.T) {
 	}
 	if !meta.Video.StartsWithKeyframe {
 		t.Errorf("a stream whose first keyframe is its first frame must report StartsWithKeyframe")
+	}
+}
+
+func sumBytes(values []int64) int64 {
+	var total int64
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+func TestProbe_KeyframeBytesParallelKeyframes(t *testing.T) {
+	cases := map[string][]string{
+		"mp4 header index": {"-bf", "2", "-movflags", "+faststart"},
+		"packet scan":      {"-f", "mpegts"},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			ext := "indexed.mp4"
+			if name == "packet scan" {
+				ext = "scan.ts"
+			}
+			path := makeMedia(t, ext, extra...)
+			meta, err := NewProber().Probe(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(meta.Keyframes) == 0 || len(meta.KeyframeBytes) != len(meta.Keyframes) {
+				t.Fatalf("keyframes %d bytes %d", len(meta.Keyframes), len(meta.KeyframeBytes))
+			}
+			for i, size := range meta.KeyframeBytes {
+				if size <= 0 {
+					t.Fatalf("group %d has %d bytes", i, size)
+				}
+			}
+		})
+	}
+}
+
+func TestProbe_KeyframeBytesWithNonZeroStart(t *testing.T) {
+	path := makeMedia(t, "offset.ts", "-output_ts_offset", "1.4", "-f", "mpegts")
+	meta, err := NewProber().Probe(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.StartTime < 1 {
+		t.Fatalf("fixture start %f", meta.StartTime)
+	}
+	if len(meta.KeyframeBytes) != len(meta.Keyframes) || sumBytes(meta.KeyframeBytes) <= 0 {
+		t.Fatalf("keyframes %d bytes %v", len(meta.Keyframes), meta.KeyframeBytes)
+	}
+}
+
+func TestAssignKeyframeBytes(t *testing.T) {
+	raw := []float64{1.4, 3.4, 5.4}
+	groups := []int64{10, 20, 30}
+	got := assignKeyframeBytes(raw, groups, 1.4, []float64{0, 2, 4})
+	if fmt.Sprint(got) != "[10 20 30]" {
+		t.Fatalf("got %v", got)
+	}
+	if got := assignKeyframeBytes(raw, groups[:2], 1.4, []float64{0, 2, 4}); got != nil {
+		t.Fatalf("mismatched groups must yield nil, got %v", got)
+	}
+	merged := assignKeyframeBytes(raw, groups, 1.4, []float64{0, 4})
+	if fmt.Sprint(merged) != "[30 30]" {
+		t.Fatalf("got %v", merged)
+	}
+}
+
+func TestKeyframeScanFoldsLeadingBytesIntoFirstGroup(t *testing.T) {
+	var scan keyframeScan
+	scan.add([]string{"0.04", "0.04", "100", "___"})
+	scan.add([]string{"0.08", "0.04", "50", "K__"})
+	scan.add([]string{"0.12", "0.04", "7", "___"})
+	if fmt.Sprint(scan.bytes) != "[157]" {
+		t.Fatalf("got %v", scan.bytes)
+	}
+}
+
+func TestKeyframeScanFoldsUnparseablePtsKeyframeIntoCurrentGroup(t *testing.T) {
+	var scan keyframeScan
+	scan.add([]string{"0.00", "0.04", "10", "K__"})
+	scan.add([]string{"N/A", "0.04", "5", "K__"})
+	scan.add([]string{"0.08", "0.04", "3", "___"})
+	scan.add([]string{"1.00", "0.04", "20", "K__"})
+	if fmt.Sprint(scan.bytes) != "[18 20]" || len(scan.keyframes) != 2 {
+		t.Fatalf("got %v keyframes %v", scan.bytes, scan.keyframes)
 	}
 }
