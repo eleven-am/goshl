@@ -5,7 +5,7 @@ This guide covers upgrading to the current release: cache schema `goshl-cache-v5
 ## Summary
 
 - Cache schema is now `goshl-cache-v5` (v0.0.22 used v3). Every source is re-probed and re-transcoded once, and every subtitle, sprite, preview and thumbnail is regenerated.
-- Job contract version is 5. A coordinator must round-trip every `Job` field and every `VideoRendition` and `AudioRendition` field; see "Coordinator and worker contract". Producers and workers must roll together.
+- Job contract version is 5. A coordinator must round-trip every `Job` field and every `VideoRendition` and `AudioRendition` field; workers verify this with `Job.Digest` and refuse a job that changed in transit. See "Coordinator and worker contract". Producers and workers must roll together.
 - Segment counts and indices change for most sources (new planner).
 - FFmpeg and FFprobe 6.1 or newer are required, enforced at startup. HDR sources need an ffmpeg with `zscale` and `tonemap`.
 - Output media sits on a timeline offset by 10 seconds; subtitle WebVTT carries an `X-TIMESTAMP-MAP`.
@@ -21,7 +21,7 @@ The cache schema moves from `goshl-cache-v4` to `goshl-cache-v5`, and the job co
 
 ### Coordinator and worker contract
 
-A coordinator must serialize and restore every field below without rounding, recalculating or dropping any, including fields it does not interpret. Workers act on these fields directly, so a coordinator that drops one changes the output rather than failing with a clear error.
+A coordinator must serialize and restore every field below without rounding, recalculating or dropping any, including fields it does not interpret. Workers act on these fields directly. `Job.Digest` lets a worker detect a field that was dropped, rounded or rewritten: the job is then settled failed with a `digest mismatch` error and `EventJobDeliveryRejected` is emitted, instead of wrong media being stored.
 
 `Job`:
 
@@ -33,23 +33,27 @@ A coordinator must serialize and restore every field below without rounding, rec
 - `Overlap`: the segment before the first one. Set for audio jobs and for copied-video jobs that do not start at segment 0. A coordinator that drops it breaks the join between jobs.
 - `Trailing`: one segment after the last one, for copied video only.
 - `VideoStreamIndex`: the source video stream the worker encodes.
+- `Digest`: a SHA-256 hex string over every other job field except `EnqueuedAt` and `StartBy`, set by the producer. Carry it unchanged. The two times are excluded, so they may be stored at any precision or in any zone.
 - `VideoRendition`, `AudioRendition`: see below.
 
 `VideoRendition`:
 
 - `Name`, `Width`, `Height`, `Bitrate`, `PeakBitrate`, `FrameRate`, `Codec`, `Level`, `Method`.
 - `BufferSize`: rate-control buffer, derived from the H.264 level.
+- `PeakBandwidth`: the measured or estimated peak bits per second used for the playlist `BANDWIDTH`.
 - `Colour`: a `ColourPlan` (`Tonemap`, `AssumeMatrix`, `AssumePrimaries`) telling the worker how to tag, convert or tone map the source.
 - `SourceEnd`: the video end in seconds when the video ends more than 0.5 s before the end of the file, otherwise 0. The worker repeats the last frame to fill the remaining segments.
 
 `AudioRendition`:
 
-- `Name`, `Codec`, `CodecString`, `GroupID`, `Bitrate`, `Channels`, `Method`, `StreamIndex`, `Language`, `Default`.
+- `Name`, `Codec`, `CodecString`, `Bitrate`, `Channels`, `PeakBandwidth`, `Method`, `StreamIndex`, `Language`, `Default`.
 - `Title`: the track title, used for the playlist `NAME`.
-- `SampleRate`: the source sample rate. Workers use it to join audio frame-exactly across jobs for 44.1 kHz and 32 kHz sources.
+- `SampleRate`: the source sample rate. Workers use it for passthrough (AC-3, E-AC-3) audio when a job must pad or generate silence past the end of the source audio, so those segments keep the source rate and frame grid.
 - `SourceEnd`: the end of the source audio stream in seconds, 0 if unknown. Workers pad the audio with silence (`apad`) up to the plan.
 
-A JSON or protobuf coordinator written against v4 almost certainly drops `BufferSize`, `Colour`, `SourceEnd` (both renditions), `SampleRate` and `Title`. Add them before deploying. Adding fields ahead of the Goshl upgrade is safe.
+A JSON or protobuf coordinator written against v4 almost certainly drops `Digest`, `BufferSize`, `PeakBandwidth` (both renditions), `Colour`, `SourceEnd` (both renditions), `SampleRate` and `Title`. Add them before deploying. Adding fields ahead of the Goshl upgrade is safe. `AudioRendition.GroupID` no longer exists; remove it from your schema when convenient.
+
+Besides the digest, a worker refuses a job with an unknown `Method`, a transcoded audio rendition without `Channels` or `Bitrate`, a passthrough audio rendition without `Codec`, an audio or copied-video job after segment 0 without `Overlap`, and an `audioN_...` rendition whose `StreamIndex` is not N. Video jobs run ffmpeg with `-an -sn -dn` and audio jobs with `-vn -sn -dn`, so a stream index that names the wrong kind of stream fails the job.
 
 ### Rolling deploy
 
@@ -73,11 +77,14 @@ Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the de
 ### Probe and metadata
 
 - `Metadata` gains `Bitrate` (container bits per second, 0 = unknown). `VideoStream` and `AudioStream` gain `End` (seconds on the `Metadata` timeline, 0 = unknown).
-- `End` is measured from the last packets when the container declares nothing: one bounded read of the file tail at probe time. It stays 0 only when no packet is found within 15 minutes of the end, or the read takes over 20 seconds.
+- `End` is measured from the last packets when the container declares nothing, with bounded reads at probe time. The probe reads the last 15 seconds, then searches the rest of the file for a stream that ended earlier. `End` stays 0 only when the reads take over 20 seconds or find no packet.
 - `VideoStream.FrameRate` is now the average frame rate when known, so VFR and field-rate sources change (50 becomes 25).
 - `Duration` is bounded by known stream ends. A missing container duration is derived from the streams (audio included) or from the packet scan.
 - A real I/O error reading the MP4 header (local or remote) now fails the probe instead of falling back to the packet scan. Remote MP4s are indexed from the `moov` box.
 - MKV and WebM keyframes come from the Matroska Cues element instead of a full packet scan, so remote MKVs need no full download. If a cue list has a gap over 11.5 s, the probe falls back to the scan. `VideoStream.End` on cued MKVs comes from the `DURATION` tag, or is 0 when the tag is absent.
+- `AudioStream.End` of MPEG-TS sources is measured from the last packet and is up to 0.3 s later than before; `Duration` of a TS source is at least its latest stream end.
+- A Matroska or TS stream that starts after ffprobe's analysis window no longer reports the container duration as its end.
+- Truncated audio-only sources, and sources whose audio is cut after the video ended, report the last readable audio packet as `End` and `Duration` instead of the declared values.
 
 ### Video and audio output
 
@@ -107,7 +114,7 @@ Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the de
 
 - Only text subtitle codecs are advertised and served (allowlist in `internal/subtitle/codec.go`). Bitmap tracks (PGS, DVD, DVB, XSUB, teletext) and unlisted codecs such as TTML are no longer in the master playlist. `SubtitlePlaylist`, `SubtitleVTT` and `SubtitlesVTT` return an error wrapping `ErrRenditionNotFound` for them and for unknown track IDs. The error text for unknown IDs changes from `subtitle track X not found` to `rendition not found: subtitle track X`. `Metadata` still lists every track.
 - A failed single-track batch is no longer rerun with the identical command. FFmpeg runs with `-y` and `-nostdin`, retries write fresh files, and a partial batch output is never stored.
-- Subtitle tracks of MKV sources whose cues cover them are read from only the cued blocks and converted by ffmpeg as before, so output is byte-identical. Other tracks fall back to one full pass shared by all requested tracks.
+- Subtitle tracks of MKV sources whose cues cover them are read from only the cued blocks and converted by ffmpeg as before, so output is byte-identical. Other tracks fall back to one full pass shared by all requested tracks. An ffmpeg-written MKV that holds blocks before time zero ahead of its first cue is read by the full pass.
 
 ### Runtime and lifecycle
 
@@ -119,12 +126,13 @@ Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the de
 ### New and changed API
 
 - New event `EventRenditionDropped` (`Rendition` names the rung, `Error` gives the reason). Emitted on each `MasterPlaylist` call.
-- `Metadata.Bitrate`, `VideoStream.End`, `AudioStream.End`, `VideoRendition.SourceEnd`, `VideoRendition.BufferSize`, `VideoRendition.Colour`, `AudioRendition.SampleRate`, `AudioRendition.SourceEnd`, `AudioRendition.Title` are new fields.
+- `Metadata.Bitrate`, `VideoStream.End`, `AudioStream.End`, `Job.Digest`, `VideoRendition.SourceEnd`, `VideoRendition.BufferSize`, `VideoRendition.PeakBandwidth`, `VideoRendition.Colour`, `AudioRendition.SampleRate`, `AudioRendition.SourceEnd`, `AudioRendition.PeakBandwidth`, `AudioRendition.Title` are new fields. `ColourPlan`, the type of `VideoRendition.Colour`, is exported.
+- Removed: `AudioRendition.GroupID` (nothing set or read it) and the `DirectPlay` playback method constant (never assigned).
 - `ErrUnsupportedSource` is returned for an empty source, a scheme other than file, http or https, or a malformed URL.
 
 ### Checklist for this release
 
-- Make your Coordinator carry every field in "Coordinator and worker contract", then deploy producers and workers together on the same version.
+- Make your Coordinator carry every field in "Coordinator and worker contract", `Job.Digest` included, then deploy producers and workers together on the same version. Watch for `EventJobDeliveryRejected` with a `digest mismatch` error after the rollout: it names a coordinator that changes jobs in transit.
 - Install ffmpeg and ffprobe 6.1 or newer everywhere; if you serve HDR media, use a build with `zscale` and `tonemap` on every replica.
 - Re-read the trust model in the README and validate user-supplied source URLs in your application.
 - Budget for a cold cache and roughly 1.5 times the software video CPU.

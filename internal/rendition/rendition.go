@@ -237,10 +237,6 @@ func clamp(value, low, high int) int {
 	return min(max(value, low), high)
 }
 
-func GenerateAudio(audio domain.AudioStream) []domain.AudioRendition {
-	return generateAudio(audio, 0, false, true)
-}
-
 func GenerateAudioTracks(audios []domain.AudioStream) []domain.AudioRendition {
 	var renditions []domain.AudioRendition
 

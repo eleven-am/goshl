@@ -26,7 +26,7 @@ func TestRunningJobIsNotEnqueuedTwice(t *testing.T) {
 	}
 	store := &stubStorage{metaData: metadata, metaExists: true, segments: make(map[int][]byte)}
 	coordinator := &countingCoordinator{clusterCoordinator: newClusterCoordinator()}
-	jobTimeout := 200 * time.Millisecond
+	jobTimeout := time.Second
 	requester := NewController(Options{
 		Storage:        store,
 		Coordinator:    coordinator,

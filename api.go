@@ -40,6 +40,7 @@ type (
 	Segment = domain.Segment
 
 	VideoRendition = domain.VideoRendition
+	ColourPlan     = domain.ColourPlan
 
 	AudioRendition = domain.AudioRendition
 
@@ -92,8 +93,6 @@ const (
 	DecodeSafe = domain.DecodeSafe
 
 	DecodeDevice = domain.DecodeDevice
-
-	DirectPlay = domain.DirectPlay
 
 	DirectStream = domain.DirectStream
 

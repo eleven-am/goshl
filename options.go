@@ -106,12 +106,6 @@ func (o *Options) setDefaults() {
 	}
 }
 
-func (o *Options) validate() {
-	if err := o.validateError(); err != nil {
-		panic(err)
-	}
-}
-
 func (o *Options) validateError() error {
 	if o.Storage == nil {
 		return fmt.Errorf("%w: Storage is required", ErrInvalidOptions)

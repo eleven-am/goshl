@@ -15,24 +15,22 @@ import (
 	"github.com/eleven-am/goshl/internal/ffmpeg"
 )
 
-const defaultTargetDuration = 6.0
 const maxResubscribeDelay = 30 * time.Second
 
 var ErrDeliveryLeaseLost = errors.New("job delivery lease lost")
 var ErrJobExpired = errors.New("job start-by time expired")
 
 type Pool struct {
-	coordinator    domain.Coordinator
-	size           int
-	streamType     domain.StreamType
-	targetDuration float64
-	storage        domain.Storage
-	cmdBuilder     *ffmpeg.CommandBuilder
-	segStorage     domain.Storage
-	jobTimeout     time.Duration
-	observer       domain.Observer
-	profile        string
-	newBackoff     func() backoff.BackOff
+	coordinator domain.Coordinator
+	size        int
+	streamType  domain.StreamType
+	storage     domain.Storage
+	cmdBuilder  *ffmpeg.CommandBuilder
+	segStorage  domain.Storage
+	jobTimeout  time.Duration
+	observer    domain.Observer
+	profile     string
+	newBackoff  func() backoff.BackOff
 
 	runMu   sync.Mutex
 	running map[string]context.CancelCauseFunc
@@ -99,16 +97,11 @@ func NewPool(
 	coordinator domain.Coordinator,
 	size int,
 	streamType domain.StreamType,
-	targetDuration float64,
 	storage domain.Storage,
 	cmdBuilder *ffmpeg.CommandBuilder,
 	segStorage domain.Storage,
 	settings ...PoolConfig,
 ) *Pool {
-	if targetDuration <= 0 {
-		targetDuration = defaultTargetDuration
-	}
-
 	config := PoolConfig{JobTimeout: 2 * time.Minute}
 	if len(settings) > 0 {
 		config = settings[0]
@@ -117,18 +110,17 @@ func NewPool(
 		}
 	}
 	return &Pool{
-		coordinator:    coordinator,
-		size:           size,
-		streamType:     streamType,
-		targetDuration: targetDuration,
-		storage:        storage,
-		cmdBuilder:     cmdBuilder,
-		segStorage:     segStorage,
-		jobTimeout:     config.JobTimeout,
-		observer:       config.Observer,
-		profile:        config.Profile,
-		running:        make(map[string]context.CancelCauseFunc),
-		newBackoff:     defaultResubscribeBackoff,
+		coordinator: coordinator,
+		size:        size,
+		streamType:  streamType,
+		storage:     storage,
+		cmdBuilder:  cmdBuilder,
+		segStorage:  segStorage,
+		jobTimeout:  config.JobTimeout,
+		observer:    config.Observer,
+		profile:     config.Profile,
+		running:     make(map[string]context.CancelCauseFunc),
+		newBackoff:  defaultResubscribeBackoff,
 	}
 }
 
@@ -521,18 +513,51 @@ func (p *Pool) validateJob(job domain.Job) error {
 	if job.VideoRendition != nil && job.VideoRendition.Name != job.Rendition || job.AudioRendition != nil && job.AudioRendition.Name != job.Rendition {
 		return fmt.Errorf("invalid job contract: rendition identity is inconsistent")
 	}
+	if err := validateRendition(job); err != nil {
+		return err
+	}
+	copiedVideo := p.streamType == domain.StreamVideo && job.VideoRendition.Method == domain.DirectStream
+	if job.Overlap == nil && job.StartIndex > 0 && (copiedVideo || p.streamType == domain.StreamAudio) {
+		return fmt.Errorf("invalid job contract: overlap is missing")
+	}
 	if job.Overlap != nil && !domain.Adjacent(*job.Overlap, job.Segments[0]) {
 		return fmt.Errorf("invalid job contract: overlap is inconsistent")
 	}
 	if job.Trailing != nil {
 		last := job.Segments[len(job.Segments)-1]
-		copiedVideo := p.streamType == domain.StreamVideo && job.VideoRendition.Method == domain.DirectStream
 		if !copiedVideo || !domain.Adjacent(last, *job.Trailing) {
 			return fmt.Errorf("invalid job contract: trailing is inconsistent")
 		}
 	}
 	if p.streamType == domain.StreamVideo && job.VideoStreamIndex < 0 {
 		return fmt.Errorf("invalid job contract: video stream index is missing")
+	}
+	if job.Digest == "" || job.Digest != domain.JobDigest(job) {
+		return fmt.Errorf("invalid job contract: digest mismatch, the coordinator dropped or altered a job field")
+	}
+	return nil
+}
+
+func validateRendition(job domain.Job) error {
+	if video := job.VideoRendition; job.StreamType == domain.StreamVideo {
+		if video.Method != domain.DirectStream && video.Method != domain.Transcode {
+			return fmt.Errorf("invalid job contract: video method %q is unknown", video.Method)
+		}
+		return nil
+	}
+	audio := job.AudioRendition
+	if audio.Method != domain.DirectStream && audio.Method != domain.Transcode {
+		return fmt.Errorf("invalid job contract: audio method %q is unknown", audio.Method)
+	}
+	if audio.Method == domain.Transcode && (audio.Channels <= 0 || audio.Bitrate <= 0) {
+		return fmt.Errorf("invalid job contract: audio channels or bitrate are missing")
+	}
+	if audio.Method == domain.DirectStream && audio.Codec == "" {
+		return fmt.Errorf("invalid job contract: audio codec is missing")
+	}
+	var track int
+	if matched, _ := fmt.Sscanf(audio.Name, "audio%d_", &track); matched == 1 && track != audio.StreamIndex {
+		return fmt.Errorf("invalid job contract: audio stream index is inconsistent")
 	}
 	return nil
 }

@@ -34,7 +34,7 @@ func (c *countingSubscribeCoordinator) Subscribe(ctx context.Context, streamType
 func TestInvalidDeliveriesWithEmptyRunIDAreEachRejected(t *testing.T) {
 	coord := &stubCoordinator{}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	if !pool.beginJob("", func(error) {}) {
 		t.Fatal("expected the empty run id slot to be free")
 	}
@@ -57,7 +57,7 @@ func TestInvalidDeliveriesWithEmptyRunIDAreEachRejected(t *testing.T) {
 func TestRejectedDeliveryAckFailureStillEmitsRejection(t *testing.T) {
 	coord := &ackFailingCoordinator{stubCoordinator: &stubCoordinator{}}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	delivery := validPoolDelivery("receipt", "")
 	delivery.Job.ID = ""
 
@@ -83,7 +83,7 @@ func TestRejectedDeliveryAckFailureStillEmitsRejection(t *testing.T) {
 func TestStaleSubscriptionGenerationDoesNotResubscribe(t *testing.T) {
 	coord := &countingSubscribeCoordinator{stubCoordinator: &stubCoordinator{}}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	pool.newBackoff = fastBackoff
 	sub := &subscription{ch: make(chan domain.JobDelivery), gen: 3, delays: fastBackoff()}
 
@@ -148,7 +148,7 @@ func TestLeaseIsLostWithinTwoThirdsOfTTLAfterLastRenewal(t *testing.T) {
 func TestPoolRejectsJobWithoutExpectedIndices(t *testing.T) {
 	coord := &stubCoordinator{}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	delivery := validPoolDelivery("receipt", "run")
 	delivery.Job.ExpectedIndices = nil
 

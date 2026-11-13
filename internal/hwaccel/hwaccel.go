@@ -87,10 +87,6 @@ func Select(available []domain.Accelerator) domain.Accelerator {
 	return domain.AccelNone
 }
 
-func DetectBest() *domain.HWAccelConfig {
-	return DetectBestContext(context.Background())
-}
-
 func DetectBestContext(ctx context.Context) *domain.HWAccelConfig {
 	detectCtx, detectCancel := context.WithTimeout(ctx, detectionTimeout)
 	available, err := Detect(detectCtx)
@@ -211,10 +207,6 @@ func NewConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) *domain
 			DecodeMode:   domain.DecodeSafe,
 		}
 	}
-}
-
-func RequireConfig(accel domain.Accelerator) (*domain.HWAccelConfig, error) {
-	return RequireConfigWithMode(accel, domain.DecodeSafe)
 }
 
 func RequireConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) (*domain.HWAccelConfig, error) {

@@ -362,8 +362,7 @@ func (c *Controller) buildJob(runID string, startBy time.Time, sourceURL, mediaK
 		value := allSegments[endIdx+1]
 		trailing = &value
 	}
-	now := time.Now()
-	return domain.Job{
+	job := domain.Job{
 		ID:               deterministicJobID(mediaKey, renditionName, streamType, startIdx, endIdx),
 		RunID:            runID,
 		MediaKey:         mediaKey,
@@ -374,7 +373,7 @@ func (c *Controller) buildJob(runID string, startBy time.Time, sourceURL, mediaK
 		StartIndex:       startIdx,
 		EndIndex:         endIdx,
 		RequestedIndex:   index,
-		EnqueuedAt:       now,
+		EnqueuedAt:       time.Now(),
 		StartBy:          startBy,
 		Segments:         segments,
 		Overlap:          overlap,
@@ -384,6 +383,8 @@ func (c *Controller) buildJob(runID string, startBy time.Time, sourceURL, mediaK
 		AudioRendition:   audio,
 		VideoStreamIndex: meta.Video.Index,
 	}
+	job.Digest = domain.JobDigest(job)
+	return job
 }
 
 func deterministicJobID(sourceURL, rendition string, streamType StreamType, startIdx, endIdx int) string {

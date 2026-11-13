@@ -314,17 +314,12 @@ func TestCopyJobRequiresMeasuredLanding(t *testing.T) {
 	}
 }
 
-func TestTrailingRejectedForTranscodeAndAudio(t *testing.T) {
+func TestTrailingRejectedForTranscode(t *testing.T) {
 	builder := NewCommandBuilder(testHW)
 	segments := []domain.Segment{{Index: 2, Start: 4, End: 6}}
 	trailing := domain.Segment{Index: 3, Start: 6, End: 8}
 	if _, err := builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30}, Segments: segments, Trailing: &trailing}); !errors.Is(err, ErrTrailingNotSupported) {
 		t.Fatalf("transcoded video with a trailing segment: got %v", err)
-	}
-	for _, method := range []domain.PlaybackMethod{domain.Transcode, domain.DirectStream} {
-		if _, err := builder.Audio(AudioParams{InputURL: "in", Rendition: domain.AudioRendition{Method: method, Channels: 2, Bitrate: 128000}, Segments: segments, Trailing: &trailing, Landing: landing(4)}); !errors.Is(err, ErrTrailingNotSupported) {
-			t.Fatalf("%s audio with a trailing segment: got %v", method, err)
-		}
 	}
 }
 
@@ -844,5 +839,30 @@ func TestVideoJobPastSourceEndClonesTheLastFrame(t *testing.T) {
 	unknown.SourceEnd = 0
 	if filter := optionValue(t, build(unknown, segments[2:4]), "-vf"); strings.Contains(filter, "tpad") {
 		t.Fatalf("without a known early end nothing is padded: %s", filter)
+	}
+}
+
+func TestJobsKeepOnlyTheirOwnKindOfStream(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := []domain.Segment{{Index: 2, Start: 4, End: 6}}
+	video, err := builder.Video(VideoParams{InputURL: "in", StreamIndex: 1, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30}, Segments: segments})
+	if err != nil {
+		t.Fatalf("video args: %v", err)
+	}
+	copied, err := builder.Video(VideoParams{InputURL: "in", StreamIndex: 1, Rendition: domain.VideoRendition{Method: domain.DirectStream}, Segments: segments, Landing: landing(4)})
+	if err != nil {
+		t.Fatalf("copied video args: %v", err)
+	}
+	audio, err := builder.Audio(AudioParams{InputURL: "in", StreamIndex: 1, Rendition: domain.AudioRendition{Method: domain.Transcode, Channels: 2, Bitrate: 128000}, Segments: segments})
+	if err != nil {
+		t.Fatalf("audio args: %v", err)
+	}
+	for name, test := range map[string]struct {
+		args []string
+		want string
+	}{"video": {video, "-map 0:1 -an -sn -dn"}, "copied video": {copied, "-map 0:1 -an -sn -dn"}, "audio": {audio, "-map 0:1 -vn -sn -dn"}} {
+		if joined := strings.Join(test.args, " "); !strings.Contains(joined, test.want) {
+			t.Errorf("%s args must disable every other stream kind (%q): %s", name, test.want, joined)
+		}
 	}
 }

@@ -3,7 +3,6 @@ package domain
 type PlaybackMethod string
 
 const (
-	DirectPlay   PlaybackMethod = "direct_play"
 	DirectStream PlaybackMethod = "direct_stream"
 	Transcode    PlaybackMethod = "transcode"
 )
@@ -28,7 +27,6 @@ type AudioRendition struct {
 	Name          string
 	Codec         string
 	CodecString   string
-	GroupID       string
 	Bitrate       int
 	Channels      int
 	SampleRate    int

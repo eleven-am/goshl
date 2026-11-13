@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -138,12 +137,6 @@ func TestStopKillsDetachedAssetGeneration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("in-flight request did not return after Stop")
 	}
-}
-
-func goroutinesInFlightWatchers() int {
-	buf := make([]byte, 1<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-	return strings.Count(string(buf), "goshl.(*Controller).watchFlight")
 }
 
 func TestCallsAfterStopReturnErrControllerStopped(t *testing.T) {

@@ -103,7 +103,7 @@ func newTimelinePool(storage *capturingStorage, coordinator *stubCoordinator, st
 		KeyframeFlag: "-force_key_frames",
 		ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
 	})
-	return NewPool(coordinator, 1, stream, 2, storage, builder, storage)
+	return NewPool(coordinator, 1, stream, storage, builder, storage)
 }
 
 type poolRendition struct {
@@ -159,7 +159,7 @@ func timelineJob(id string, fixture poolFixture, rendition poolRendition, start,
 	if rendition.copiedVideo() && end+1 < len(fixture.segments) {
 		job.Trailing = &fixture.segments[end+1]
 	}
-	return job
+	return sealed(job)
 }
 
 func runTimelineJobs(t *testing.T, fixture poolFixture, rendition poolRendition, selector string) map[int][]float64 {
@@ -226,7 +226,7 @@ func aacRendition() poolRendition {
 }
 
 func ac3Rendition() poolRendition {
-	return poolRendition{audio: &domain.AudioRendition{Name: "ac3_passthrough", Method: domain.DirectStream, Channels: 2, StreamIndex: 2}}
+	return poolRendition{audio: &domain.AudioRendition{Name: "ac3_passthrough", Codec: "ac3", Method: domain.DirectStream, Channels: 2, StreamIndex: 2}}
 }
 
 func TestPoolCopyJobsShareNoPTSAcrossJoins(t *testing.T) {
@@ -363,5 +363,30 @@ func TestPoolVideoJobsUseProbedVideoStreamIndex(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPoolJobFailsWhenItsStreamIndexNamesAnotherKindOfStream(t *testing.T) {
+	fixture := newAudioFirstFixture(t)
+	wrongVideo := func(rendition poolRendition) domain.Job {
+		job := timelineJob("wrong-video", fixture, rendition, 0, 1)
+		job.VideoStreamIndex = 0
+		return sealed(job)
+	}
+	wrongAudio := timelineJob("wrong-audio", fixture, aacRendition(), 0, 1)
+	audio := *wrongAudio.AudioRendition
+	audio.StreamIndex = fixture.meta.Video.Index
+	wrongAudio.AudioRendition = &audio
+	for name, job := range map[string]domain.Job{"transcoded video": wrongVideo(transcodeRendition()), "copied video": wrongVideo(copyRendition()), "audio": sealed(wrongAudio)} {
+		storage := newCapturingStorage()
+		coordinator := &stubCoordinator{}
+		pool := newTimelinePool(storage, coordinator, job.StreamType)
+		pool.processJob(context.Background(), domain.JobDelivery{Job: job, Receipt: job.ID})
+		if len(storage.writes) != 0 {
+			t.Errorf("%s: stored segments %v from a stream of the wrong kind", name, storage.writes)
+		}
+		if len(coordinator.jobPublishes) != 1 || coordinator.jobPublishes[0].State != domain.JobStateFailed {
+			t.Errorf("%s: statuses %+v, want one failure", name, coordinator.jobPublishes)
+		}
 	}
 }

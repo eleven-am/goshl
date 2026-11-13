@@ -91,7 +91,7 @@ func TestNewConfigReturnsExpectedFlags(t *testing.T) {
 }
 
 func TestRequireConfigRejectsUnknownAccelerator(t *testing.T) {
-	if _, err := RequireConfig(domain.Accelerator("bad")); err == nil {
+	if _, err := RequireConfigWithMode(domain.Accelerator("bad"), domain.DecodeSafe); err == nil {
 		t.Fatalf("expected unknown accelerator error")
 	}
 }
@@ -117,7 +117,7 @@ func TestDetectBestExposesDetectionError(t *testing.T) {
 	t.Cleanup(func() { _ = os.Setenv("PATH", origPath) })
 	_ = os.Setenv("PATH", tmp+string(os.PathListSeparator)+origPath)
 
-	cfg := DetectBest()
+	cfg := DetectBestContext(context.Background())
 	if cfg.Accelerator != domain.AccelNone {
 		t.Fatalf("expected software fallback, got %s", cfg.Accelerator)
 	}

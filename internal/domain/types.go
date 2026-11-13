@@ -22,6 +22,7 @@ type Job struct {
 	VideoRendition   *VideoRendition
 	AudioRendition   *AudioRendition
 	VideoStreamIndex int
+	Digest           string
 }
 
 type JobDelivery struct {

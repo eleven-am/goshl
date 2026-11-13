@@ -120,7 +120,7 @@ func TestGenerateVideoTranscodedRungsCoverRateControlBound(t *testing.T) {
 }
 
 func TestAudioRenditionsAdvertisePeakBandwidth(t *testing.T) {
-	renditions := GenerateAudio(domain.AudioStream{Codec: "ac3", Channels: 6, Bitrate: 448_000, SampleRate: 48000})
+	renditions := GenerateAudioTracks([]domain.AudioStream{domain.AudioStream{Codec: "ac3", Channels: 6, Bitrate: 448_000, SampleRate: 48000}})
 
 	for _, rendition := range renditions {
 		if rendition.PeakBandwidth < rendition.Bitrate {

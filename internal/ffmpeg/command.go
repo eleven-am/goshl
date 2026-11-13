@@ -100,15 +100,20 @@ type AudioParams struct {
 	Rendition   domain.AudioRendition
 	Segments    []domain.Segment
 	Overlap     *domain.Segment
-	Trailing    *domain.Segment
 	Landing     *float64
 	OutputDir   string
 }
+
+var (
+	videoOnlyArgs = []string{"-an", "-sn", "-dn"}
+	audioOnlyArgs = []string{"-vn", "-sn", "-dn"}
+)
 
 type jobTimeline struct {
 	inputArgs   []string
 	streamIndex int
 	inputFlags  []string
+	only        []string
 	encodeArgs  []string
 	outputDir   string
 	firstIndex  int
@@ -160,6 +165,7 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 		reference:   first.Start,
 		cuts:        segmentCuts(p.Segments, p.Overlap),
 		timeDelta:   videoSegmentTimeDelta,
+		only:        videoOnlyArgs,
 	}
 
 	if copied {
@@ -207,10 +213,6 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.Trailing != nil {
-		return nil, ErrTrailingNotSupported
-	}
-
 	input, err := source.InputArgs(p.InputURL)
 	if err != nil {
 		return nil, err
@@ -225,6 +227,7 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 		end:         last.End,
 		cuts:        segmentCuts(p.Segments, p.Overlap),
 		timeDelta:   audioSegmentTimeDelta,
+		only:        audioOnlyArgs,
 	}
 
 	coverage := audioCoverageOf(p.Rendition, first, last)
@@ -336,6 +339,7 @@ func (t jobTimeline) args() []string {
 			"-map", fmt.Sprintf("0:%d", t.streamIndex),
 		)
 	}
+	args = append(args, t.only...)
 	args = append(args, t.encodeArgs...)
 	args = append(args,
 		"-f", "segment",

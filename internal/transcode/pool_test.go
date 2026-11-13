@@ -3,6 +3,7 @@ package transcode
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -91,7 +92,7 @@ func (e assertErr) Error() string { return string(e) }
 
 func TestNewPool(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 2, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool := NewPool(coord, 2, domain.StreamVideo, nil, nil, nil)
 
 	if pool.size != 2 {
 		t.Fatalf("expected size 2, got %d", pool.size)
@@ -120,18 +121,18 @@ func TestValidateJobRejectsMixedPipelineProfile(t *testing.T) {
 		ExpectedIndices: []int{0},
 		VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
 	}
-	if err := pool.validateJob(job); err == nil {
-		t.Fatalf("expected mixed pipeline profile rejection")
+	if err := pool.validateJob(sealed(job)); err == nil || !strings.Contains(err.Error(), "profile mismatch") {
+		t.Fatalf("expected mixed pipeline profile rejection, got %v", err)
 	}
 	job.Profile = "worker-profile"
-	if err := pool.validateJob(job); err != nil {
+	if err := pool.validateJob(sealed(job)); err != nil {
 		t.Fatalf("expected valid concrete job: %v", err)
 	}
 }
 
 func TestPoolStartAndStop(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "pipeline-a"})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "pipeline-a"})
 
 	ctx := context.Background()
 	if err := pool.Start(ctx); err != nil {
@@ -151,7 +152,7 @@ func TestPoolStartAndStop(t *testing.T) {
 
 func TestPoolStartSubscribeFailureCanRetry(t *testing.T) {
 	coord := &stubCoordinator{subErr: errors.New("subscribe failed")}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
 
 	if err := pool.Start(context.Background()); err == nil {
 		t.Fatalf("expected start error")
@@ -166,7 +167,7 @@ func TestPoolStartSubscribeFailureCanRetry(t *testing.T) {
 
 func TestPoolStartTwiceReturnsError(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
 
 	ctx := context.Background()
 	if err := pool.Start(ctx); err != nil {
@@ -182,7 +183,7 @@ func TestPoolStartTwiceReturnsError(t *testing.T) {
 
 func TestPoolStopWithoutStart(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
 	pool.Stop()
 }
 
@@ -222,22 +223,23 @@ func TestValidateJobNeighbourRules(t *testing.T) {
 		if stream == domain.StreamVideo {
 			job.VideoRendition = &domain.VideoRendition{Name: "r", Method: domain.DirectStream}
 		} else {
-			job.AudioRendition = &domain.AudioRendition{Name: "r", Method: domain.Transcode}
+			job.AudioRendition = &domain.AudioRendition{Name: "r", Method: domain.Transcode, Channels: 2, Bitrate: 128000}
 		}
+		job.Overlap = &overlap
 		return job
 	}
-	video := NewPool(&stubCoordinator{}, 1, domain.StreamVideo, 6, nil, nil, nil, PoolConfig{Profile: "profile"})
-	audio := NewPool(&stubCoordinator{}, 1, domain.StreamAudio, 6, nil, nil, nil, PoolConfig{Profile: "profile"})
+	video := NewPool(&stubCoordinator{}, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile"})
+	audio := NewPool(&stubCoordinator{}, 1, domain.StreamAudio, nil, nil, nil, PoolConfig{Profile: "profile"})
 
 	copied := base(domain.StreamVideo)
 	copied.Overlap, copied.Trailing = &overlap, &trailing
-	if err := video.validateJob(copied); err != nil {
+	if err := video.validateJob(sealed(copied)); err != nil {
 		t.Fatalf("copied video with adjacent neighbours must be valid: %v", err)
 	}
 
 	withOverlap := base(domain.StreamAudio)
 	withOverlap.Overlap = &overlap
-	if err := audio.validateJob(withOverlap); err != nil {
+	if err := audio.validateJob(sealed(withOverlap)); err != nil {
 		t.Fatalf("audio with an adjacent overlap must be valid: %v", err)
 	}
 
@@ -270,7 +272,7 @@ func TestValidateJobNeighbourRules(t *testing.T) {
 		"negative video stream index": {video, func() domain.Job { job := base(domain.StreamVideo); job.VideoStreamIndex = -1; return job }},
 	}
 	for name, test := range rejected {
-		if err := test.pool.validateJob(test.job()); err == nil {
+		if err := test.pool.validateJob(sealed(test.job())); err == nil {
 			t.Errorf("%s: job must be rejected", name)
 		}
 	}
@@ -278,7 +280,7 @@ func TestValidateJobNeighbourRules(t *testing.T) {
 
 func TestPoolProcessJobSkipsJobAlreadyRunning(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil)
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil)
 	if started := pool.beginJob("run", func(error) {}); !started {
 		t.Fatal("expected first begin to start")
 	}
@@ -333,10 +335,10 @@ func TestCompletedJobSettlesDeliveryReceipt(t *testing.T) {
 
 func TestInitialLeaseFailureLeavesDeliveryPending(t *testing.T) {
 	coord := &stubCoordinator{renewErr: errors.New("lease unavailable")}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile"})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile"})
 	delivery := domain.JobDelivery{
 		Receipt: "receipt",
-		Job: domain.Job{
+		Job: sealed(domain.Job{
 			ID:              "batch",
 			RunID:           "run",
 			MediaKey:        "media",
@@ -352,7 +354,7 @@ func TestInitialLeaseFailureLeavesDeliveryPending(t *testing.T) {
 			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
 			ExpectedIndices: []int{0},
 			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
-		},
+		}),
 	}
 	pool.processJob(context.Background(), delivery)
 	if len(coord.acks) != 0 || len(coord.jobPublishes) != 0 {
@@ -362,10 +364,10 @@ func TestInitialLeaseFailureLeavesDeliveryPending(t *testing.T) {
 
 func TestExpiredDeliveryPublishesFailureAndSettles(t *testing.T) {
 	coord := &stubCoordinator{}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile"})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile"})
 	delivery := domain.JobDelivery{
 		Receipt: "expired-receipt",
-		Job: domain.Job{
+		Job: sealed(domain.Job{
 			ID:              "batch",
 			RunID:           "expired-run",
 			MediaKey:        "media",
@@ -381,7 +383,7 @@ func TestExpiredDeliveryPublishesFailureAndSettles(t *testing.T) {
 			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
 			ExpectedIndices: []int{0},
 			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
-		},
+		}),
 	}
 
 	pool.processJob(context.Background(), delivery)
@@ -448,7 +450,7 @@ func (r *eventRecorder) await(t *testing.T, eventType domain.EventType) domain.E
 func validPoolDelivery(receipt, runID string) domain.JobDelivery {
 	return domain.JobDelivery{
 		Receipt: receipt,
-		Job: domain.Job{
+		Job: sealed(domain.Job{
 			ID:              "batch",
 			RunID:           runID,
 			MediaKey:        "media",
@@ -464,7 +466,7 @@ func validPoolDelivery(receipt, runID string) domain.JobDelivery {
 			Segments:        []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}},
 			ExpectedIndices: []int{0},
 			VideoRendition:  &domain.VideoRendition{Name: "720p", Method: domain.Transcode},
-		},
+		}),
 	}
 }
 
@@ -500,7 +502,7 @@ func (c *resubscribingCoordinator) Subscribe(ctx context.Context, streamType dom
 func TestPoolResubscribesAfterSubscriptionCloses(t *testing.T) {
 	coord := &resubscribingCoordinator{stubCoordinator: &stubCoordinator{}, subscribed: make(chan int, 16)}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 2, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 2, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	pool.newBackoff = fastBackoff
 
 	if err := pool.Start(context.Background()); err != nil {
@@ -600,7 +602,7 @@ func TestPoolCancelsAfterRenewFailuresExhaustLeaseWindow(t *testing.T) {
 func TestPoolRejectsReceiptlessDeliveryWithDistinctEvent(t *testing.T) {
 	coord := &stubCoordinator{}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 
 	pool.processJob(context.Background(), validPoolDelivery("", "run"))
 
@@ -623,7 +625,7 @@ func TestPoolRejectsReceiptlessDeliveryWithDistinctEvent(t *testing.T) {
 func TestPoolRejectsInvalidDeliveryWithDistinctEvent(t *testing.T) {
 	coord := &stubCoordinator{}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	delivery := validPoolDelivery("receipt", "run")
 	delivery.Job.Profile = "other"
 
@@ -650,7 +652,7 @@ func TestPoolRejectsInvalidDeliveryWithDistinctEvent(t *testing.T) {
 func TestPoolIgnoresDuplicateRunSilently(t *testing.T) {
 	coord := &stubCoordinator{}
 	recorder := newEventRecorder()
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", Observer: recorder})
 	if !pool.beginJob("run", func(error) {}) {
 		t.Fatal("expected first begin to start")
 	}
@@ -712,7 +714,7 @@ func TestPoolStopDoesNotBlockStart(t *testing.T) {
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(coord.release) }) }
 	t.Cleanup(release)
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile"})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile"})
 	if err := pool.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -766,7 +768,7 @@ func TestProcessJobWorkerContextOutlivesStartBy(t *testing.T) {
 	coord.onRenew = func(ctx context.Context) {
 		deadline, hasDeadline = ctx.Deadline()
 	}
-	pool := NewPool(coord, 1, domain.StreamVideo, 6.0, nil, nil, nil, PoolConfig{Profile: "profile", JobTimeout: 2 * time.Second})
+	pool := NewPool(coord, 1, domain.StreamVideo, nil, nil, nil, PoolConfig{Profile: "profile", JobTimeout: 2 * time.Second})
 	delivery := validPoolDelivery("receipt", "run")
 	delivery.Job.StartBy = time.Now().Add(100 * time.Millisecond)
 

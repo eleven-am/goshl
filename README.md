@@ -164,6 +164,7 @@ type Job struct {
     VideoRendition   *VideoRendition
     AudioRendition   *AudioRendition
     VideoStreamIndex int
+    Digest           string
 }
 
 type JobDelivery struct {
@@ -183,17 +184,19 @@ type JobStatus struct {
 
 `StartBy` is the latest moment a worker may begin the job. A worker refuses a delivery whose `StartBy` has passed, and otherwise runs it with a full `Options.JobTimeout` counted from the start of execution. `Overlap` and `Trailing` are extra media ranges the worker needs so segments join without gaps: `Overlap` is the segment before the first one (set for audio jobs and copied-video jobs that do not start at segment 0), `Trailing` is one segment after the last one (copied video only). `VideoStreamIndex` selects the source video stream. A coordinator never interprets them.
 
+`Digest` is a SHA-256 over every other field of the job except `EnqueuedAt` and `StartBy`, set by the replica that builds the job. A worker recomputes it and refuses the delivery when it differs, so a coordinator that drops, rounds or rewrites any field gets a failed job with a `digest mismatch` error and an `EventJobDeliveryRejected` event instead of wrong media. The two times are excluded, so a coordinator may store them at any precision or in any zone.
+
 The rendition structs inside a job are part of the contract too. Round-trip every field, including the ones added since earlier releases:
 
 ```go
 type VideoRendition struct {
-    Name, Width, Height, Bitrate, PeakBitrate, BufferSize, FrameRate, Codec, Level, Method
+    Name, Width, Height, Bitrate, PeakBitrate, BufferSize, PeakBandwidth, FrameRate, Codec, Level, Method
     Colour    ColourPlan // Tonemap, AssumeMatrix, AssumePrimaries
     SourceEnd float64    // video end in seconds when it ends early, otherwise 0
 }
 
 type AudioRendition struct {
-    Name, Codec, CodecString, GroupID, Bitrate, Channels, Method
+    Name, Codec, CodecString, Bitrate, Channels, PeakBandwidth, Method
     SampleRate  int
     SourceEnd   float64 // end of the source audio stream in seconds, 0 if unknown
     StreamIndex int
@@ -208,6 +211,7 @@ The job contract version is 5; it is part of the pipeline profile, so replicas o
 
 #### Contract
 
+- A delivered `Job` must equal the enqueued one field for field. Workers verify `Job.Digest` and refuse a job that changed in transit.
 - `Enqueue` is idempotent by `Job.RunID`. Return an error wrapping `goshl.ErrEnqueueRejected` only when the job was definitely not persisted; goshl then frees the batch at once so the next request can retry. Any other error is treated as ambiguous and the batch stays reserved until its lock expires.
 - `Subscribe` is a competing-consumer subscription scoped to both stream type and pipeline profile. A job is delivered only to a worker subscribed to its exact `Job.Profile`. Every delivery has a unique receipt and an initial lease of at least five seconds. `Renew` extends that exact delivery, `Ack` discards only that receipt, and an unacknowledged delivery becomes available again when its lease expires. Redelivery invalidates the previous receipt.
 - `SettleJob` atomically validates the active receipt, persists the terminal status and removes the delivery. It is idempotent when retried with the same receipt and status. The receipt-to-status record and the job status must stay available until at least one minute after `Job.StartBy` plus `JobTimeout`. `Ack` is reserved for malformed deliveries that cannot supply a valid status.
@@ -266,7 +270,7 @@ With `HWAccel: true` or an explicit `HWAccelMode`, construction runs a hardware 
 | `MediaKey(ctx, sourceURL) (string, error)` | The resolved opaque media key. |
 | `Invalidate(ctx, sourceURL) error` | Deletes everything stored for the media, including `SpriteStorage` when configured. Returns `ErrCacheInvalidationUnsupported` if `Storage` (or a configured `SpriteStorage`) has no `DeleteMedia`. |
 
-`Metadata` carries `StartTime`, `Duration`, `Bitrate` (container bits per second, 0 if unknown), `Keyframes`, one `Video` stream, and `Audios` and `Subtitles` lists. `VideoStream.End` and `AudioStream.End` are the stream ends in seconds on the `Metadata` timeline, 0 if unknown. When the container declares no end they are measured from the last packets (one bounded read of the file tail at probe time; they stay 0 if no packet is found within 15 minutes of the end or the read takes over 20 seconds). `Duration` is bounded by the known stream ends; when the container declares none, it is the latest stream end, audio included. `VideoStream.FrameRate` is the average frame rate when known, so a 50 fields-per-second interlaced source reports 25. Each subtitle has a stable `ID` (for example `subtitle-3`) used as the track ID everywhere else. `Metadata` lists every subtitle track, including ones that cannot be served (see below).
+`Metadata` carries `StartTime`, `Duration`, `Bitrate` (container bits per second, 0 if unknown), `Keyframes`, one `Video` stream, and `Audios` and `Subtitles` lists. `VideoStream.End` and `AudioStream.End` are the stream ends in seconds on the `Metadata` timeline, 0 if unknown. When the container declares no end they are measured from the last packets (a read of the last 15 seconds at probe time, then a bounded search of the rest of the file for a stream that ended earlier; they stay 0 if the reads take over 20 seconds). MPEG-TS stream ends are always measured, and a Matroska stream end comes from its `DURATION` tag or is measured, never from ffprobe's stream duration. An audio end that lies past the readable data (a truncated audio-only source, or audio cut after the video ended) is lowered to the last readable packet, and `Duration` with it. `Duration` is bounded by the known stream ends; when the container declares none, it is the latest stream end, audio included. `VideoStream.FrameRate` is the average frame rate when known, so a 50 fields-per-second interlaced source reports 25. Each subtitle has a stable `ID` (for example `subtitle-3`) used as the track ID everywhere else. `Metadata` lists every subtitle track, including ones that cannot be served (see below).
 
 Probing reads an MP4 from its `moov` box and an MKV or WebM from its Matroska Cues element, so neither needs a full packet scan or download. Cues are used when they leave no keyframe gap above 11.5 seconds; otherwise the probe falls back to the scan. A real I/O error reading the MP4 header (local or remote) fails the probe rather than falling back to the packet scan. Remote MP4s are indexed from the `moov` box, which reads a small fraction of the file.
 
@@ -373,7 +377,8 @@ Workers on different accelerators use different pipeline profiles and never exch
 
 ## Other exported types
 
-- `PlaybackMethod`: `DirectPlay`, `DirectStream` or `Transcode`, set on each `VideoRendition` and `AudioRendition` in a `Job`.
+- `PlaybackMethod`: `DirectStream` or `Transcode`, set on each `VideoRendition` and `AudioRendition` in a `Job`.
+- `ColourPlan`: the type of `VideoRendition.Colour` (`Tonemap`, `AssumeMatrix`, `AssumePrimaries`).
 - `StreamType`: `StreamVideo`, `StreamAudio` or `StreamSubtitle` (subtitles are served through `SubtitlePlaylist` and `SubtitleVTT`; `Segment` rejects them).
 - `SegmentState` / `SegmentStatus`: `SegmentStateReady` or `SegmentStateError`, with an `Error` string, passed to `Coordinator.NotifySegment`.
 - `SourceRevisionResolver`: `func(ctx context.Context, sourceURL string) (string, error)`, the type of `Options.SourceRevision`.
@@ -393,7 +398,7 @@ Workers on different accelerators use different pipeline profiles and never exch
 | `EventJobEnqueued`, `EventJobJoined` | This replica enqueued a job, or joined one already running. |
 | `EventJobStarted`, `EventJobCompleted`, `EventJobFailed` | Worker-side job lifecycle. |
 | `EventJobAckFailed`, `EventJobLeaseFailed`, `EventJobSettleFailed` | Coordinator calls failed during delivery handling. |
-| `EventJobDeliveryRejected` | A worker refused a malformed delivery (wrong profile or invalid job). A job whose `StartBy` already passed is not a rejection: it is settled failed and reported as `EventJobFailed`. |
+| `EventJobDeliveryRejected` | A worker refused a malformed delivery (wrong profile, invalid job, or a job whose `Digest` does not match its fields). A job whose `StartBy` already passed is not a rejection: it is settled failed and reported as `EventJobFailed`. |
 | `EventPoolSubscriptionLost` | A worker pool lost its coordinator subscription. |
 | `EventSegmentReady`, `EventSegmentNotifyFailed` | `EventSegmentReady`: a waiting request learned of its segment through the coordinator's readiness notification (requests satisfied directly from storage do not emit it). `EventSegmentNotifyFailed`: the worker could not publish the notification. |
 | `EventHardwareSelected`, `EventHardwareFallback` | Hardware choice at construction, and the reasons when a preferred accelerator was skipped (for a lower-priority one or for software). |

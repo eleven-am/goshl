@@ -11,7 +11,7 @@ Output correctness release R2 (cache `goshl-cache-v5`, job contract version 5). 
 - feat(playlist): RFC 8216 audio groups, RFC 5646 languages, unique subtitle names, valid audio-only masters; invalid playlists return errors
 - feat(subtitles): only text codecs are listed and served, others return `ErrRenditionNotFound`; MKV subtitles read only cued blocks; failed batches are not rerun identically
 - feat(video): a video that ends early repeats its last frame (`VideoRendition.SourceEnd`); renditions above H.264 level 5.2 are dropped with the new `EventRenditionDropped`
-- feat(contract): job contract 5: coordinators must also carry `VideoRendition.BufferSize`, `Colour` and `SourceEnd`, and `AudioRendition.SampleRate`, `SourceEnd` and `Title`
+- feat(contract): job contract 5: coordinators must also carry `Job.Digest`, `VideoRendition.BufferSize`, `PeakBandwidth`, `Colour` and `SourceEnd`, and `AudioRendition.SampleRate`, `PeakBandwidth`, `SourceEnd` and `Title`; workers verify the digest and reject a job that changed in transit; `ColourPlan` is exported; `AudioRendition.GroupID` and `DirectPlay` are removed
 - fix(audio): non-48 kHz audio joins frame-exactly across jobs; job output is validated against the plan
 - fix(runtime): `Start` returns `ErrControllerStopped` after `Stop`; lock-held waiters, enqueue cancellation and pool shutdown with a cause no longer orphan locks or fail redeliverable jobs
 - fix(options): `TargetDuration` 1-60 s, `SegmentsPerJob` at most 1000, pool sizes at most 1024; inputs restricted with `-format_whitelist`; `ErrUnsupportedSource` for empty, unsupported or malformed sources

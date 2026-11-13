@@ -83,7 +83,7 @@ func TestGenerateVideo_EstimatesBitrateAndEvenWidth(t *testing.T) {
 
 func TestGenerateAudio_IncludesSurroundAndPassthrough(t *testing.T) {
 	audio := domain.AudioStream{Codec: "ac3", Channels: 6, Bitrate: 640_000}
-	renditions := GenerateAudio(audio)
+	renditions := GenerateAudioTracks([]domain.AudioStream{audio})
 
 	if len(renditions) != 3 {
 		t.Fatalf("expected stereo, surround, and passthrough, got %d renditions", len(renditions))
@@ -503,7 +503,7 @@ func TestPassthroughWithoutBitrateUsesCodecCeiling(t *testing.T) {
 		want    int
 	}{{"ac3", 0, 640_000}, {"eac3", 0, 1_536_000}, {"ac3", 448_000, 448_000}, {"eac3", 768_000, 768_000}}
 	for _, c := range cases {
-		renditions := GenerateAudio(domain.AudioStream{Codec: c.codec, Channels: 6, Bitrate: c.bitrate})
+		renditions := GenerateAudioTracks([]domain.AudioStream{domain.AudioStream{Codec: c.codec, Channels: 6, Bitrate: c.bitrate}})
 		last := renditions[len(renditions)-1]
 		if last.Method != domain.DirectStream || last.Bitrate != c.want {
 			t.Errorf("%s declared at %d: passthrough bitrate = %d, want %d", c.codec, c.bitrate, last.Bitrate, c.want)

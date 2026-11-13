@@ -3,6 +3,7 @@ package goshl
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -404,5 +405,97 @@ func TestStartRacingStopLeavesNoPoolRunning(t *testing.T) {
 		if subscription.Err() == nil {
 			t.Fatalf("pool subscription %d is still live after Start lost the race with Stop", index)
 		}
+	}
+}
+
+func remoteJobFails(t *testing.T, controller *Controller, coordinator *clusterCoordinator, start, end int, reason string) {
+	t.Helper()
+	info := raceSegmentInfo(t, controller, start)
+	jobID := deterministicJobID(info.MediaKey, "1080p", domain.StreamVideo, start, end)
+	status := domain.JobStatus{JobID: jobID, RunID: "remote-run", State: domain.JobStateFailed, Error: reason}
+	coordinator.mu.Lock()
+	delete(coordinator.locks, "job:"+jobID)
+	delete(coordinator.activeJobs, jobID)
+	coordinator.jobStatuses["remote-run"] = status
+	waiters := make([]chan domain.JobStatus, 0, len(coordinator.jobWaiters["remote-run"]))
+	for waiter := range coordinator.jobWaiters["remote-run"] {
+		waiters = append(waiters, waiter)
+	}
+	coordinator.mu.Unlock()
+	for _, waiter := range waiters {
+		waiter <- status
+	}
+}
+
+func TestLocalJoinerStartsAFreshJobAfterTheRemoteJobFails(t *testing.T) {
+	cluster := newClusterCoordinator()
+	coordinator := &raceCoordinator{clusterCoordinator: cluster, waitJobSeen: make(chan string, 4), enqueued: make(chan struct{}, 1)}
+	store := raceStore(t)
+	joined := make(chan struct{}, 4)
+	controller := NewController(Options{
+		Storage:        store,
+		Coordinator:    coordinator,
+		PathGen:        stubPathGen{},
+		SegmentTimeout: time.Minute,
+		JobTimeout:     time.Hour,
+		Observer: ObserverFunc(func(_ context.Context, event Event) {
+			if event.Type == EventJobJoined {
+				joined <- struct{}{}
+			}
+		}),
+	})
+	defer controller.Stop()
+	remoteHoldsJob(t, controller, cluster, 0, 3)
+
+	results := make(chan error, 2)
+	request := func() {
+		data, err := controller.Segment(context.Background(), "file:///media", domain.StreamVideo, "1080p", 0)
+		if err == nil && string(data) != "retried" {
+			err = errors.New("wrong segment data")
+		}
+		results <- err
+	}
+	go request()
+	<-coordinator.waitJobSeen
+	go request()
+	<-joined
+
+	remoteJobFails(t, controller, cluster, 0, 3, "remote boom")
+
+	pending := 2
+	select {
+	case <-coordinator.enqueued:
+	case err := <-results:
+		pending--
+		if err == nil || !strings.Contains(err.Error(), "remote boom") {
+			t.Fatalf("a request ended with %v before any fresh job was enqueued", err)
+		}
+		select {
+		case <-coordinator.enqueued:
+		case err := <-results:
+			t.Fatalf("the joiner ended with %v instead of starting a fresh job after the remote failure", err)
+		}
+	}
+	info := raceSegmentInfo(t, controller, 0)
+	if err := store.WriteSegment(context.Background(), info, []byte("retried")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.NotifySegment(context.Background(), info, domain.SegmentStatus{State: domain.SegmentStateReady}); err != nil {
+		t.Fatal(err)
+	}
+	served := 0
+	for ; pending > 0; pending-- {
+		err := <-results
+		if err == nil {
+			served++
+		} else if !strings.Contains(err.Error(), "remote boom") {
+			t.Fatalf("a request ended with %v, want the segment or the remote failure", err)
+		}
+	}
+	if served == 0 {
+		t.Fatal("no request was served by the fresh job")
+	}
+	if got := coordinator.enqueues.Load(); got != 1 {
+		t.Fatalf("exactly one fresh job must be enqueued after the remote failure, got %d", got)
 	}
 }

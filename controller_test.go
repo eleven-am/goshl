@@ -548,34 +548,25 @@ func TestOptionsSetDefaults(t *testing.T) {
 	}
 }
 
-func TestOptionsValidatePanicsOnMissingStorage(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("expected panic for missing Storage")
-		}
-	}()
+func TestOptionsValidateRejectsMissingStorage(t *testing.T) {
 	opts := Options{Coordinator: &stubCoordinator{}, PathGen: stubPathGen{}}
-	opts.validate()
+	if err := opts.validateError(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("missing Storage: got %v, want ErrInvalidOptions", err)
+	}
 }
 
-func TestOptionsValidatePanicsOnMissingCoordinator(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("expected panic for missing Coordinator")
-		}
-	}()
+func TestOptionsValidateRejectsMissingCoordinator(t *testing.T) {
 	opts := Options{Storage: &stubStorage{}, PathGen: stubPathGen{}}
-	opts.validate()
+	if err := opts.validateError(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("missing Coordinator: got %v, want ErrInvalidOptions", err)
+	}
 }
 
-func TestOptionsValidatePanicsOnMissingPathGen(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("expected panic for missing PathGen")
-		}
-	}()
+func TestOptionsValidateRejectsMissingPathGen(t *testing.T) {
 	opts := Options{Storage: &stubStorage{}, Coordinator: &stubCoordinator{}}
-	opts.validate()
+	if err := opts.validateError(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("missing PathGen: got %v, want ErrInvalidOptions", err)
+	}
 }
 
 func TestSegmentAcquiresAndReleasesLock(t *testing.T) {
