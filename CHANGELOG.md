@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.0.26] - 2026-11-13
+
 Output correctness release R2 (cache `goshl-cache-v5`, job contract version 5). See MIGRATION.md.
 
 - feat(planner): segments last at most max(2 x target, 12 s); long keyframe gaps are split, tail slivers merge, rounding noise no longer merges segments

@@ -1,10 +1,10 @@
 # Goshl Migration Guide
 
-This guide covers upgrading to the current release: cache schema `goshl-cache-v5` and job contract version 5. The last published version is v0.0.22, which predates both this release and the v4 release before it, so the guide has two parts. Read both when upgrading from v0.0.22. If you already run the v4 release, read only the first part.
+This guide covers upgrading to the current release: cache schema `goshl-cache-v5` and job contract version 5. The previous published version is v0.0.25 (cache `goshl-cache-v3`). Between the two, an unpublished intermediate stage used cache v4 and job contract 4, so the guide has two parts. Read both when upgrading from v0.0.25 or earlier.
 
 ## Summary
 
-- Cache schema is now `goshl-cache-v5` (v0.0.22 used v3). Every source is re-probed and re-transcoded once, and every subtitle, sprite, preview and thumbnail is regenerated.
+- Cache schema is now `goshl-cache-v5` (v0.0.25 used v3). Every source is re-probed and re-transcoded once, and every subtitle, sprite, preview and thumbnail is regenerated.
 - Job contract version is 5. A coordinator must round-trip every `Job` field and every `VideoRendition` and `AudioRendition` field; workers verify this with `Job.Digest` and refuse a job that changed in transit. See "Coordinator and worker contract". Producers and workers must roll together.
 - Segment counts and indices change for most sources (new planner).
 - FFmpeg and FFprobe 6.1 or newer are required, enforced at startup. HDR sources need an ffmpeg with `zscale` and `tonemap`.
@@ -145,9 +145,9 @@ Direct stream is lost when a source keyframe gap exceeds the cap (12 s at the de
 - Verify in Safari: playback across segment boundaries, the discontinuity indicator, and sources whose video starts slightly after the container start.
 - Run a real playback and seek test in each target GPU environment.
 
-## Part 2: Changes since v0.0.22 introduced in the v4 release
+## Part 2: Changes since v0.0.25 from the intermediate v4 stage
 
-The material below was introduced in the v4 release (cache v4, job contract 4). It still applies when upgrading from v0.0.22. Where it names version numbers, v5 supersedes them: read "v4" as "v5" for the cache schema and job contract.
+The material below was introduced in the unpublished v4 stage (cache v4, job contract 4). It applies when upgrading from v0.0.25. Where it names version numbers, v5 supersedes them: read "v4" as "v5" for the cache schema and job contract.
 
 ### Protocol whitelist and FFmpeg version
 
@@ -214,7 +214,7 @@ Without `SourceRevision`, the complete remote URL determines identity. A refresh
 
 ### Cache migration
 
-The cache schema is `goshl-cache-v5` (v4 in the v4 release), and the pipeline profile also covers the output timeline offset and the job contract version. Output produced under the previous schemas (v3 in v0.0.22, v4) is not reused. After deploying, every source is re-probed and re-transcoded, and every subtitle, sprite, preview and thumbnail is regenerated. Plan for the one-time probe and transcoding load, and remove cold v3 and v4 data when operationally safe. Existing objects remain in storage but are cold data from Goshl's perspective.
+The cache schema is `goshl-cache-v5` (v4 in the v4 release), and the pipeline profile also covers the output timeline offset and the job contract version. Output produced under the previous schemas (v3 in v0.0.25, v4) is not reused. After deploying, every source is re-probed and re-transcoded, and every subtitle, sprite, preview and thumbnail is regenerated. Plan for the one-time probe and transcoding load, and remove cold v3 and v4 data when operationally safe. Existing objects remain in storage but are cold data from Goshl's perspective.
 
 Storage may implement optional invalidation:
 
@@ -228,7 +228,7 @@ Generated-asset keys are namespaced beneath the media key so `DeleteMedia` can r
 
 ### Delivery, enqueue and lifecycle
 
-`Job` is a concrete, versioned work contract. The full list of `Job`, `VideoRendition` and `AudioRendition` fields a coordinator must round-trip is in "Coordinator and worker contract" in Part 1. The v4 additions were `StartBy` (replacing `Deadline`), `Trailing` and `VideoStreamIndex`. `Trailing` is, for copied video, one extra segment after the last requested one, produced and discarded so the final requested segment ends on the correct frame. Earlier development builds carried a full `Metadata` copy on the job; that field no longer exists.
+`Job` is a concrete, versioned work contract. The full list of `Job`, `VideoRendition` and `AudioRendition` fields a coordinator must round-trip is in "Coordinator and worker contract" in Part 1. The v4 additions were `StartBy` (replacing `Deadline`), `Trailing` and `VideoStreamIndex`. `Trailing` is, for copied video, one extra segment after the last requested one, produced and discarded so the final requested segment ends on the correct frame. v0.0.25 carried a full `Metadata` copy on the job; that field no longer exists, and a coordinator must stop sending it.
 
 `Job.Deadline` was renamed to `StartBy` and its meaning changed. `StartBy` is the latest moment a worker may begin the job. A worker refuses a delivery once `StartBy` has passed and otherwise runs it with a full `JobTimeout` measured from the moment execution starts, so time spent queued no longer shortens the execution budget. The requesting replica sets `StartBy` to enqueue time plus `JobTimeout`, and keeps its in-process flight until `StartBy` plus `JobTimeout`. The distributed job lock lives one minute longer.
 
