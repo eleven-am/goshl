@@ -1,12 +1,14 @@
 package mp4index
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
 
+	"github.com/Eyevinn/mp4ff/bits"
 	"github.com/Eyevinn/mp4ff/mp4"
 )
 
@@ -14,7 +16,8 @@ var ErrUnsupported = errors.New("mp4index: unsupported layout")
 
 const (
 	maxMoovBytes = 256 << 20
-	headerProbe  = 16
+	smallHeader  = 8
+	largeHeader  = 16
 )
 
 func Keyframes(path string, streamIndex int) ([]float64, error) {
@@ -46,34 +49,78 @@ func KeyframesFrom(r io.ReaderAt, size int64, streamIndex int) ([]float64, error
 
 func readMoov(r io.ReaderAt, size int64) (*mp4.MoovBox, error) {
 	for pos := int64(0); pos < size; {
-		header, err := mp4.DecodeHeader(io.NewSectionReader(r, pos, headerProbe))
+		name, boxSize, err := boxHeader(r, pos, size)
 		if err != nil {
-			return nil, fmt.Errorf("%w: box header at %d: %v", ErrUnsupported, pos, err)
+			return nil, err
 		}
-		boxSize := int64(header.Size)
-		if boxSize < int64(header.Hdrlen) || boxSize < 0 {
-			return nil, fmt.Errorf("%w: invalid box size at %d", ErrUnsupported, pos)
-		}
-		switch header.Name {
+		switch name {
 		case "moof":
 			return nil, fmt.Errorf("%w: fragmented", ErrUnsupported)
 		case "moov":
-			if boxSize > maxMoovBytes || pos+boxSize > size {
-				return nil, fmt.Errorf("%w: moov size %d", ErrUnsupported, boxSize)
-			}
-			box, err := mp4.DecodeBox(uint64(pos), io.NewSectionReader(r, pos, boxSize))
-			if err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
-			}
-			moov, ok := box.(*mp4.MoovBox)
-			if !ok {
-				return nil, fmt.Errorf("%w: moov decode", ErrUnsupported)
-			}
-			return moov, nil
+			return decodeMoov(r, pos, boxSize, size)
+		}
+		if boxSize > size-pos {
+			break
 		}
 		pos += boxSize
 	}
 	return nil, fmt.Errorf("%w: no moov box", ErrUnsupported)
+}
+
+func boxHeader(r io.ReaderAt, pos, size int64) (string, int64, error) {
+	var raw [largeHeader]byte
+	want := min(int64(largeHeader), size-pos)
+	n, err := r.ReadAt(raw[:want], pos)
+	if int64(n) < want && err != nil && err != io.EOF {
+		return "", 0, fmt.Errorf("mp4index: read box header at %d: %w", pos, err)
+	}
+	if n < smallHeader {
+		return "", 0, fmt.Errorf("%w: truncated box header at %d", ErrUnsupported, pos)
+	}
+	name := string(raw[4:smallHeader])
+	boxSize := int64(binary.BigEndian.Uint32(raw[0:4]))
+	headerLength := int64(smallHeader)
+	switch boxSize {
+	case 0:
+		boxSize = size - pos
+	case 1:
+		large := binary.BigEndian.Uint64(raw[smallHeader:largeHeader])
+		if n < largeHeader || large > math.MaxInt64 {
+			return "", 0, fmt.Errorf("%w: invalid large box size at %d", ErrUnsupported, pos)
+		}
+		boxSize = int64(large)
+		headerLength = largeHeader
+	}
+	if boxSize < headerLength {
+		return "", 0, fmt.Errorf("%w: invalid box size at %d", ErrUnsupported, pos)
+	}
+	return name, boxSize, nil
+}
+
+func decodeMoov(r io.ReaderAt, pos, boxSize, size int64) (*mp4.MoovBox, error) {
+	if boxSize > maxMoovBytes || boxSize > size-pos {
+		return nil, fmt.Errorf("%w: moov size %d", ErrUnsupported, boxSize)
+	}
+	data := make([]byte, boxSize)
+	n, err := r.ReadAt(data, pos)
+	if n < len(data) {
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("mp4index: read moov at %d: %w", pos, err)
+		}
+		return nil, fmt.Errorf("%w: truncated moov", ErrUnsupported)
+	}
+	if binary.BigEndian.Uint32(data[0:4]) == 0 {
+		binary.BigEndian.PutUint32(data[0:4], uint32(boxSize))
+	}
+	box, err := mp4.DecodeBoxSR(uint64(pos), bits.NewFixedSliceReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
+	}
+	moov, ok := box.(*mp4.MoovBox)
+	if !ok {
+		return nil, fmt.Errorf("%w: moov decode", ErrUnsupported)
+	}
+	return moov, nil
 }
 
 type timeline struct {
@@ -92,11 +139,12 @@ func trackKeyframes(trak *mp4.TrakBox, movieTimescale uint64) ([]float64, error)
 	}
 	mediaTimescale := uint64(trak.Mdia.Mdhd.Timescale)
 	stbl := trak.Mdia.Minf.Stbl
-	if mediaTimescale == 0 || stbl.Stts == nil || stbl.Stsz == nil || stbl.Stss == nil {
+	if mediaTimescale == 0 || stbl.Stts == nil || stbl.Stsz == nil {
 		return nil, fmt.Errorf("%w: missing sample tables", ErrUnsupported)
 	}
 	sampleCount := stbl.Stsz.GetNrSamples()
-	if sampleCount == 0 || len(stbl.Stss.SampleNumber) == 0 {
+	syncSamples := syncSampleNumbers(stbl.Stss, sampleCount)
+	if sampleCount == 0 || len(syncSamples) == 0 {
 		return nil, fmt.Errorf("%w: no samples or sync table", ErrUnsupported)
 	}
 
@@ -117,7 +165,7 @@ func trackKeyframes(trak *mp4.TrakBox, movieTimescale uint64) ([]float64, error)
 		return nil, fmt.Errorf("%w: edit list shorter than media", ErrUnsupported)
 	}
 
-	decodeTimes, err := syncDecodeTimes(stbl.Stts, stbl.Stss.SampleNumber, sampleCount)
+	decodeTimes, err := syncDecodeTimes(stbl.Stts, syncSamples, sampleCount)
 	if err != nil {
 		return nil, err
 	}
@@ -127,12 +175,23 @@ func trackKeyframes(trak *mp4.TrakBox, movieTimescale uint64) ([]float64, error)
 	for i, dts := range decodeTimes {
 		composition := int64(dts)
 		if stbl.Ctts != nil {
-			composition += int64(stbl.Ctts.GetCompositionTimeOffset(stbl.Stss.SampleNumber[i]))
+			composition += int64(stbl.Ctts.GetCompositionTimeOffset(syncSamples[i]))
 		}
 		seconds := float64(composition-line.mediaTime+emptyTicks) / float64(mediaTimescale)
 		keyframes = append(keyframes, math.Round(seconds*1e6)/1e6)
 	}
 	return keyframes, nil
+}
+
+func syncSampleNumbers(stss *mp4.StssBox, sampleCount uint32) []uint32 {
+	if stss != nil {
+		return stss.SampleNumber
+	}
+	all := make([]uint32, sampleCount)
+	for index := range all {
+		all[index] = uint32(index) + 1
+	}
+	return all
 }
 
 func editTimeline(trak *mp4.TrakBox, movieTimescale, mediaTimescale uint64) (timeline, error) {

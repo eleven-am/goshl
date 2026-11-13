@@ -3,9 +3,11 @@ package hwaccel
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,7 +20,24 @@ const (
 	validationHeight = 180
 )
 
+const (
+	sdrTags             = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+	softwareScaleFilter = "scale=%d:%d:out_color_matrix=bt709:out_range=tv,setsar=1,format=yuv420p," + sdrTags
+	tonemapFilter       = "zscale=w=%d:h=%d:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,setsar=1,format=yuv420p," + sdrTags
+)
+
+var tonemapFilters = []string{"zscale", "tonemap"}
+
+var ErrTonemapUnavailable = errors.New("HDR source cannot be tone mapped")
+
 var validationLevels = []string{"3.0", "5.2"}
+
+var (
+	detectionTimeout  = 10 * time.Second
+	validationTimeout = 15 * time.Second
+)
+
+var priority = []domain.Accelerator{domain.AccelCUDA, domain.AccelQSV, domain.AccelVideoToolbox, domain.AccelVAAPI}
 
 func Detect(ctx context.Context) ([]domain.Accelerator, error) {
 	hwaccels, err := detectHWAccels(ctx)
@@ -51,17 +70,20 @@ func Detect(ctx context.Context) ([]domain.Accelerator, error) {
 	return available, nil
 }
 
-func Select(available []domain.Accelerator) domain.Accelerator {
-	priority := []domain.Accelerator{domain.AccelCUDA, domain.AccelQSV, domain.AccelVideoToolbox, domain.AccelVAAPI}
-
+func Candidates(available []domain.Accelerator) []domain.Accelerator {
+	candidates := make([]domain.Accelerator, 0, len(priority))
 	for _, accel := range priority {
-		for _, a := range available {
-			if a == accel {
-				return accel
-			}
+		if slices.Contains(available, accel) {
+			candidates = append(candidates, accel)
 		}
 	}
+	return candidates
+}
 
+func Select(available []domain.Accelerator) domain.Accelerator {
+	if candidates := Candidates(available); len(candidates) > 0 {
+		return candidates[0]
+	}
 	return domain.AccelNone
 }
 
@@ -70,9 +92,9 @@ func DetectBest() *domain.HWAccelConfig {
 }
 
 func DetectBestContext(ctx context.Context) *domain.HWAccelConfig {
-	detectCtx, detectCancel := context.WithTimeout(ctx, 20*time.Second)
-	defer detectCancel()
+	detectCtx, detectCancel := context.WithTimeout(ctx, detectionTimeout)
 	available, err := Detect(detectCtx)
+	detectCancel()
 	if err != nil {
 		cfg := NewConfig(domain.AccelNone)
 		cfg.Requested = domain.AccelNone
@@ -80,23 +102,37 @@ func DetectBestContext(ctx context.Context) *domain.HWAccelConfig {
 		cfg.Error = err.Error()
 		return cfg
 	}
-	selected := Select(available)
-	cfg := NewConfig(selected)
-	cfg.Requested = selected
-	cfg.Available = available
-	if selected != domain.AccelNone {
-		validateCtx, cancel := context.WithTimeout(detectCtx, 15*time.Second)
-		err = Validate(validateCtx, cfg)
-		cancel()
-		if err != nil {
-			fallback := NewConfig(domain.AccelNone)
-			fallback.Requested = selected
-			fallback.Available = available
-			fallback.Error = err.Error()
-			return fallback
+	requested := Select(available)
+	var failures []error
+	for _, accel := range Candidates(available) {
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", accel, err))
+			break
 		}
+		cfg := NewConfig(accel)
+		validateCtx, cancel := context.WithTimeout(ctx, validationTimeout)
+		err := Validate(validateCtx, cfg)
+		cancel()
+		if err == nil {
+			cfg.Requested = requested
+			cfg.Available = available
+			cfg.Error = joinFailures(failures)
+			return cfg
+		}
+		failures = append(failures, fmt.Errorf("%s: %w", accel, err))
 	}
-	return cfg
+	fallback := NewConfig(domain.AccelNone)
+	fallback.Requested = requested
+	fallback.Available = available
+	fallback.Error = joinFailures(failures)
+	return fallback
+}
+
+func joinFailures(failures []error) string {
+	if len(failures) == 0 {
+		return ""
+	}
+	return errors.Join(failures...).Error()
 }
 
 func NewConfig(accel domain.Accelerator) *domain.HWAccelConfig {
@@ -110,7 +146,7 @@ func NewConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) *domain
 	switch accel {
 	case domain.AccelCUDA:
 		decodeFlags := []string{"-hwaccel", "cuda"}
-		scaleFilter := "scale=%d:%d,setsar=1,format=yuv420p"
+		scaleFilter := softwareScaleFilter
 		deviceFrames := false
 		if mode == domain.DecodeDevice {
 			decodeFlags = []string{"-hwaccel", "cuda", "-hwaccel_output_format", "cuda"}
@@ -133,10 +169,10 @@ func NewConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) *domain
 			Accelerator:  domain.AccelVideoToolbox,
 			Requested:    domain.AccelVideoToolbox,
 			DecodeFlags:  []string{"-hwaccel", "videotoolbox"},
-			EncodeFlags:  []string{"-c:v", "h264_videotoolbox", "-realtime", "true", "-prio_speed", "true"},
+			EncodeFlags:  []string{"-c:v", "h264_videotoolbox", "-realtime", "true", "-prio_speed", "true", "-g", "250"},
 			Encoder:      "h264_videotoolbox",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
+			ScaleFilter:  softwareScaleFilter,
 			DecodeMode:   mode,
 		}
 	case domain.AccelVAAPI:
@@ -168,10 +204,10 @@ func NewConfigWithMode(accel domain.Accelerator, mode domain.DecodeMode) *domain
 			Accelerator:  domain.AccelNone,
 			Requested:    accel,
 			DecodeFlags:  []string{},
-			EncodeFlags:  []string{"-c:v", "libx264", "-preset", "ultrafast"},
+			EncodeFlags:  []string{"-c:v", "libx264", "-preset", "superfast"},
 			Encoder:      "libx264",
 			KeyframeFlag: "-force_key_frames",
-			ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
+			ScaleFilter:  softwareScaleFilter,
 			DecodeMode:   domain.DecodeSafe,
 		}
 	}
@@ -215,6 +251,30 @@ func Validate(ctx context.Context, config *domain.HWAccelConfig) error {
 		}
 	}
 	return nil
+}
+
+func DetectTonemap(ctx context.Context) (string, error) {
+	output, err := mediaexec.Output(ctx, "ffmpeg", "-hide_banner", "-filters")
+	if err != nil {
+		return "", fmt.Errorf("list ffmpeg filters: %w", err)
+	}
+	present := make(map[string]bool)
+	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	for scanner.Scan() {
+		if fields := strings.Fields(scanner.Text()); len(fields) >= 3 {
+			present[fields[1]] = true
+		}
+	}
+	var missing []string
+	for _, name := range tonemapFilters {
+		if !present[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return "", fmt.Errorf("%w: ffmpeg has no %s filter", ErrTonemapUnavailable, strings.Join(missing, " or "))
+	}
+	return tonemapFilter, nil
 }
 
 func detectHWAccels(ctx context.Context) (map[string]bool, error) {

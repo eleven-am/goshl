@@ -572,7 +572,7 @@ func TestWorkerStoresCompleteRealFFmpegBatch(t *testing.T) {
 	args, err := builder.Video(ffmpeg.VideoParams{
 		InputURL:    input,
 		StreamIndex: 0,
-		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 500_000},
+		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 500_000, PeakBitrate: 750000, BufferSize: 1500000, Level: 30},
 		Segments: []domain.Segment{
 			{Index: 0, Start: 0, End: 2, Duration: 2},
 			{Index: 1, Start: 2, End: 4, Duration: 2},

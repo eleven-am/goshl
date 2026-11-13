@@ -360,7 +360,7 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 			OutputDir:   tmpDir,
 		}
 		if job.AudioRendition.Method == domain.DirectStream {
-			landing, err := p.cmdBuilder.SeekLanding(jobCtx, job.SourceURL, jobSeekStart(job), job.AudioRendition.StreamIndex)
+			landing, err := p.cmdBuilder.SeekLanding(jobCtx, job.SourceURL, params.LandingStart(), job.AudioRendition.StreamIndex)
 			if err != nil {
 				fail(err)
 				return

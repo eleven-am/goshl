@@ -1,102 +1,170 @@
 package rendition
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/h264level"
+	"github.com/eleven-am/goshl/internal/playlist"
 )
 
-type bounds struct {
-	min int
-	max int
+var ErrNoEncodableVideo = errors.New("no encodable video rendition")
+
+type class struct {
+	shortSide       int
+	minBitrate      int
+	maxBitrate      int
+	estimateBitrate int
 }
 
-var targetHeights = []int{2160, 1080, 720, 480, 360}
-
-var bitrateBounds = map[int]bounds{
-	2160: {min: 8000000, max: 20000000},
-	1080: {min: 2000000, max: 8000000},
-	720:  {min: 1000000, max: 4000000},
-	480:  {min: 500000, max: 2000000},
-	360:  {min: 300000, max: 1000000},
+var classes = []class{
+	{shortSide: 2160, minBitrate: 8_000_000, maxBitrate: 20_000_000, estimateBitrate: 15_000_000},
+	{shortSide: 1080, minBitrate: 2_000_000, maxBitrate: 8_000_000, estimateBitrate: 5_000_000},
+	{shortSide: 720, minBitrate: 1_000_000, maxBitrate: 4_000_000, estimateBitrate: 2_500_000},
+	{shortSide: 480, minBitrate: 500_000, maxBitrate: 2_000_000, estimateBitrate: 1_200_000},
+	{shortSide: 360, minBitrate: 300_000, maxBitrate: 1_000_000, estimateBitrate: 800_000},
 }
 
-var directStreamCodecs = map[string]bool{
-	"h264": true,
+var passthroughCeilings = map[string]int{
+	"ac3":  640_000,
+	"eac3": 1_536_000,
 }
 
-func GenerateVideo(video domain.VideoStream) []domain.VideoRendition {
+func GenerateVideo(meta *domain.Metadata, targetDuration float64) ([]domain.VideoRendition, error) {
+	video := meta.Video
+	if video.Width <= 0 || video.Height <= 0 {
+		return nil, nil
+	}
+
+	direct := directStreamCompatible(video) && playlist.KeyframeAligned(meta.Keyframes, meta.Duration, targetDuration)
+	sourceBitrate := sourceVideoBitrate(meta)
+
+	width, height := video.Width, video.Height
+	if !direct {
+		width, height = evenDown(width), evenDown(height)
+	}
+	sourceShort := min(width, height)
+	sourceClass := classFor(sourceShort)
+
+	colour := domain.PlanColour(video)
 	var renditions []domain.VideoRendition
+	var rejected []string
 
-	srcWidth := video.Width
-	srcHeight := video.Height
-	srcBitrate := video.Bitrate
-	srcPixels := srcWidth * srcHeight
-	srcCodec := video.Codec
-
-	if srcBitrate <= 0 {
-		srcBitrate = estimateBitrate(srcHeight)
+	topBitrate := sourceBitrate
+	if !direct {
+		topBitrate = min(sourceBitrate, sourceClass.maxBitrate)
+	}
+	ceiling := topBitrate
+	if direct {
+		renditions = append(renditions, directRendition(video, topBitrate))
+	} else if top, err := transcodedRendition(width, height, topBitrate, video.FrameRate); err != nil {
+		rejected = append(rejected, err.Error())
+	} else {
+		top.Colour = colour
+		renditions = append(renditions, top)
 	}
 
-	heights := make([]int, 0, len(targetHeights)+1)
-	if srcHeight > 0 {
-		heights = append(heights, srcHeight)
-	}
-	for _, height := range targetHeights {
-		if height < srcHeight {
-			heights = append(heights, height)
+	sourcePixels := float64(width) * float64(height)
+	for _, rung := range classes {
+		if rung.shortSide >= sourceShort {
+			continue
 		}
-	}
-
-	for _, targetHeight := range heights {
-
-		targetWidth := calculateWidth(srcWidth, srcHeight, targetHeight)
-		targetPixels := targetWidth * targetHeight
-
-		ratio := float64(targetPixels) / float64(srcPixels)
-		bitrate := int(float64(srcBitrate) * ratio)
-
-		if targetHeight == srcHeight {
-			bitrate = srcBitrate
-		} else {
-			bitrate = clampBitrate(targetHeight, bitrate)
+		rungWidth, rungHeight := scaleToShortSide(video.Width, video.Height, rung.shortSide)
+		ratio := float64(rungWidth) * float64(rungHeight) / sourcePixels
+		bitrate := min(clamp(int(float64(topBitrate)*ratio), rung.minBitrate, rung.maxBitrate), ceiling)
+		candidate, err := transcodedRendition(rungWidth, rungHeight, bitrate, video.FrameRate)
+		if err != nil {
+			rejected = append(rejected, err.Error())
+			continue
 		}
-
-		method := domain.Transcode
-		if directStreamCodecs[srcCodec] && targetHeight == srcHeight && directStreamCompatible(video) {
-			method = domain.DirectStream
-		}
-		peakBitrate := int(float64(bitrate) * 1.5)
-		level := h264level.Minimum(targetWidth, targetHeight, video.FrameRate, peakBitrate)
-		codec := videoCodecString(level)
-		if method == domain.DirectStream {
-			codec = sourceVideoCodecString(video)
-			level = video.Level
-		}
-
-		renditions = append(renditions, domain.VideoRendition{
-			Name:        fmt.Sprintf("%dp", targetHeight),
-			Width:       targetWidth,
-			Height:      targetHeight,
-			Bitrate:     bitrate,
-			PeakBitrate: peakBitrate,
-			FrameRate:   video.FrameRate,
-			Codec:       codec,
-			Level:       level,
-			Method:      method,
-		})
+		candidate.Colour = colour
+		renditions = append(renditions, candidate)
+		ceiling = bitrate
 	}
 
-	return renditions
+	if len(renditions) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNoEncodableVideo, strings.Join(rejected, "; "))
+	}
+	return renditions, nil
+}
+
+func directRendition(video domain.VideoStream, bitrate int) domain.VideoRendition {
+	return domain.VideoRendition{
+		Name:        rungName(video.Width, video.Height),
+		Width:       video.Width,
+		Height:      video.Height,
+		Bitrate:     bitrate,
+		PeakBitrate: peakBitrate(bitrate),
+		FrameRate:   video.FrameRate,
+		Codec:       sourceVideoCodecString(video),
+		Level:       video.Level,
+		Method:      domain.DirectStream,
+	}
+}
+
+func transcodedRendition(width, height, bitrate int, frameRate float64) (domain.VideoRendition, error) {
+	name := rungName(width, height)
+	peak := peakBitrate(bitrate)
+	level, ok := h264level.Minimum(width, height, frameRate, peak)
+	if !ok {
+		return domain.VideoRendition{}, fmt.Errorf("%s (%dx%d at %.3f fps, peak %d) needs an H.264 level above %.1f", name, width, height, frameRate, peak, float64(h264level.Ceiling)/10)
+	}
+	return domain.VideoRendition{
+		Name:        name,
+		Width:       width,
+		Height:      height,
+		Bitrate:     bitrate,
+		PeakBitrate: peak,
+		BufferSize:  min(2*peak, h264level.MaxCPB(level)),
+		FrameRate:   frameRate,
+		Codec:       fmt.Sprintf("avc1.6400%02x", level),
+		Level:       level,
+		Method:      domain.Transcode,
+	}, nil
+}
+
+func rungName(width, height int) string {
+	return fmt.Sprintf("%dp", min(width, height))
+}
+
+func peakBitrate(bitrate int) int {
+	return bitrate + bitrate/2
+}
+
+func sourceVideoBitrate(meta *domain.Metadata) int {
+	if meta.Video.Bitrate > 0 {
+		return meta.Video.Bitrate
+	}
+	remaining := meta.Bitrate
+	for _, audio := range meta.Audios {
+		remaining -= audio.Bitrate
+	}
+	if meta.Bitrate > 0 && remaining > 0 {
+		return remaining
+	}
+	return classFor(min(meta.Video.Width, meta.Video.Height)).estimateBitrate
+}
+
+func classFor(shortSide int) class {
+	chosen := classes[0]
+	for _, candidate := range classes {
+		if candidate.shortSide >= shortSide {
+			chosen = candidate
+		}
+	}
+	return chosen
 }
 
 func directStreamCompatible(video domain.VideoStream) bool {
+	if domain.HDRTransfer(video.ColorTransfer) {
+		return false
+	}
 	if video.Codec != "h264" || video.BitDepth != 0 && video.BitDepth != 8 {
 		return false
 	}
-	if video.Level <= 0 || video.Level > 52 {
+	if video.Level <= 0 || video.Level > h264level.Ceiling {
 		return false
 	}
 	if video.Rotation != 0 {
@@ -111,70 +179,38 @@ func directStreamCompatible(video domain.VideoStream) bool {
 	if !video.StartsWithKeyframe {
 		return false
 	}
-	profile := strings.ToLower(video.Profile)
-	return profile == "baseline" || profile == "constrained baseline" || profile == "main" || profile == "high"
+	_, known := sourceProfiles[strings.ToLower(video.Profile)]
+	return known
+}
+
+var sourceProfiles = map[string]string{
+	"baseline":             "4200",
+	"constrained baseline": "4240",
+	"main":                 "4d00",
+	"high":                 "6400",
 }
 
 func sourceVideoCodecString(video domain.VideoStream) string {
-	profile := 100
-	switch strings.ToLower(video.Profile) {
-	case "baseline", "constrained baseline":
-		profile = 66
-	case "main":
-		profile = 77
-	}
-	level := video.Level
-	if level <= 0 {
-		level = 40
-	}
-	return fmt.Sprintf("avc1.%02x00%02x", profile, level)
+	return fmt.Sprintf("avc1.%s%02x", sourceProfiles[strings.ToLower(video.Profile)], video.Level)
 }
 
-func videoCodecString(level int) string {
-	return fmt.Sprintf("avc1.6400%02x", level)
+func scaleToShortSide(width, height, shortSide int) (int, int) {
+	if width >= height {
+		return evenUp(int(float64(shortSide) * float64(width) / float64(height))), shortSide
+	}
+	return shortSide, evenUp(int(float64(shortSide) * float64(height) / float64(width)))
 }
 
-func calculateWidth(srcWidth, srcHeight, targetHeight int) int {
-	aspectRatio := float64(srcWidth) / float64(srcHeight)
-	width := int(float64(targetHeight) * aspectRatio)
-	if width%2 != 0 {
-		width++
-	}
-	return width
+func evenUp(value int) int {
+	return value + value%2
 }
 
-func clampBitrate(height, bitrate int) int {
-	b, ok := bitrateBounds[height]
-	if !ok {
-		return bitrate
-	}
-	if bitrate < b.min {
-		return b.min
-	}
-	if bitrate > b.max {
-		return b.max
-	}
-	return bitrate
+func evenDown(value int) int {
+	return max(value-value%2, 2)
 }
 
-func estimateBitrate(height int) int {
-	switch {
-	case height >= 2160:
-		return 15000000
-	case height >= 1080:
-		return 5000000
-	case height >= 720:
-		return 2500000
-	case height >= 480:
-		return 1200000
-	default:
-		return 800000
-	}
-}
-
-var passthroughCodecs = map[string]bool{
-	"ac3":  true,
-	"eac3": true,
+func clamp(value, low, high int) int {
+	return min(max(value, low), high)
 }
 
 func GenerateAudio(audio domain.AudioStream) []domain.AudioRendition {
@@ -184,13 +220,20 @@ func GenerateAudio(audio domain.AudioStream) []domain.AudioRendition {
 func GenerateAudioTracks(audios []domain.AudioStream) []domain.AudioRendition {
 	var renditions []domain.AudioRendition
 
+	defaultTrack := 0
+	for i, audio := range audios {
+		if audio.Default {
+			defaultTrack = i
+			break
+		}
+	}
 	for i, audio := range audios {
 		prefixNames := len(audios) > 1
 		streamIndex := audio.Index
 		if i > 0 && streamIndex == 0 {
 			streamIndex = i
 		}
-		renditions = append(renditions, generateAudio(audio, streamIndex, prefixNames, i == 0 || audio.Default)...)
+		renditions = append(renditions, generateAudio(audio, streamIndex, prefixNames, i == defaultTrack)...)
 	}
 
 	return renditions
@@ -202,11 +245,15 @@ func generateAudio(audio domain.AudioStream, streamIndex int, prefixNames bool, 
 	renditions = append(renditions, audioRendition("aac_stereo", "aac", 128000, 2, domain.Transcode, audio, streamIndex, prefixNames, defaultTrack))
 
 	if audio.Channels >= 6 {
-		renditions = append(renditions, audioRendition("aac_surround", "aac", 384000, 6, domain.Transcode, audio, streamIndex, prefixNames, false))
+		renditions = append(renditions, audioRendition("aac_surround", "aac", 384000, 6, domain.Transcode, audio, streamIndex, prefixNames, defaultTrack))
 	}
 
-	if passthroughCodecs[audio.Codec] {
-		renditions = append(renditions, audioRendition(audio.Codec+"_passthrough", audio.Codec, audio.Bitrate, audio.Channels, domain.DirectStream, audio, streamIndex, prefixNames, false))
+	if ceiling, passthrough := passthroughCeilings[audio.Codec]; passthrough {
+		bitrate := audio.Bitrate
+		if bitrate <= 0 {
+			bitrate = ceiling
+		}
+		renditions = append(renditions, audioRendition(audio.Codec+"_passthrough", audio.Codec, bitrate, audio.Channels, domain.DirectStream, audio, streamIndex, prefixNames, defaultTrack))
 	}
 
 	return renditions
@@ -226,7 +273,9 @@ func audioRendition(name, codec string, bitrate, channels int, method domain.Pla
 		Method:      method,
 		StreamIndex: streamIndex,
 		Language:    audio.Language,
+		Title:       audio.Title,
 		Default:     isDefault,
+		SourceEnd:   audio.End,
 	}
 }
 

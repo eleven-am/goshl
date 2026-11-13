@@ -325,3 +325,83 @@ func TestSegmentPollingBacksOff(t *testing.T) {
 		t.Fatalf("widest poll gap = %v, want the 1s cap (900ms..1.3s)", widest)
 	}
 }
+
+type jobWatchProbe struct {
+	ctx      context.Context
+	runID    string
+	statuses chan domain.JobStatus
+}
+
+type jobWatchProbeCoordinator struct {
+	*segTestCoordinator
+	watches chan jobWatchProbe
+}
+
+func (c *jobWatchProbeCoordinator) WaitJob(ctx context.Context, runID string) (<-chan domain.JobStatus, error) {
+	statuses := make(chan domain.JobStatus, 1)
+	c.watches <- jobWatchProbe{ctx: ctx, runID: runID, statuses: statuses}
+	return statuses, nil
+}
+
+func TestSegmentJobWatchIsCancelledWhenFlightEndsWhileControllerRuns(t *testing.T) {
+	newProbe := func(t *testing.T) (*Controller, *jobWatchProbeCoordinator) {
+		coord := &jobWatchProbeCoordinator{segTestCoordinator: newSegTestCoordinator(), watches: make(chan jobWatchProbe, 4)}
+		ctl := newSegTestController(t, &segTestStorage{}, coord.segTestCoordinator, func(o *Options) {
+			o.Coordinator = coord
+			o.SegmentTimeout = 30 * time.Second
+		})
+		return ctl, coord
+	}
+	watchOf := func(t *testing.T, coord *jobWatchProbeCoordinator) jobWatchProbe {
+		t.Helper()
+		select {
+		case watch := <-coord.watches:
+			return watch
+		case <-time.After(5 * time.Second):
+			t.Fatal("the request never opened a job watch")
+			return jobWatchProbe{}
+		}
+	}
+
+	t.Run("terminal job status", func(t *testing.T) {
+		ctl, coord := newProbe(t)
+		result := make(chan error, 1)
+		go func() {
+			_, err := ctl.Segment(context.Background(), "/x.mkv", StreamVideo, "720p", 0)
+			result <- err
+		}()
+		watch := watchOf(t, coord)
+		watch.statuses <- domain.JobStatus{RunID: watch.runID, State: domain.JobStateFailed, Error: "encoder crashed"}
+
+		select {
+		case err := <-result:
+			if err == nil || !strings.Contains(err.Error(), "encoder crashed") {
+				t.Fatalf("error = %v, want the job failure", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Segment did not return after the job failed")
+		}
+		if watch.ctx.Err() == nil {
+			t.Fatal("the job watch stayed open after its flight finished")
+		}
+		if ctl.lifecycle.Stopped() {
+			t.Fatal("the controller must still be running")
+		}
+	})
+
+	t.Run("rejected enqueue", func(t *testing.T) {
+		ctl, coord := newProbe(t)
+		coord.enqueueErr = func(int32) error { return fmt.Errorf("queue down: %w", ErrEnqueueRejected) }
+
+		if _, err := ctl.Segment(context.Background(), "/x.mkv", StreamVideo, "720p", 0); err == nil || !strings.Contains(err.Error(), "queue down") {
+			t.Fatalf("error = %v, want enqueue failure", err)
+		}
+		watch := watchOf(t, coord)
+		if watch.ctx.Err() == nil {
+			t.Fatal("the job watch stayed open after its flight was abandoned")
+		}
+		if ctl.lifecycle.Stopped() {
+			t.Fatal("the controller must still be running")
+		}
+	})
+}

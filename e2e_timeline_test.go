@@ -353,7 +353,11 @@ func TestControllerSegmentsFormOneContinuousTimeline(t *testing.T) {
 				joinTolerance = 0.001
 			}
 			var direct, transcoded int
-			for _, video := range rendition.GenerateVideo(meta.Video) {
+			videos, err := rendition.GenerateVideo(meta, 2)
+			if err != nil {
+				t.Fatalf("generate video renditions: %v", err)
+			}
+			for _, video := range videos {
 				segments := fetchTimelineRendition(t, controller, source, StreamVideo, video.Name, "v:0")
 				if video.Method == domain.DirectStream {
 					direct++

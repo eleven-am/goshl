@@ -346,3 +346,85 @@ func TestSegmentReturnsStoppedWhenStopRemovesFlightBeforeLockIsRecorded(t *testi
 		t.Fatalf("the acquired job lock must be released, got %d releases", coordinator.releaseCount())
 	}
 }
+
+var flightEndings = []struct {
+	name string
+	end  func(*Controller, *flight)
+}{
+	{"finish", (*Controller).finishFlight},
+	{"stop", (*Controller).stopFlight},
+	{"abandon", (*Controller).abandonFlight},
+	{"expire", (*Controller).expireFlight},
+}
+
+func TestEndingFlightAgainDoesNotReleaseItsJobLockTwice(t *testing.T) {
+	for _, first := range flightEndings {
+		for _, second := range flightEndings {
+			t.Run(first.name+" then "+second.name, func(t *testing.T) {
+				coordinator := newLifecycleProbeCoordinator()
+				var releaseFailures atomic.Int32
+				controller := lifecycleController(t, coordinator, time.Hour)
+				controller.opts.Observer = ObserverFunc(func(_ context.Context, event Event) {
+					if event.Type == EventLockReleaseFailed {
+						releaseFailures.Add(1)
+					}
+				})
+				t.Cleanup(controller.Stop)
+				f := parkFlight(t, controller, coordinator, "720p", false, false)
+
+				first.end(controller, f)
+				if got := coordinator.releasesCompleted(); got != 1 {
+					t.Fatalf("ending a never-enqueued flight must release its job lock once, got %d releases", got)
+				}
+				second.end(controller, f)
+
+				if got := coordinator.releasesCompleted(); got != 1 {
+					t.Fatalf("a flight that already ended must not release its job lock again, got %d release calls", got)
+				}
+				if got := releaseFailures.Load(); got != 0 {
+					t.Fatalf("ending a flight twice reported %d lock release failures", got)
+				}
+				if coordinator.holdsJob(f.jobID) {
+					t.Fatal("the job lock must be released")
+				}
+			})
+		}
+	}
+}
+
+func TestEndingFlightCancelsItsJobWatch(t *testing.T) {
+	for _, ending := range flightEndings {
+		t.Run(ending.name, func(t *testing.T) {
+			coordinator := newLifecycleProbeCoordinator()
+			controller := lifecycleController(t, coordinator, time.Hour)
+			t.Cleanup(controller.Stop)
+			_, f := controller.joinFlight("watched", domain.StreamVideo, "720p", 0, 0)
+			if f == nil {
+				t.Fatal("expected a new flight")
+			}
+			watchCtx, watchCancel := context.WithCancel(controller.lifecycle.Context())
+			defer watchCancel()
+			if !controller.setFlightWatch(f, watchCancel) {
+				t.Fatal("flight watch not recorded")
+			}
+
+			ending.end(controller, f)
+
+			if watchCtx.Err() == nil {
+				t.Fatal("ending a flight must cancel its job watch instead of leaving it open until Stop")
+			}
+			if controller.lifecycle.Stopped() {
+				t.Fatal("the controller must still be running")
+			}
+		})
+	}
+}
+
+func (c *Controller) finishFlightRun(jobID, runID string) {
+	c.flights.mu.Lock()
+	f := c.flights.flights[jobID]
+	c.flights.mu.Unlock()
+	if f != nil && f.runID == runID {
+		c.finishFlight(f)
+	}
+}

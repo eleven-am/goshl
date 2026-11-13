@@ -56,7 +56,7 @@ func TestVideoCommand_TranscodeIncludesSegmentTimes(t *testing.T) {
 	args, err := builder.Video(VideoParams{
 		InputURL:    "input.mp4",
 		StreamIndex: 0,
-		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 1280, Height: 720, Bitrate: 2_000_000},
+		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 1280, Height: 720, Bitrate: 2_000_000, PeakBitrate: 3000000, BufferSize: 6000000, Level: 31},
 		Segments:    segments,
 		OutputDir:   "/tmp/out",
 	})
@@ -190,7 +190,7 @@ func TestAACJobSeeksOnTheFrameGrid(t *testing.T) {
 			t.Fatalf("cut %d is %.6f, want %.6f measured from the priming packet", index, got, want)
 		}
 	}
-	if want := "aresample=48000:first_pts=" + strconv.FormatInt(int64(math.Round(seek*48000)), 10); optionValue(t, joined, "-af") != want {
+	if want := "aresample=48000:first_pts=" + strconv.FormatInt(int64(math.Round(seek*48000)), 10) + ",apad"; optionValue(t, joined, "-af") != want {
 		t.Fatalf("the encoder input must be pinned to the frame grid with %s: %s", want, joined)
 	}
 	if optionValue(t, joined, "-segment_start_number") != "3" {
@@ -249,7 +249,7 @@ func TestEveryJobCarriesTheTimelineOffset(t *testing.T) {
 			return builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.DirectStream}, Segments: segments, Landing: landing(0)})
 		},
 		"transcoded video": func() ([]string, error) {
-			return builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000}, Segments: segments})
+			return builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30}, Segments: segments})
 		},
 		"aac audio": func() ([]string, error) {
 			return builder.Audio(AudioParams{InputURL: "in", Rendition: domain.AudioRendition{Method: domain.Transcode, Channels: 2, Bitrate: 128000}, Segments: segments})
@@ -318,7 +318,7 @@ func TestTrailingRejectedForTranscodeAndAudio(t *testing.T) {
 	builder := NewCommandBuilder(testHW)
 	segments := []domain.Segment{{Index: 2, Start: 4, End: 6}}
 	trailing := domain.Segment{Index: 3, Start: 6, End: 8}
-	if _, err := builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000}, Segments: segments, Trailing: &trailing}); !errors.Is(err, ErrTrailingNotSupported) {
+	if _, err := builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30}, Segments: segments, Trailing: &trailing}); !errors.Is(err, ErrTrailingNotSupported) {
 		t.Fatalf("transcoded video with a trailing segment: got %v", err)
 	}
 	for _, method := range []domain.PlaybackMethod{domain.Transcode, domain.DirectStream} {
@@ -363,7 +363,7 @@ func TestSingleFileJobStillDeclaresACutBeyondItsEnd(t *testing.T) {
 			return builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.DirectStream}, Segments: segments, Landing: landing(0)})
 		},
 		"transcoded video": func() ([]string, error) {
-			return builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000}, Segments: segments})
+			return builder.Video(VideoParams{InputURL: "in", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30}, Segments: segments})
 		},
 		"aac audio": func() ([]string, error) {
 			return builder.Audio(AudioParams{InputURL: "in", Rendition: domain.AudioRendition{Method: domain.Transcode, Channels: 2, Bitrate: 128000}, Segments: segments})
@@ -395,7 +395,7 @@ func TestVideoCommandDoesNotMutateHardwareConfig(t *testing.T) {
 	builder := NewCommandBuilder(config)
 	if _, err := builder.Video(VideoParams{
 		InputURL:  "input.mp4",
-		Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600_000},
+		Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600_000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30},
 		Segments:  []domain.Segment{{Index: 0, Start: 0, End: 6}},
 		OutputDir: "/tmp/out",
 	}); err != nil {
@@ -418,7 +418,7 @@ func TestCUDATranscodeForcesIDRFrames(t *testing.T) {
 	args, err := builder.Video(VideoParams{
 		InputURL:    "file.mkv",
 		StreamIndex: 2,
-		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600_000},
+		Rendition:   domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600_000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30},
 		Segments:    []domain.Segment{{Index: 0, Start: 0, End: 2.5}, {Index: 1, Start: 2.5, End: 5}},
 	})
 	joined := mustArgs(t, args, err)
@@ -491,7 +491,7 @@ func TestSeekLandingSharesSeekInputPrefixWithVideo(t *testing.T) {
 func TestTranscodedVideoKeepsSourceFrameTiming(t *testing.T) {
 	builder := NewCommandBuilder(testHW)
 	segments := []domain.Segment{{Index: 0, Start: 0, End: 6}}
-	args, err := builder.Video(VideoParams{InputURL: "in.mkv", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000}, Segments: segments})
+	args, err := builder.Video(VideoParams{InputURL: "in.mkv", Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 640, Height: 360, Bitrate: 600000, PeakBitrate: 900000, BufferSize: 1800000, Level: 30}, Segments: segments})
 	joined := mustArgs(t, args, err)
 	if !strings.Contains(joined, "-fps_mode passthrough") || !strings.Contains(joined, "-enc_time_base demux") {
 		t.Fatalf("transcoded video must keep source frame timestamps instead of re-timing them to a frame grid: %s", joined)
@@ -499,5 +499,238 @@ func TestTranscodedVideoKeepsSourceFrameTiming(t *testing.T) {
 	args, err = builder.Video(VideoParams{InputURL: "in.mkv", Rendition: domain.VideoRendition{Method: domain.DirectStream}, Segments: segments, Landing: landing(0)})
 	if copied := mustArgs(t, args, err); strings.Contains(copied, "-fps_mode") || strings.Contains(copied, "-enc_time_base") {
 		t.Fatalf("copied video has no encoder timing to set: %s", copied)
+	}
+}
+
+func completeRendition() domain.VideoRendition {
+	return domain.VideoRendition{Name: "720p", Method: domain.Transcode, Width: 1280, Height: 720, Bitrate: 2_000_000, PeakBitrate: 3_100_000, BufferSize: 5_300_000, Level: 30, FrameRate: 60}
+}
+
+func TestTranscodeArgsUseRenditionFactsVerbatim(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}}
+	cases := []struct {
+		level int
+		want  string
+	}{{30, "3.0"}, {31, "3.1"}, {40, "4.0"}, {42, "4.2"}, {52, "5.2"}}
+	for _, c := range cases {
+		rendition := completeRendition()
+		rendition.Level = c.level
+		args, err := builder.Video(VideoParams{InputURL: "in.mkv", Rendition: rendition, Segments: segments, OutputDir: "/tmp/v"})
+		joined := mustArgs(t, args, err)
+		for option, want := range map[string]string{"-level:v": c.want, "-b:v": "2000000", "-maxrate": "3100000", "-bufsize": "5300000", "-profile:v": "high"} {
+			if got := optionValue(t, joined, option); got != want {
+				t.Errorf("level %d: %s = %s, want the rendition value %s", c.level, option, got, want)
+			}
+		}
+		if !strings.Contains(joined, "scale=1280:720") {
+			t.Errorf("level %d: scale must use the rendition size: %s", c.level, joined)
+		}
+	}
+}
+
+func TestTranscodeRejectsIncompleteRendition(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}}
+	strip := map[string]func(*domain.VideoRendition){
+		"width":   func(r *domain.VideoRendition) { r.Width = 0 },
+		"height":  func(r *domain.VideoRendition) { r.Height = 0 },
+		"bitrate": func(r *domain.VideoRendition) { r.Bitrate = 0 },
+		"peak":    func(r *domain.VideoRendition) { r.PeakBitrate = 0 },
+		"buffer":  func(r *domain.VideoRendition) { r.BufferSize = 0 },
+		"level":   func(r *domain.VideoRendition) { r.Level = 0 },
+	}
+	for name, remove := range strip {
+		rendition := completeRendition()
+		remove(&rendition)
+		if _, err := builder.Video(VideoParams{InputURL: "in.mkv", Rendition: rendition, Segments: segments, OutputDir: "/tmp/v"}); !errors.Is(err, ErrRenditionIncomplete) {
+			t.Errorf("a transcode rendition without %s must be rejected, got %v", name, err)
+		}
+	}
+	if _, err := builder.Video(VideoParams{InputURL: "in.mkv", Rendition: domain.VideoRendition{Method: domain.DirectStream}, Segments: segments, Landing: landing(0), OutputDir: "/tmp/v"}); err != nil {
+		t.Fatalf("a copied rendition needs no encoder facts: %v", err)
+	}
+}
+
+func audioEndSegments() []domain.Segment {
+	segments := make([]domain.Segment, 10)
+	for index := range segments {
+		segments[index] = domain.Segment{Index: index, Start: float64(index), End: float64(index + 1), Duration: 1}
+	}
+	return segments
+}
+
+func TestAudioJobCoverageFollowsSourceEnd(t *testing.T) {
+	segments := audioEndSegments()
+	cases := []struct {
+		name      string
+		sourceEnd float64
+		from, to  int
+		overlap   bool
+		want      audioCoverage
+	}{
+		{"unknown end", 0, 8, 9, true, audioCovered},
+		{"inside", 7.5, 2, 5, true, audioCovered},
+		{"ends exactly at the guard", 7.05, 5, 6, true, audioCovered},
+		{"reaches past the guard", 7.049, 5, 6, true, audioPadded},
+		{"straddles the end", 7.5, 6, 9, true, audioPadded},
+		{"overlap is inside", 7.5, 8, 9, true, audioPadded},
+		{"overlap starts just inside the guard", 8.051, 9, 9, true, audioPadded},
+		{"overlap starts on the guard", 8.05, 9, 9, true, audioSilent},
+		{"wholly past", 7.5, 9, 9, true, audioSilent},
+		{"wholly past without overlap", 7.5, 8, 9, false, audioSilent},
+		{"end over the plan", 12, 8, 9, true, audioCovered},
+	}
+	for _, c := range cases {
+		first := segments[c.from]
+		if c.overlap {
+			first = segments[c.from-1]
+		}
+		if got := audioCoverageOf(domain.AudioRendition{SourceEnd: c.sourceEnd}, first, segments[c.to]); got != c.want {
+			t.Errorf("%s: coverage = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestAACJobAlwaysPadsItsInput(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := audioEndSegments()
+	for _, sourceEnd := range []float64{0, 7.5, 20} {
+		rendition := domain.AudioRendition{Method: domain.Transcode, Codec: "aac", Channels: 2, Bitrate: 128000, SourceEnd: sourceEnd}
+		args, err := builder.Audio(AudioParams{InputURL: "in.mkv", StreamIndex: 1, Rendition: rendition, Segments: segments[6:8], Overlap: &segments[5], OutputDir: "/tmp/a"})
+		joined := mustArgs(t, args, err)
+		if got := optionValue(t, joined, "-af"); got != "aresample=48000:first_pts=239616,apad" {
+			t.Errorf("source end %.1f: -af = %s, want the grid pin followed by apad", sourceEnd, got)
+		}
+		if optionValue(t, joined, "-to") != "8.000000" || !strings.Contains(joined, "-ss 4.992000 ") || strings.Contains(joined, "lavfi") {
+			t.Errorf("source end %.1f: a job that starts inside the audio reads the source: %s", sourceEnd, joined)
+		}
+	}
+}
+
+func TestAACJobPastSourceEndGeneratesSilence(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	rendition := domain.AudioRendition{Method: domain.Transcode, Codec: "aac", Channels: 6, Bitrate: 384000, SourceEnd: 7.5}
+	overlap := domain.Segment{Index: 8, Start: 8.1, End: 9.1, Duration: 1}
+	last := domain.Segment{Index: 9, Start: 9.1, End: 10, Duration: 0.9}
+	params := AudioParams{InputURL: "in.mkv", StreamIndex: 1, Rendition: rendition, Segments: []domain.Segment{last}, Overlap: &overlap, OutputDir: "/tmp/a"}
+	args, err := builder.Audio(params)
+	joined := mustArgs(t, args, err)
+
+	real := params
+	real.Rendition.SourceEnd = 0
+	realArgs, err := builder.Audio(real)
+	realJoined := mustArgs(t, realArgs, err)
+
+	if !strings.Contains(joined, "-f lavfi -i anullsrc=r=48000:cl=stereo ") || strings.Contains(joined, "in.mkv") || strings.Contains(joined, "-ss ") {
+		t.Fatalf("a job wholly past the audio end must read generated silence only: %s", joined)
+	}
+	if strings.Contains(joined, "-copyts") || optionValue(t, joined, "-map") != "0:0" {
+		t.Fatalf("generated silence is timed by the offset alone: %s", joined)
+	}
+	seek := 379.0 * 1024 / 48000
+	if got := optionValue(t, joined, "-output_ts_offset"); got != formatSeconds(domain.OutputTimelineOffset.Seconds()+seek) {
+		t.Fatalf("offset = %s, want the timeline offset plus the grid seek %.6f", got, seek)
+	}
+	if got := optionValue(t, joined, "-to"); got != formatSeconds(10-seek) {
+		t.Fatalf("-to = %s, want the job length %.6f", got, 10-seek)
+	}
+	for _, option := range []string{"-segment_times", "-segment_start_number", "-segment_time_delta", "-c:a", "-ac", "-b:a", "-ar"} {
+		if got, want := optionValue(t, joined, option), optionValue(t, realJoined, option); got != want {
+			t.Errorf("%s = %s, a job over real audio uses %s", option, got, want)
+		}
+	}
+	if strings.Contains(joined, "-af") {
+		t.Fatalf("generated silence needs no filter: %s", joined)
+	}
+}
+
+func TestPassthroughJobInsideSourceCopies(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := audioEndSegments()
+	for _, sourceEnd := range []float64{0, 7.5} {
+		rendition := domain.AudioRendition{Method: domain.DirectStream, Codec: "ac3", Channels: 6, Bitrate: 640000, SourceEnd: sourceEnd}
+		params := AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: rendition, Segments: segments[3:6], Overlap: &segments[2], Landing: landing(1.984), OutputDir: "/tmp/a"}
+		args, err := builder.Audio(params)
+		joined := mustArgs(t, args, err)
+		if optionValue(t, joined, "-c:a") != "copy" || strings.Contains(joined, "apad") || strings.Contains(joined, "-noaccurate_seek") || strings.Contains(joined, "lavfi") {
+			t.Errorf("source end %.1f: a job inside the audio must copy: %s", sourceEnd, joined)
+		}
+		if optionValue(t, joined, "-output_ts_offset") != "10.000000" {
+			t.Errorf("source end %.1f: copied audio keeps the plain timeline offset: %s", sourceEnd, joined)
+		}
+		if got := params.LandingStart(); got != 2 {
+			t.Errorf("source end %.1f: landing is measured at %.3f, want the job seek 2", sourceEnd, got)
+		}
+	}
+}
+
+func TestPassthroughJobReachingSourceEndReencodesAndPads(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := audioEndSegments()
+	rendition := domain.AudioRendition{Method: domain.DirectStream, Codec: "eac3", Channels: 8, Bitrate: 1_536_000, SourceEnd: 7.5}
+	params := AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: rendition, Segments: segments[7:9], Overlap: &segments[6], Landing: landing(5.984), OutputDir: "/tmp/a"}
+	if got := params.LandingStart(); got != 6 {
+		t.Fatalf("landing is measured at %.3f, want the job seek 6", got)
+	}
+	args, err := builder.Audio(params)
+	joined := mustArgs(t, args, err)
+	if !strings.Contains(joined, "-noaccurate_seek -flags2 +skip_manual -ss 6.000000 ") {
+		t.Fatalf("the decode must start on the landing packet, as the copy does: %s", joined)
+	}
+	for option, want := range map[string]string{"-c:a": "eac3", "-ac": "6", "-b:a": "1536000", "-af": "apad", "-to": "9.000000", "-output_ts_offset": "10.005333", "-segment_times": "1.016000,2.016000", "-map": "0:2"} {
+		if got := optionValue(t, joined, option); got != want {
+			t.Errorf("%s = %s, want %s", option, got, want)
+		}
+	}
+	assertTimestampsPreservedAfterSeek(t, joined)
+
+	params.Segments, params.Overlap, params.Landing = segments[0:9], nil, landing(-0.005333)
+	args, err = builder.Audio(params)
+	if got := optionValue(t, mustArgs(t, args, err), "-to"); got != "9.005333" {
+		t.Fatalf("-to = %s, a negative landing must not shorten the job (want 9.005333)", got)
+	}
+	if _, err := builder.Audio(AudioParams{InputURL: "in.mkv", Rendition: rendition, Segments: segments[7:9], OutputDir: "/tmp/a"}); !errors.Is(err, ErrLandingRequired) {
+		t.Fatalf("a padded passthrough job still needs its landing, got %v", err)
+	}
+}
+
+func TestPassthroughJobPastSourceEndGeneratesSilenceOnTheSourceGrid(t *testing.T) {
+	builder := NewCommandBuilder(testHW)
+	segments := audioEndSegments()
+	rendition := domain.AudioRendition{Method: domain.DirectStream, Codec: "ac3", Channels: 2, Bitrate: 192000, SourceEnd: 7.494}
+	params := AudioParams{InputURL: "in.mkv", StreamIndex: 2, Rendition: rendition, Segments: segments[9:10], Overlap: &segments[8], OutputDir: "/tmp/a"}
+	if got := params.LandingStart(); math.Abs(got-6.994) > 1e-9 {
+		t.Fatalf("landing is measured at %.6f, want half a second inside the audio (6.994)", got)
+	}
+	params.Landing = landing(6.970667)
+	args, err := builder.Audio(params)
+	joined := mustArgs(t, args, err)
+	if !strings.Contains(joined, "-f lavfi -i anullsrc=r=48000:cl=stereo ") || strings.Contains(joined, "in.mkv") || strings.Contains(joined, "-ss ") || strings.Contains(joined, "apad") {
+		t.Fatalf("a job wholly past the audio end must read generated silence only: %s", joined)
+	}
+	grid := 6.970667 + 32*0.032
+	for option, want := range map[string]string{
+		"-c:a":              "ac3",
+		"-ac":               "2",
+		"-b:a":              "192000",
+		"-map":              "0:0",
+		"-to":               formatSeconds(10 - grid),
+		"-output_ts_offset": formatSeconds(domain.OutputTimelineOffset.Seconds() + grid + 256.0/48000),
+		"-segment_times":    formatSeconds(9 - grid),
+	} {
+		if got := optionValue(t, joined, option); got != want {
+			t.Errorf("%s = %s, want %s", option, got, want)
+		}
+	}
+
+	short := params
+	short.Rendition.SourceEnd = 0.2
+	if got := short.LandingStart(); got != 0 {
+		t.Fatalf("landing is measured at %.3f, want the stream start for a very short track", got)
+	}
+	params.Landing = nil
+	if _, err := builder.Audio(params); !errors.Is(err, ErrLandingRequired) {
+		t.Fatalf("silence for a passthrough rendition needs a grid anchor, got %v", err)
 	}
 }

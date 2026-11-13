@@ -321,3 +321,126 @@ func TestOnceMapsErrorsToErrStoppedOnlyAfterClose(t *testing.T) {
 		t.Fatalf("a successful run must stay successful, got %v", err)
 	}
 }
+
+func TestCoordinateSkipsGenerateWhenReadyUnderFreshLock(t *testing.T) {
+	coord := coordtest.NewMemCoordinator()
+	runner := Runner{Kind: "asset", Coordinator: coord, Timeout: func() time.Duration { return time.Minute }, Observe: func(context.Context, domain.Event) {}}
+	var checks, generated atomic.Int32
+
+	err := runner.Coordinate(context.Background(), "k",
+		func(context.Context) (bool, error) { checks.Add(1); return true, nil },
+		func(context.Context) error { generated.Add(1); return nil })
+
+	if err != nil {
+		t.Fatalf("got %v, want nil for an asset that is already ready", err)
+	}
+	if checks.Load() != 1 {
+		t.Fatalf("ready checked %d times under the lock, want 1", checks.Load())
+	}
+	if generated.Load() != 0 {
+		t.Fatalf("generate ran %d times for an asset that was already ready", generated.Load())
+	}
+	token, err := coord.AcquireLock(context.Background(), "asset:k", time.Minute)
+	if err != nil || token == "" {
+		t.Fatalf("the lock must be released after the ready recheck, got token %q err %v", token, err)
+	}
+}
+
+func TestCoordinateReturnsReadyErrorUnderLockWithoutGenerating(t *testing.T) {
+	coord := coordtest.NewMemCoordinator()
+	runner := Runner{Kind: "asset", Coordinator: coord, Timeout: func() time.Duration { return time.Minute }, Observe: func(context.Context, domain.Event) {}}
+	storageDown := errors.New("storage down")
+	var generated atomic.Int32
+
+	err := runner.Coordinate(context.Background(), "k",
+		func(context.Context) (bool, error) { return false, storageDown },
+		func(context.Context) error { generated.Add(1); return nil })
+
+	if !errors.Is(err, storageDown) {
+		t.Fatalf("got %v, want the ready error", err)
+	}
+	if generated.Load() != 0 {
+		t.Fatalf("generate ran %d times after ready failed", generated.Load())
+	}
+	if _, err := coord.AcquireLock(context.Background(), "asset:k", time.Minute); err != nil {
+		t.Fatalf("the lock must be released after a ready error, got %v", err)
+	}
+}
+
+func TestLockWaiterRechecksReadyAfterTakingOverTheLock(t *testing.T) {
+	coord := coordtest.NewMemCoordinator()
+	lockWaiting := make(chan struct{}, 1)
+	runner := Runner{Kind: "asset", Coordinator: coord, Timeout: func() time.Duration { return time.Minute }, Observe: func(_ context.Context, event domain.Event) {
+		if event.Type == domain.EventLockWait {
+			select {
+			case lockWaiting <- struct{}{}:
+			default:
+			}
+		}
+	}}
+	holderToken, err := coord.AcquireLock(context.Background(), "asset:k", time.Minute)
+	if err != nil {
+		t.Fatalf("holder acquire: %v", err)
+	}
+
+	var checks, generated atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- runner.Coordinate(ctx, "k",
+			func(ctx context.Context) (bool, error) {
+				if checks.Add(1) > 1 {
+					return true, nil
+				}
+				return false, coord.ReleaseLock(ctx, "asset:k", holderToken)
+			},
+			func(context.Context) error { generated.Add(1); return nil })
+	}()
+
+	select {
+	case <-lockWaiting:
+	case <-time.After(3 * time.Second):
+		t.Fatal("waiter never started waiting for the lock")
+	}
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("waiter error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter never returned")
+	}
+	if checks.Load() != 2 {
+		t.Fatalf("ready checked %d times, want 2 (once while waiting, once under the lock)", checks.Load())
+	}
+	if generated.Load() != 0 {
+		t.Fatalf("waiter regenerated an asset the holder finished between its poll and its lock, generate ran %d times", generated.Load())
+	}
+	if _, err := coord.AcquireLock(context.Background(), "asset:k", time.Minute); err != nil {
+		t.Fatalf("the waiter must release the lock it took over, got %v", err)
+	}
+}
+
+func TestCoordinateWithoutCoordinatorChecksReadyBeforeGenerating(t *testing.T) {
+	runner := Runner{Kind: "asset", Timeout: func() time.Duration { return time.Minute }, Observe: func(context.Context, domain.Event) {}}
+	storageDown := errors.New("storage down")
+	var generated atomic.Int32
+	generate := func(context.Context) error { generated.Add(1); return nil }
+
+	if err := runner.Coordinate(context.Background(), "k", func(context.Context) (bool, error) { return true, nil }, generate); err != nil {
+		t.Fatalf("got %v, want nil for an asset that is already ready", err)
+	}
+	if err := runner.Coordinate(context.Background(), "k", func(context.Context) (bool, error) { return false, storageDown }, generate); !errors.Is(err, storageDown) {
+		t.Fatalf("got %v, want the ready error", err)
+	}
+	if generated.Load() != 0 {
+		t.Fatalf("generate ran %d times, want 0", generated.Load())
+	}
+	if err := runner.Coordinate(context.Background(), "k", func(context.Context) (bool, error) { return false, nil }, generate); err != nil {
+		t.Fatalf("got %v, want nil from generate", err)
+	}
+	if generated.Load() != 1 {
+		t.Fatalf("generate ran %d times for a missing asset, want 1", generated.Load())
+	}
+}

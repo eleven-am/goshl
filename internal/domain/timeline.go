@@ -7,7 +7,7 @@ import (
 
 const (
 	OutputTimelineOffset = 10 * time.Second
-	JobContractVersion   = 4
+	JobContractVersion   = 5
 	BoundaryTolerance    = 0.000001
 )
 

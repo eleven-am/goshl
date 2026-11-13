@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"math"
 	"net/url"
 	"os"
@@ -292,11 +293,11 @@ func makeMedia(t *testing.T, name string, args ...string) string {
 
 func referenceKeyframes(t *testing.T, path string, meta *domain.Metadata) []float64 {
 	t.Helper()
-	raw, err := NewProber().probeKeyframes(context.Background(), path, meta.Video.Index)
+	scan, err := NewProber().probeKeyframes(context.Background(), path, meta.Video.Index)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return normalizeKeyframes(raw, meta.StartTime, meta.Duration)
+	return normalizeKeyframes(scan.keyframes, meta.StartTime, meta.Duration)
 }
 
 func TestProbe_MP4UsesHeaderIndexAndMatchesPacketScan(t *testing.T) {
@@ -342,9 +343,9 @@ func TestProbe_FallsBackToPacketScan(t *testing.T) {
 	mp4 := makeMedia(t, "source.mp4")
 
 	cases := map[string]string{
-		"matroska":   makeMedia(t, "a.mkv"),
-		"fragmented": makeMedia(t, "frag.mp4", "-movflags", "frag_keyframe+empty_moov"),
-		"mpegts":     makeMedia(t, "a.ts"),
+		"matroska without cues": makeMedia(t, "a.mkv", "-live", "1"),
+		"fragmented":            makeMedia(t, "frag.mp4", "-movflags", "frag_keyframe+empty_moov"),
+		"mpegts":                makeMedia(t, "a.ts"),
 	}
 	trimmed := filepath.Join(dir, "trimmed.mp4")
 	if data, err := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "1.3", "-i", mp4, "-c", "copy", trimmed).CombinedOutput(); err != nil {
@@ -374,18 +375,16 @@ func TestProbe_MissingHeaderIndexFallsBack(t *testing.T) {
 	logPath := ffprobeCallLog(t)
 	path := makeMedia(t, "plain.mp4")
 	prober := NewProber()
+	ctx := context.Background()
 
-	if _, ok := prober.indexKeyframes("https://example.com/video.mp4", "mov,mp4,m4a,3gp,3g2,mj2", 0); ok {
-		t.Fatal("remote source must not use the header index")
+	if _, ok, err := prober.indexKeyframes(ctx, path, "matroska,webm", 0); ok || err != nil {
+		t.Fatalf("non-mp4 container must not use the header index: %v %v", ok, err)
 	}
-	if _, ok := prober.indexKeyframes(path, "matroska,webm", 0); ok {
-		t.Fatal("non-mp4 container must not use the header index")
+	if _, ok, err := prober.indexKeyframes(ctx, path, "mov,mp4,m4a,3gp,3g2,mj2", 7); ok || err != nil {
+		t.Fatalf("missing trak must fall back: %v %v", ok, err)
 	}
-	if _, ok := prober.indexKeyframes(filepath.Join(filepath.Dir(path), "missing.mp4"), "mov,mp4,m4a,3gp,3g2,mj2", 0); ok {
-		t.Fatal("unreadable source must fall back")
-	}
-	if _, ok := prober.indexKeyframes(path, "mov,mp4,m4a,3gp,3g2,mj2", 7); ok {
-		t.Fatal("missing trak must fall back")
+	if _, ok, err := prober.indexKeyframes(ctx, filepath.Join(filepath.Dir(path), "missing.mp4"), "mov,mp4,m4a,3gp,3g2,mj2", 0); ok || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreadable source must fail, got %v %v", ok, err)
 	}
 	if packetPassCount(t, logPath) != 0 {
 		t.Fatal("indexKeyframes must not run ffprobe")

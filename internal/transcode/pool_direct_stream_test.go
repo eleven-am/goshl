@@ -218,7 +218,7 @@ func copyRendition() poolRendition {
 }
 
 func transcodeRendition() poolRendition {
-	return poolRendition{video: &domain.VideoRendition{Name: "180p", Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000}}
+	return poolRendition{video: &domain.VideoRendition{Name: "180p", Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000, PeakBitrate: 600000, BufferSize: 1200000, Level: 30}}
 }
 
 func aacRendition() poolRendition {

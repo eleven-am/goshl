@@ -289,39 +289,6 @@ func TestMasterPlaylistUsesCachedMetadata(t *testing.T) {
 	}
 }
 
-func TestMasterPlaylistIncludesAllAudioTracks(t *testing.T) {
-	cleanup := installFakeFFmpeg(t)
-	defer cleanup()
-
-	meta := &domain.Metadata{
-		Video: domain.VideoStream{Width: 1920, Height: 1080, Bitrate: 5_000_000},
-		Audios: []domain.AudioStream{
-			{Codec: "aac", Channels: 2, Bitrate: 128_000, Language: "eng"},
-			{Codec: "ac3", Channels: 6, Bitrate: 640_000, Language: "spa"},
-		},
-	}
-	metaBytes, _ := json.Marshal(meta)
-	svc := NewController(Options{
-		Storage:     &stubStorage{metaData: metaBytes, metaExists: true},
-		Coordinator: &stubCoordinator{},
-		PathGen:     stubPathGen{},
-	})
-
-	out, err := svc.MasterPlaylist(context.Background(), "file:///media")
-	if err != nil {
-		t.Fatalf("master playlist err: %v", err)
-	}
-
-	for _, want := range []string{"audio0_aac_stereo", "audio1_aac_stereo", "audio1_aac_surround", "audio1_ac3_passthrough"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("expected audio rendition %q in playlist: %s", want, out)
-		}
-	}
-	if strings.Count(out, "DEFAULT=YES") != 3 {
-		t.Fatalf("expected one default in each compatible audio group: %s", out)
-	}
-}
-
 func masterWithSubtitles(t *testing.T, omit bool) string {
 	t.Helper()
 	cleanup := installFakeFFmpeg(t)

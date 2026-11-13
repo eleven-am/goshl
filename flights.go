@@ -235,15 +235,6 @@ func (c *Controller) startFlightWatch(f *flight, statuses <-chan domain.JobStatu
 	return true
 }
 
-func (c *Controller) finishFlightRun(jobID, runID string) {
-	c.flights.mu.Lock()
-	f := c.flights.flights[jobID]
-	c.flights.mu.Unlock()
-	if f != nil && f.runID == runID {
-		c.finishFlight(f)
-	}
-}
-
 func (c *Controller) releaseFlightLocks(flights []*flight) {
 	for _, f := range flights {
 		c.flights.mu.Lock()

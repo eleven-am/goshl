@@ -27,19 +27,28 @@ type SubtitleJob struct {
 	Origin      float64
 }
 
+var ErrSubtitleNotConvertible = errors.New("subtitle codec cannot be converted to webvtt")
+
 type SubtitleOutcome struct {
 	Data []byte
 	Err  error
 }
 
-var bitmapSubtitleCodecs = map[string]struct{}{
-	"hdmv_pgs_subtitle": {},
-	"pgssub":            {},
-	"dvd_subtitle":      {},
-	"dvdsub":            {},
-	"dvb_subtitle":      {},
-	"dvbsub":            {},
-	"xsub":              {},
+type batchFailure struct {
+	tracks map[string]error
+}
+
+func (f *batchFailure) Error() string {
+	ids := make([]string, 0, len(f.tracks))
+	for id := range f.tracks {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, id+": "+f.tracks[id].Error())
+	}
+	return "subtitle extraction failed: " + strings.Join(parts, "; ")
 }
 
 func (g *Generator) GetSubtitlesBatch(ctx context.Context, sourceURL string, jobs []SubtitleJob) (map[string]SubtitleOutcome, error) {
@@ -58,8 +67,8 @@ func (g *Generator) GetSubtitlesBatch(ctx context.Context, sourceURL string, job
 			outcomes[job.TrackID] = SubtitleOutcome{Data: data, Err: err}
 			continue
 		}
-		if _, bitmap := bitmapSubtitleCodecs[job.Codec]; bitmap {
-			outcomes[job.TrackID] = SubtitleOutcome{Err: fmt.Errorf("subtitle codec %s cannot be converted to webvtt", job.Codec)}
+		if !subtitle.Convertible(job.Codec) {
+			outcomes[job.TrackID] = SubtitleOutcome{Err: fmt.Errorf("%w: %q", ErrSubtitleNotConvertible, job.Codec)}
 			continue
 		}
 		outcomes[job.TrackID] = SubtitleOutcome{}
@@ -69,7 +78,6 @@ func (g *Generator) GetSubtitlesBatch(ctx context.Context, sourceURL string, job
 		return outcomes, nil
 	}
 
-	failures := make(map[string]error)
 	err := g.runner().Once(ctx, &g.subtitles, batchKey(pending), func(readyCtx context.Context) (bool, error) {
 		for _, job := range pending {
 			ok, err := g.storage.SubtitleVTTExists(readyCtx, job.Key, job.TrackID)
@@ -79,10 +87,22 @@ func (g *Generator) GetSubtitlesBatch(ctx context.Context, sourceURL string, job
 		}
 		return true, nil
 	}, func(genCtx context.Context) error {
-		return g.runSubtitleExtraction(genCtx, sourceURL, pending, failures)
+		failures := make(map[string]error)
+		if err := g.runSubtitleExtraction(genCtx, sourceURL, pending, failures); err != nil {
+			return err
+		}
+		if len(failures) > 0 {
+			return &batchFailure{tracks: failures}
+		}
+		return nil
 	})
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
+	}
+	var failed *batchFailure
+	failures := map[string]error{}
+	if errors.As(err, &failed) {
+		failures, err = failed.tracks, nil
 	}
 	for _, job := range pending {
 		if failure := failures[job.TrackID]; failure != nil {
@@ -159,20 +179,21 @@ func (g *Generator) extractSubtitleBatchFFmpeg(ctx context.Context, sourceURL st
 	if err != nil {
 		return err
 	}
-	args := append([]string{}, input...)
 	paths := make([]string, len(jobs))
-	for i, job := range jobs {
-		paths[i] = filepath.Join(dir, fmt.Sprintf("%d.vtt", i))
-		args = append(args, "-map", fmt.Sprintf("0:%d", job.StreamIndex), "-c:s", "webvtt", "-f", "webvtt", paths[i])
+	for i := range jobs {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("batch-%d.vtt", i))
 	}
-
-	if err := mediaexec.Run(ctx, "ffmpeg", args...); err != nil {
+	if err := mediaexec.Run(ctx, "ffmpeg", subtitleArgs(input, jobs, paths)...); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if len(jobs) == 1 {
+			failures[jobs[0].TrackID] = fmt.Errorf("ffmpeg subtitle extraction: %w", err)
+			return nil
+		}
 		for i, job := range jobs {
-			single := append(append([]string{}, input...), "-map", fmt.Sprintf("0:%d", job.StreamIndex), "-c:s", "webvtt", "-f", "webvtt", paths[i])
-			if runErr := mediaexec.Run(ctx, "ffmpeg", single...); runErr != nil {
+			paths[i] = filepath.Join(dir, fmt.Sprintf("track-%d.vtt", i))
+			if runErr := mediaexec.Run(ctx, "ffmpeg", subtitleArgs(input, jobs[i:i+1], paths[i:i+1])...); runErr != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -201,4 +222,12 @@ func (g *Generator) extractSubtitleBatchFFmpeg(ctx context.Context, sourceURL st
 		}
 	}
 	return nil
+}
+
+func subtitleArgs(input []string, jobs []SubtitleJob, paths []string) []string {
+	args := append([]string{"-nostdin", "-y"}, input...)
+	for i, job := range jobs {
+		args = append(args, "-map", fmt.Sprintf("0:%d", job.StreamIndex), "-c:s", "webvtt", "-f", "webvtt", paths[i])
+	}
+	return args
 }

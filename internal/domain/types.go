@@ -59,6 +59,7 @@ type SegmentStatus struct {
 type Metadata struct {
 	StartTime float64
 	Duration  float64
+	Bitrate   int
 	Keyframes []float64
 	Video     VideoStream
 	Audios    []AudioStream
@@ -84,6 +85,7 @@ type VideoStream struct {
 	Rotation           int
 	Default            bool
 	StartsWithKeyframe bool
+	End                float64
 }
 
 type AudioStream struct {
@@ -95,6 +97,7 @@ type AudioStream struct {
 	ChannelLayout string
 	Bitrate       int
 	Default       bool
+	End           float64
 }
 
 type SubtitleStream struct {

@@ -13,7 +13,7 @@ import (
 	"github.com/eleven-am/goshl/internal/source"
 )
 
-const cacheSchemaVersion = "goshl-cache-v4"
+const cacheSchemaVersion = "goshl-cache-v5"
 
 type SourceRevisionResolver func(context.Context, string) (string, error)
 

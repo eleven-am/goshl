@@ -74,7 +74,7 @@ func (c *Controller) segmentOnce(ctx context.Context, sourceURL string, streamTy
 	if err != nil {
 		return nil, fmt.Errorf("get metadata: %w", err)
 	}
-	videoRendition, audioRendition, err := resolveRendition(meta, streamType, renditionName)
+	videoRendition, audioRendition, err := c.resolveRendition(meta, streamType, renditionName)
 	if err != nil {
 		return nil, err
 	}
@@ -297,10 +297,14 @@ func (c *Controller) readStoredSegment(ctx context.Context, info domain.SegmentD
 	return data, true, err
 }
 
-func resolveRendition(meta *domain.Metadata, streamType domain.StreamType, name string) (*domain.VideoRendition, *domain.AudioRendition, error) {
+func (c *Controller) resolveRendition(meta *domain.Metadata, streamType domain.StreamType, name string) (*domain.VideoRendition, *domain.AudioRendition, error) {
 	switch streamType {
 	case domain.StreamVideo:
-		for _, candidate := range rendition.GenerateVideo(meta.Video) {
+		videos, err := rendition.GenerateVideo(meta, c.opts.TargetDuration)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %s: %v", ErrRenditionNotFound, name, err)
+		}
+		for _, candidate := range videos {
 			if candidate.Name == name {
 				value := candidate
 				return &value, nil, nil

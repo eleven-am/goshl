@@ -6,6 +6,7 @@ import (
 
 	"github.com/eleven-am/goshl/internal/domain"
 	"github.com/eleven-am/goshl/internal/misc"
+	"github.com/eleven-am/goshl/internal/subtitle"
 )
 
 func (c *Controller) SpriteVTT(ctx context.Context, sourceURL string) ([]byte, error) {
@@ -63,15 +64,9 @@ func (c *Controller) SubtitlesVTT(ctx context.Context, sourceURL string, trackID
 	results := make(map[string]SubtitleResult, len(trackIDs))
 	jobs := make([]misc.SubtitleJob, 0, len(trackIDs))
 	for _, trackID := range trackIDs {
-		var found *domain.SubtitleStream
-		for i := range meta.Subtitles {
-			if meta.Subtitles[i].ID == trackID {
-				found = &meta.Subtitles[i]
-				break
-			}
-		}
-		if found == nil {
-			results[trackID] = SubtitleResult{Err: fmt.Errorf("subtitle track %s not found", trackID)}
+		found, err := convertibleSubtitle(meta, trackID)
+		if err != nil {
+			results[trackID] = SubtitleResult{Err: err}
 			continue
 		}
 		jobs = append(jobs, misc.SubtitleJob{
@@ -91,6 +86,29 @@ func (c *Controller) SubtitlesVTT(ctx context.Context, sourceURL string, trackID
 		results[trackID] = SubtitleResult{Data: outcome.Data, Err: outcome.Err}
 	}
 	return results, nil
+}
+
+func convertibleSubtitles(streams []domain.SubtitleStream) []domain.SubtitleStream {
+	kept := make([]domain.SubtitleStream, 0, len(streams))
+	for _, stream := range streams {
+		if subtitle.Convertible(stream.Codec) {
+			kept = append(kept, stream)
+		}
+	}
+	return kept
+}
+
+func convertibleSubtitle(meta *domain.Metadata, trackID string) (*domain.SubtitleStream, error) {
+	for i := range meta.Subtitles {
+		if meta.Subtitles[i].ID != trackID {
+			continue
+		}
+		if !subtitle.Convertible(meta.Subtitles[i].Codec) {
+			return nil, fmt.Errorf("%w: subtitle track %s uses codec %q, which cannot be converted to webvtt", ErrRenditionNotFound, trackID, meta.Subtitles[i].Codec)
+		}
+		return &meta.Subtitles[i], nil
+	}
+	return nil, fmt.Errorf("%w: subtitle track %s", ErrRenditionNotFound, trackID)
 }
 
 func (c *Controller) Preview(ctx context.Context, sourceURL string, config *PreviewConfig) ([]byte, error) {

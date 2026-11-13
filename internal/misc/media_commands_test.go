@@ -76,7 +76,11 @@ func awkwardMediaFixture(t *testing.T) string {
 		Audio:     []testmedia.AudioSpec{{Codec: "aac"}},
 		Subtitles: true,
 	})
-	data, err := os.ReadFile(original)
+	cueless := filepath.Join(t.TempDir(), "cueless.mkv")
+	if out, err := exec.Command("ffmpeg", "-nostdin", "-v", "error", "-y", "-i", original, "-map", "0", "-c", "copy", "-live", "1", cueless).CombinedOutput(); err != nil {
+		t.Fatalf("remux fixture without cues: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(cueless)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
@@ -132,7 +136,7 @@ func runEveryMediaCommand(t *testing.T) (string, []mediaCommandRun, []recordedCo
 	copyArgs, err := builder.Video(ffmpeg.VideoParams{InputURL: sourceURL, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.DirectStream}, Segments: segments, Landing: &landing, OutputDir: t.TempDir()})
 	execute("video copy", copyArgs, err)
 
-	transcodeArgs, err := builder.Video(ffmpeg.VideoParams{InputURL: sourceURL, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 160, Height: 90, Bitrate: 200000}, Segments: segments, OutputDir: t.TempDir()})
+	transcodeArgs, err := builder.Video(ffmpeg.VideoParams{InputURL: sourceURL, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 160, Height: 90, Bitrate: 200000, PeakBitrate: 300000, BufferSize: 600000, Level: 30}, Segments: segments, OutputDir: t.TempDir()})
 	execute("video transcode", transcodeArgs, err)
 
 	audioArgs, err := builder.Audio(ffmpeg.AudioParams{InputURL: sourceURL, StreamIndex: 1, Rendition: domain.AudioRendition{Method: domain.Transcode, Channels: 2, Bitrate: 128000}, Segments: segments, OutputDir: t.TempDir()})

@@ -8,21 +8,28 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
-	"github.com/eleven-am/goshl/internal/h264level"
+	"github.com/eleven-am/goshl/internal/hwaccel"
 	"github.com/eleven-am/goshl/internal/mediaexec"
 	"github.com/eleven-am/goshl/internal/source"
 )
 
 const (
-	videoSegmentTimeDelta = "0.050000"
-	audioSegmentTimeDelta = "0.000001"
-	keyframeLeadMicros    = 1000
-	trailingGuardSeconds  = 1.0
-	uncutMarginMicros     = 3600 * 1000000
-	aacSampleRate         = 48000
-	aacFrameSamples       = 1024
+	videoSegmentTimeDelta  = "0.050000"
+	audioSegmentTimeDelta  = "0.000001"
+	keyframeLeadMicros     = 1000
+	trailingGuardSeconds   = 1.0
+	uncutMarginMicros      = 3600 * 1000000
+	aacSampleRate          = 48000
+	aacFrameSamples        = 1024
+	ac3FrameSamples        = 1536
+	ac3EncoderDelay        = 256
+	audioEndGuardSeconds   = 0.05
+	audioAnchorLeadSeconds = 0.5
+	passthroughMaxChannels = 6
 )
 
 var (
@@ -31,18 +38,47 @@ var (
 	ErrTrailingNotSupported = errors.New("trailing segment is only supported for copied video")
 	ErrTrailingNotAdjacent  = errors.New("trailing segment does not follow the last segment")
 	ErrOverlapNotAdjacent   = errors.New("overlap segment does not precede the first segment")
+	ErrRenditionIncomplete  = errors.New("transcode rendition lacks encoder facts")
 )
 
 var sourceTimelineArgs = []string{"-copyts", "-start_at_zero"}
 
 var sourceFrameTimingArgs = []string{"-fps_mode", "passthrough", "-enc_time_base", "demux"}
 
+const tonemapDetectionTimeout = 10 * time.Second
+
 type CommandBuilder struct {
-	HWAccel *domain.HWAccelConfig
+	HWAccel       *domain.HWAccelConfig
+	DetectTonemap func(context.Context) (string, error)
+
+	tonemapMu     sync.Mutex
+	tonemapFilter string
+	tonemapErr    error
+	tonemapKnown  bool
 }
 
 func NewCommandBuilder(hwAccel *domain.HWAccelConfig) *CommandBuilder {
-	return &CommandBuilder{HWAccel: hwAccel}
+	return &CommandBuilder{HWAccel: hwAccel, DetectTonemap: hwaccel.DetectTonemap}
+}
+
+func (b *CommandBuilder) tonemap() (string, error) {
+	b.tonemapMu.Lock()
+	defer b.tonemapMu.Unlock()
+	if b.tonemapKnown {
+		return b.tonemapFilter, b.tonemapErr
+	}
+	detect := b.DetectTonemap
+	if detect == nil {
+		detect = hwaccel.DetectTonemap
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tonemapDetectionTimeout)
+	defer cancel()
+	filter, err := detect(ctx)
+	if err != nil && !errors.Is(err, hwaccel.ErrTonemapUnavailable) {
+		return "", err
+	}
+	b.tonemapFilter, b.tonemapErr, b.tonemapKnown = filter, err, true
+	return filter, err
 }
 
 type VideoParams struct {
@@ -68,19 +104,28 @@ type AudioParams struct {
 }
 
 type jobTimeline struct {
-	inputURL    string
 	inputArgs   []string
 	streamIndex int
 	inputFlags  []string
 	encodeArgs  []string
 	outputDir   string
 	firstIndex  int
+	generated   bool
 	seek        float64
 	end         float64
+	shift       float64
 	reference   float64
 	cuts        []float64
 	timeDelta   string
 }
+
+type audioCoverage int
+
+const (
+	audioCovered audioCoverage = iota
+	audioPadded
+	audioSilent
+)
 
 func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 	first, last, err := jobBounds(p.Segments, p.Overlap)
@@ -103,7 +148,6 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 	}
 
 	timeline := jobTimeline{
-		inputURL:    p.InputURL,
 		inputArgs:   input,
 		streamIndex: p.StreamIndex,
 		outputDir:   p.OutputDir,
@@ -128,13 +172,20 @@ func (b *CommandBuilder) Video(p VideoParams) ([]string, error) {
 		return timeline.args(), nil
 	}
 
+	config, chain, err := b.pipelineFor(p.Rendition)
+	if err != nil {
+		return nil, err
+	}
 	timeline.seek = leadSeconds(first.Start)
 	timeline.end = leadSeconds(last.End)
-	timeline.inputFlags = b.HWAccel.DecodeFlags
-	timeline.encodeArgs = b.transcodeVideoArgs(p.Rendition)
+	timeline.inputFlags = config.DecodeFlags
+	timeline.encodeArgs, err = transcodeVideoArgs(config, chain, p.Rendition)
+	if err != nil {
+		return nil, err
+	}
 	timeline.encodeArgs = append(timeline.encodeArgs, sourceFrameTimingArgs...)
-	timeline.encodeArgs = append(timeline.encodeArgs, b.HWAccel.KeyframeFlag, keyframeTimes(p.Segments))
-	if b.HWAccel.Accelerator == domain.AccelCUDA {
+	timeline.encodeArgs = append(timeline.encodeArgs, config.KeyframeFlag, keyframeTimes(p.Segments))
+	if config.Accelerator == domain.AccelCUDA {
 		timeline.encodeArgs = append(timeline.encodeArgs, "-forced-idr", "1")
 	}
 	return timeline.args(), nil
@@ -155,7 +206,6 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 	}
 
 	timeline := jobTimeline{
-		inputURL:    p.InputURL,
 		inputArgs:   input,
 		streamIndex: p.StreamIndex,
 		outputDir:   p.OutputDir,
@@ -166,12 +216,32 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 		timeDelta:   audioSegmentTimeDelta,
 	}
 
+	coverage := audioCoverageOf(p.Rendition, first, last)
 	if p.Rendition.Method == domain.DirectStream {
 		if p.Landing == nil {
 			return nil, ErrLandingRequired
 		}
 		timeline.reference = *p.Landing
-		timeline.encodeArgs = []string{"-c:a", "copy"}
+		if coverage == audioCovered {
+			timeline.encodeArgs = []string{"-c:a", "copy"}
+			return timeline.args(), nil
+		}
+		timeline.shift = float64(ac3EncoderDelay) / aacSampleRate
+		timeline.encodeArgs = []string{
+			"-c:a", p.Rendition.Codec,
+			"-ac", strconv.Itoa(min(p.Rendition.Channels, passthroughMaxChannels)),
+			"-b:a", strconv.Itoa(p.Rendition.Bitrate),
+		}
+		if coverage == audioPadded {
+			timeline.inputFlags = []string{"-noaccurate_seek", "-flags2", "+skip_manual"}
+			timeline.end = last.End - math.Min(*p.Landing, 0)
+			timeline.encodeArgs = append(timeline.encodeArgs, "-af", "apad")
+			return timeline.args(), nil
+		}
+		frame := float64(ac3FrameSamples) / aacSampleRate
+		timeline.generated = true
+		timeline.seek = *p.Landing + math.Floor((first.Start-*p.Landing)/frame+domain.BoundaryTolerance)*frame
+		timeline.reference = timeline.seek
 		return timeline.args(), nil
 	}
 
@@ -183,22 +253,63 @@ func (b *CommandBuilder) Audio(p AudioParams) ([]string, error) {
 		"-ac", strconv.Itoa(p.Rendition.Channels),
 		"-b:a", strconv.Itoa(p.Rendition.Bitrate),
 		"-ar", strconv.Itoa(aacSampleRate),
-		"-af", fmt.Sprintf("aresample=%d:first_pts=%d", aacSampleRate, frames*aacFrameSamples),
 	}
+	if coverage == audioSilent {
+		timeline.generated = true
+		return timeline.args(), nil
+	}
+	timeline.encodeArgs = append(timeline.encodeArgs, "-af", fmt.Sprintf("aresample=%d:first_pts=%d,apad", aacSampleRate, frames*aacFrameSamples))
 	return timeline.args(), nil
+}
+
+func (p AudioParams) LandingStart() float64 {
+	first, last, err := jobBounds(p.Segments, p.Overlap)
+	if err != nil {
+		return 0
+	}
+	if audioCoverageOf(p.Rendition, first, last) != audioSilent {
+		return first.Start
+	}
+	return math.Max(p.Rendition.SourceEnd-audioAnchorLeadSeconds, 0)
+}
+
+func audioCoverageOf(rendition domain.AudioRendition, first, last domain.Segment) audioCoverage {
+	if rendition.SourceEnd <= 0 {
+		return audioCovered
+	}
+	limit := rendition.SourceEnd - audioEndGuardSeconds
+	switch {
+	case first.Start >= limit:
+		return audioSilent
+	case last.End > limit:
+		return audioPadded
+	default:
+		return audioCovered
+	}
 }
 
 func (t jobTimeline) args() []string {
 	args := []string{"-nostats", "-hide_banner", "-loglevel", "warning"}
 	args = append(args, t.inputFlags...)
-	args = append(args, seekInputArgs(t.inputArgs, t.seek)...)
-	args = append(args, "-to", formatSeconds(t.end))
-	args = append(args, sourceTimelineArgs...)
-	args = append(args,
-		"-muxdelay", "0",
-		"-output_ts_offset", formatSeconds(domain.OutputTimelineOffset.Seconds()),
-		"-map", fmt.Sprintf("0:%d", t.streamIndex),
-	)
+	offset := domain.OutputTimelineOffset.Seconds() + t.shift
+	if t.generated {
+		args = append(args, "-f", "lavfi", "-i", fmt.Sprintf("anullsrc=r=%d:cl=stereo", aacSampleRate))
+		args = append(args, "-to", formatSeconds(t.end-t.seek))
+		args = append(args,
+			"-muxdelay", "0",
+			"-output_ts_offset", formatSeconds(offset+t.seek),
+			"-map", "0:0",
+		)
+	} else {
+		args = append(args, seekInputArgs(t.inputArgs, t.seek)...)
+		args = append(args, "-to", formatSeconds(t.end))
+		args = append(args, sourceTimelineArgs...)
+		args = append(args,
+			"-muxdelay", "0",
+			"-output_ts_offset", formatSeconds(offset),
+			"-map", fmt.Sprintf("0:%d", t.streamIndex),
+		)
+	}
 	args = append(args, t.encodeArgs...)
 	args = append(args,
 		"-f", "segment",
@@ -361,24 +472,49 @@ func parseFramecrcFirstPTS(output string) (float64, error) {
 	return 0, fmt.Errorf("no packet at seek position")
 }
 
-func (b *CommandBuilder) transcodeVideoArgs(rendition domain.VideoRendition) []string {
-	peakBitrate := rendition.PeakBitrate
-	if peakBitrate <= 0 {
-		peakBitrate = int(float64(rendition.Bitrate) * 1.5)
+func (b *CommandBuilder) pipelineFor(rendition domain.VideoRendition) (*domain.HWAccelConfig, string, error) {
+	if !rendition.Colour.Tonemap {
+		return b.HWAccel, b.HWAccel.ScaleFilter, nil
 	}
-	level := rendition.Level
-	minimumLevel := h264level.Minimum(rendition.Width, rendition.Height, rendition.FrameRate, peakBitrate)
-	if level < minimumLevel {
-		level = minimumLevel
+	filter, err := b.tonemap()
+	if err != nil {
+		return nil, "", err
+	}
+	if b.HWAccel.DeviceFrames {
+		return hwaccel.NewConfig(domain.AccelNone), filter, nil
+	}
+	return b.HWAccel, filter, nil
+}
+
+func videoFilter(config *domain.HWAccelConfig, chain string, rendition domain.VideoRendition) string {
+	var filters []string
+	if !config.DeviceFrames {
+		var assumed []string
+		if rendition.Colour.AssumePrimaries != "" {
+			assumed = append(assumed, "color_primaries="+rendition.Colour.AssumePrimaries)
+		}
+		if rendition.Colour.AssumeMatrix != "" {
+			assumed = append(assumed, "colorspace="+rendition.Colour.AssumeMatrix)
+		}
+		if len(assumed) > 0 {
+			filters = append(filters, "setparams="+strings.Join(assumed, ":"))
+		}
+	}
+	return strings.Join(append(filters, fmt.Sprintf(chain, rendition.Width, rendition.Height)), ",")
+}
+
+func transcodeVideoArgs(config *domain.HWAccelConfig, chain string, rendition domain.VideoRendition) ([]string, error) {
+	if rendition.Width <= 0 || rendition.Height <= 0 || rendition.Bitrate <= 0 || rendition.PeakBitrate <= 0 || rendition.BufferSize <= 0 || rendition.Level <= 0 {
+		return nil, fmt.Errorf("%w: %q", ErrRenditionIncomplete, rendition.Name)
 	}
 
-	args := append([]string(nil), b.HWAccel.EncodeFlags...)
+	args := append([]string(nil), config.EncodeFlags...)
 	return append(args,
-		"-vf", fmt.Sprintf(b.HWAccel.ScaleFilter, rendition.Width, rendition.Height),
+		"-vf", videoFilter(config, chain, rendition),
 		"-profile:v", "high",
-		"-level:v", fmt.Sprintf("%.1f", float64(level)/10),
-		"-b:v", fmt.Sprintf("%d", rendition.Bitrate),
-		"-maxrate", fmt.Sprintf("%d", peakBitrate),
-		"-bufsize", fmt.Sprintf("%d", rendition.Bitrate*5),
-	)
+		"-level:v", fmt.Sprintf("%d.%d", rendition.Level/10, rendition.Level%10),
+		"-b:v", strconv.Itoa(rendition.Bitrate),
+		"-maxrate", strconv.Itoa(rendition.PeakBitrate),
+		"-bufsize", strconv.Itoa(rendition.BufferSize),
+	), nil
 }

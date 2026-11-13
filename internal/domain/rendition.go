@@ -14,10 +14,12 @@ type VideoRendition struct {
 	Height      int
 	Bitrate     int
 	PeakBitrate int
+	BufferSize  int
 	FrameRate   float64
 	Codec       string
 	Level       int
 	Method      PlaybackMethod
+	Colour      ColourPlan
 }
 
 type AudioRendition struct {
@@ -27,9 +29,11 @@ type AudioRendition struct {
 	GroupID     string
 	Bitrate     int
 	Channels    int
+	SourceEnd   float64
 	Method      PlaybackMethod
 
 	StreamIndex int
 	Language    string
+	Title       string
 	Default     bool
 }

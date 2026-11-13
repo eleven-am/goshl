@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/hwaccel"
 	"github.com/eleven-am/goshl/internal/playlist"
 	"github.com/eleven-am/goshl/internal/testmedia"
 )
@@ -53,12 +54,9 @@ func newIntegrationFixture(t *testing.T, container string) integrationFixture {
 }
 
 func integrationBuilder(encode ...string) *CommandBuilder {
-	return NewCommandBuilder(&domain.HWAccelConfig{
-		Accelerator:  domain.AccelNone,
-		EncodeFlags:  append([]string{"-c:v", "libx264"}, encode...),
-		KeyframeFlag: "-force_key_frames",
-		ScaleFilter:  "scale=%d:%d,setsar=1,format=yuv420p",
-	})
+	config := *hwaccel.NewConfig(domain.AccelNone)
+	config.EncodeFlags = append([]string{"-c:v", "libx264"}, encode...)
+	return NewCommandBuilder(&config)
 }
 
 func runJob(t *testing.T, args []string, err error) []string {
@@ -122,7 +120,7 @@ func testNonZeroTimestampCoverage(t *testing.T, method domain.PlaybackMethod) {
 	params := VideoParams{
 		InputURL:    input,
 		StreamIndex: 0,
-		Rendition:   domain.VideoRendition{Method: method, Width: 320, Height: 180, Bitrate: 500_000},
+		Rendition:   domain.VideoRendition{Method: method, Width: 320, Height: 180, Bitrate: 500_000, PeakBitrate: 750000, BufferSize: 1500000, Level: 30},
 		Segments: []domain.Segment{
 			{Index: 0, Start: 0, End: 2, Duration: 2},
 			{Index: 1, Start: 2, End: 4, Duration: 2},
@@ -169,7 +167,7 @@ func TestSingleSegmentJobProducesExactlyOneFile(t *testing.T) {
 		}
 	})
 	t.Run("transcode", func(t *testing.T) {
-		args, err := integrationBuilder("-g", "60").Video(VideoParams{InputURL: fixture.path, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000}, Segments: []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}}, OutputDir: t.TempDir()})
+		args, err := integrationBuilder("-g", "60").Video(VideoParams{InputURL: fixture.path, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000, PeakBitrate: 600000, BufferSize: 1200000, Level: 30}, Segments: []domain.Segment{{Index: 0, Start: 0, End: 6, Duration: 6}}, OutputDir: t.TempDir()})
 		if listed := runJob(t, args, err); len(listed) != 1 {
 			t.Fatalf("one planned segment produced %d files: %v", len(listed), listed)
 		}
@@ -244,7 +242,7 @@ func TestTranscodeKeyframesLandOnSourceKeyframes(t *testing.T) {
 	offset := domain.OutputTimelineOffset.Seconds()
 	for _, job := range [][]domain.Segment{fixture.segments[0:2], fixture.segments[1:4]} {
 		dir := t.TempDir()
-		args, err := integrationBuilder("-preset", "veryfast").Video(VideoParams{InputURL: fixture.path, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000}, Segments: job, OutputDir: dir})
+		args, err := integrationBuilder("-preset", "veryfast").Video(VideoParams{InputURL: fixture.path, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000, PeakBitrate: 600000, BufferSize: 1200000, Level: 30}, Segments: job, OutputDir: dir})
 		if listed := runJob(t, args, err); len(listed) != len(job) {
 			t.Fatalf("job listed %v, want %d segments", listed, len(job))
 		}
@@ -368,7 +366,7 @@ func TestTranscodeJobsShareNoFrameAcrossJoins(t *testing.T) {
 			}
 			dir := t.TempDir()
 			for _, job := range [][]domain.Segment{fixture.segments[0:2], fixture.segments[2:4], fixture.segments[4:5]} {
-				args, err := integrationBuilder("-preset", "veryfast").Video(VideoParams{InputURL: fixture.path, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000}, Segments: job, OutputDir: dir})
+				args, err := integrationBuilder("-preset", "veryfast").Video(VideoParams{InputURL: fixture.path, StreamIndex: 0, Rendition: domain.VideoRendition{Method: domain.Transcode, Width: 320, Height: 180, Bitrate: 400000, PeakBitrate: 600000, BufferSize: 1200000, Level: 30}, Segments: job, OutputDir: dir})
 				if listed := runJob(t, args, err); len(listed) != len(job) {
 					t.Fatalf("job listed %v, want %d segments", listed, len(job))
 				}

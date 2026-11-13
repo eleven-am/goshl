@@ -164,8 +164,11 @@ func (r *httpReader) ReadAt(p []byte, off int64) (int, error) {
 		return 0, fmt.Errorf("read source range: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return 0, fmt.Errorf("%w: range request returned the whole resource", ErrUnsupported)
+	}
 	if resp.StatusCode != http.StatusPartialContent {
-		return 0, fmt.Errorf("%w: range request returned status %d", ErrUnsupported, resp.StatusCode)
+		return 0, fmt.Errorf("read source range: unexpected status %d", resp.StatusCode)
 	}
 	start, responseEnd, total, err := parseContentRange(resp.Header.Get("Content-Range"))
 	if err != nil || start != off || responseEnd != end || total != r.size {
