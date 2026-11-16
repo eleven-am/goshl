@@ -375,6 +375,9 @@ func (t jobTimeline) args() []string {
 		)
 	}
 	args = append(args, t.only...)
+	if !t.generated {
+		args = append(args, strippedMetadataArgs...)
+	}
 	args = append(args, t.encodeArgs...)
 	args = append(args,
 		"-f", "segment",

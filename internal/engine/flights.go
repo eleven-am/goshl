@@ -89,6 +89,19 @@ func (e *Engine) joinFlight(mediaKey string, streamType domain.StreamType, rendi
 	return nil, f
 }
 
+func (e *Engine) coveringFlight(mediaKey string, streamType domain.StreamType, rendition string, index int) *flight {
+	r := e.flights
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, f := range r.flights {
+		if !now.After(f.deadline) && f.sameStream(mediaKey, streamType, rendition) && index >= f.start && index <= f.end {
+			return f
+		}
+	}
+	return nil
+}
+
 func (e *Engine) setFlightWatch(f *flight, cancel context.CancelFunc) bool {
 	e.flights.mu.Lock()
 	defer e.flights.mu.Unlock()
@@ -124,6 +137,7 @@ func (e *Engine) watchFlight(f *flight, statuses <-chan domain.JobStatus) {
 			switch status.State {
 			case domain.JobStateCompleted, domain.JobStateFailed, domain.JobStateCancelled:
 				e.setFlightTerminal(f, status)
+				e.channel.recordOutcome(f, status)
 				e.finishFlight(f)
 				return
 			}

@@ -32,7 +32,7 @@ func (e *Engine) Segment(ctx context.Context, sourceURL string, streamType domai
 	if index < 0 {
 		return nil, fmt.Errorf("%w: %d", ErrSegmentOutOfRange, index)
 	}
-	if !rendition.ValidName(renditionName) {
+	if !rendition.ValidName(renditionName) || rendition.IsChannelName(renditionName) {
 		return nil, fmt.Errorf("%w: %q", ErrRenditionNotFound, renditionName)
 	}
 	for attempt := 0; attempt < maxFlightReentries; attempt++ {
@@ -47,17 +47,106 @@ func (e *Engine) Segment(ctx context.Context, sourceURL string, streamType domai
 	return nil, fmt.Errorf("%w: segment %d", ErrSegmentTimeout, index)
 }
 
+type segmentRequest struct {
+	sourceURL  string
+	mediaKey   string
+	streamType domain.StreamType
+	rendition  string
+	index      int
+	priority   domain.JobPriority
+	plan       func(context.Context) (*flightPlan, error)
+}
+
+type flightPlan struct {
+	segments         []domain.Segment
+	start            int
+	end              int
+	video            *domain.VideoRendition
+	audio            *domain.AudioRendition
+	channel          *domain.ChannelSpec
+	videoStreamIndex int
+	neighbours       bool
+}
+
+type launchOutcome struct {
+	held        bool
+	activeRunID string
+	stored      bool
+}
+
+func (r segmentRequest) info() domain.SegmentData {
+	return domain.SegmentData{
+		MediaKey:  r.mediaKey,
+		Index:     r.index,
+		Rendition: r.rendition,
+		IsVideo:   r.streamType != domain.StreamAudio,
+	}
+}
+
 func (e *Engine) segmentOnce(ctx context.Context, sourceURL string, streamType domain.StreamType, renditionName string, index int) ([]byte, error) {
 	mediaKey, err := e.resolveMediaKey(ctx, sourceURL)
 	if err != nil {
 		return nil, err
 	}
-	info := domain.SegmentData{
-		MediaKey:  mediaKey,
-		Index:     index,
-		Rendition: renditionName,
-		IsVideo:   streamType == domain.StreamVideo,
+	request := segmentRequest{
+		sourceURL:  sourceURL,
+		mediaKey:   mediaKey,
+		streamType: streamType,
+		rendition:  renditionName,
+		index:      index,
+		priority:   domain.PriorityPlayback,
 	}
+	request.plan = func(ctx context.Context) (*flightPlan, error) {
+		return e.playbackPlan(ctx, request)
+	}
+	return e.requestSegment(ctx, request)
+}
+
+func (e *Engine) playbackPlan(ctx context.Context, request segmentRequest) (*flightPlan, error) {
+	info := request.info()
+	meta, err := e.getMetadataWithKey(ctx, request.sourceURL, request.mediaKey)
+	if err != nil {
+		return nil, fmt.Errorf("get metadata: %w", err)
+	}
+	videoRendition, audioRendition, err := e.resolveRendition(meta, request.streamType, request.rendition)
+	if err != nil {
+		return nil, err
+	}
+	allSegments := playlist.CalculateSegments(meta.Keyframes, meta.Duration, e.opts.TargetDuration)
+	if request.index >= len(allSegments) {
+		return nil, fmt.Errorf("%w: %d", ErrSegmentOutOfRange, request.index)
+	}
+	endIdx := request.index + e.opts.SegmentsPerJob - 1
+	if endIdx >= len(allSegments) {
+		endIdx = len(allSegments) - 1
+	}
+	for next := request.index + 1; next <= endIdx; next++ {
+		nextInfo := info
+		nextInfo.Index = next
+		nextExists, err := e.opts.Storage.SegmentExists(ctx, nextInfo)
+		if err != nil {
+			return nil, fmt.Errorf("check segment: %w", err)
+		}
+		if nextExists {
+			endIdx = next - 1
+			break
+		}
+	}
+	copiedVideo := request.streamType == domain.StreamVideo && videoRendition != nil && videoRendition.Method == domain.DirectStream
+	return &flightPlan{
+		segments:         allSegments,
+		start:            request.index,
+		end:              endIdx,
+		video:            videoRendition,
+		audio:            audioRendition,
+		videoStreamIndex: meta.Video.Index,
+		neighbours:       copiedVideo || request.streamType == domain.StreamAudio,
+	}, nil
+}
+
+func (e *Engine) requestSegment(ctx context.Context, request segmentRequest) ([]byte, error) {
+	mediaKey, streamType, renditionName, index := request.mediaKey, request.streamType, request.rendition, request.index
+	info := request.info()
 
 	exists, err := e.opts.Storage.SegmentExists(ctx, info)
 	if err != nil {
@@ -70,37 +159,13 @@ func (e *Engine) segmentOnce(ctx context.Context, sourceURL string, streamType d
 	}
 	e.observe(ctx, domain.Event{Type: domain.EventSegmentCacheMiss, MediaKey: mediaKey, StreamType: streamType, Rendition: renditionName, Index: index})
 
-	meta, err := e.getMetadataWithKey(ctx, sourceURL, mediaKey)
-	if err != nil {
-		return nil, fmt.Errorf("get metadata: %w", err)
-	}
-	videoRendition, audioRendition, err := e.resolveRendition(meta, streamType, renditionName)
+	plan, err := request.plan(ctx)
 	if err != nil {
 		return nil, err
 	}
-	allSegments := playlist.CalculateSegments(meta.Keyframes, meta.Duration, e.opts.TargetDuration)
-	if index >= len(allSegments) {
-		return nil, fmt.Errorf("%w: %d", ErrSegmentOutOfRange, index)
-	}
-	endIdx := index + e.opts.SegmentsPerJob - 1
-	if endIdx >= len(allSegments) {
-		endIdx = len(allSegments) - 1
-	}
-	for next := index + 1; next <= endIdx; next++ {
-		nextInfo := info
-		nextInfo.Index = next
-		nextExists, err := e.opts.Storage.SegmentExists(ctx, nextInfo)
-		if err != nil {
-			return nil, fmt.Errorf("check segment: %w", err)
-		}
-		if nextExists {
-			endIdx = next - 1
-			break
-		}
-	}
 
 	requested := time.Now()
-	existing, created := e.joinFlight(mediaKey, streamType, renditionName, index, endIdx)
+	existing, created := e.joinFlight(mediaKey, streamType, renditionName, plan.start, plan.end)
 	if existing != nil {
 		waitCtx, stopWaiting := context.WithCancel(ctx)
 		defer stopWaiting()
@@ -115,92 +180,113 @@ func (e *Engine) segmentOnce(ctx context.Context, sourceURL string, streamType d
 		return e.waitForSegment(ctx, info, statusCh, existing, nil, existing.runID, requested, nil)
 	}
 	startIdx, endIdx, jobID := created.start, created.end, created.jobID
-	lockTTL := time.Until(created.deadline) + time.Minute
-	setupCtx, stopSetup := e.flightSetupContext(ctx)
-	defer stopSetup()
-	token, activeRunID, lockErr := e.opts.Coordinator.AcquireJob(setupCtx, jobID, created.runID, lockTTL)
 
-	if lockErr != nil {
-		if !errors.Is(lockErr, domain.ErrLockHeld) {
-			e.abandonFlight(created)
-			return nil, fmt.Errorf("acquire segment lock: %w", lockErr)
-		}
-		defer e.abandonFlight(created)
-		waitCtx, stopWaiting := context.WithCancel(ctx)
-		defer stopWaiting()
-		statusCh, err := e.opts.Coordinator.WaitSegment(waitCtx, info)
+	waitCtx, stopWaiting := context.WithCancel(ctx)
+	defer stopWaiting()
+	var statusCh <-chan domain.SegmentStatus
+	subscribe := func() error {
+		var err error
+		statusCh, err = e.opts.Coordinator.WaitSegment(waitCtx, info)
 		if err != nil {
-			return nil, fmt.Errorf("wait segment: %w", err)
+			return fmt.Errorf("wait segment: %w", err)
+		}
+		return nil
+	}
+	outcome, err := e.launchFlight(ctx, request, plan, created, subscribe)
+	if err != nil {
+		return nil, err
+	}
+	if outcome.stored {
+		return e.opts.Storage.ReadSegment(ctx, info)
+	}
+	if outcome.held {
+		defer e.abandonFlight(created)
+		if err := subscribe(); err != nil {
+			return nil, err
 		}
 		e.observe(ctx, domain.Event{Type: domain.EventLockWait, MediaKey: mediaKey, JobID: jobID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
 		if data, found, err := e.readStoredSegment(ctx, info); err != nil || found {
 			return data, err
 		}
-		if activeRunID == "" {
+		if outcome.activeRunID == "" {
 			return nil, fmt.Errorf("active run missing for locked job %s", jobID)
 		}
 		jobWaitCtx, stopJobWaiting := context.WithCancel(ctx)
 		defer stopJobWaiting()
-		jobStatusCh, err := e.opts.Coordinator.WaitJob(jobWaitCtx, activeRunID)
+		jobStatusCh, err := e.opts.Coordinator.WaitJob(jobWaitCtx, outcome.activeRunID)
 		if err != nil {
 			return nil, fmt.Errorf("wait active job: %w", err)
 		}
 		lockFree := func() bool { return e.jobLockFree(jobID) }
-		return e.waitForSegment(ctx, info, statusCh, created, jobStatusCh, activeRunID, requested, lockFree)
+		return e.waitForSegment(ctx, info, statusCh, created, jobStatusCh, outcome.activeRunID, requested, lockFree)
+	}
+	return e.waitForSegment(ctx, info, statusCh, created, nil, created.runID, requested, nil)
+}
+
+func (e *Engine) launchFlight(ctx context.Context, request segmentRequest, plan *flightPlan, created *flight, subscribe func() error) (launchOutcome, error) {
+	info := request.info()
+	lockTTL := time.Until(created.deadline) + time.Minute
+	setupCtx, stopSetup := e.flightSetupContext(ctx)
+	defer stopSetup()
+	token, activeRunID, lockErr := e.opts.Coordinator.AcquireJob(setupCtx, created.jobID, created.runID, lockTTL)
+	if lockErr != nil {
+		if !errors.Is(lockErr, domain.ErrLockHeld) {
+			e.abandonFlight(created)
+			return launchOutcome{}, fmt.Errorf("acquire segment lock: %w", lockErr)
+		}
+		return launchOutcome{held: true, activeRunID: activeRunID}, nil
 	}
 	if !e.setFlightLock(created, token) {
 		e.releaseFlightLocks([]*flight{created})
-		return nil, e.flightGoneError(info)
+		return launchOutcome{}, e.flightGoneError(info)
 	}
 
-	exists, err = e.opts.Storage.SegmentExists(ctx, info)
+	exists, err := e.opts.Storage.SegmentExists(ctx, info)
 	if err != nil {
 		e.abandonFlight(created)
-		return nil, fmt.Errorf("check segment: %w", err)
+		return launchOutcome{}, fmt.Errorf("check segment: %w", err)
 	}
 	if exists {
 		e.abandonFlight(created)
-		return e.opts.Storage.ReadSegment(ctx, info)
+		return launchOutcome{stored: true}, nil
 	}
 
-	waitCtx, stopWaiting := context.WithCancel(ctx)
-	defer stopWaiting()
-	statusCh, err := e.opts.Coordinator.WaitSegment(waitCtx, info)
-	if err != nil {
-		e.abandonFlight(created)
-		return nil, fmt.Errorf("wait segment: %w", err)
+	if subscribe != nil {
+		if err := subscribe(); err != nil {
+			e.abandonFlight(created)
+			return launchOutcome{}, err
+		}
 	}
 	jobWatchCtx, jobWatchCancel := context.WithCancel(e.lifecycle.Context())
 	jobStatusCh, err := e.opts.Coordinator.WaitJob(jobWatchCtx, created.runID)
 	if err != nil {
 		jobWatchCancel()
 		e.abandonFlight(created)
-		return nil, fmt.Errorf("wait job: %w", err)
+		return launchOutcome{}, fmt.Errorf("wait job: %w", err)
 	}
 	if !e.setFlightWatch(created, jobWatchCancel) {
-		return nil, e.flightGoneError(info)
+		return launchOutcome{}, e.flightGoneError(info)
 	}
 
-	job := e.buildJob(created.runID, created.startBy, sourceURL, mediaKey, streamType, renditionName, index, startIdx, endIdx, allSegments, videoRendition, audioRendition, meta)
+	job := e.assembleJob(created, request, plan)
 	if !e.startFlightWatch(created, jobStatusCh) {
-		return nil, ErrControllerStopped
+		return launchOutcome{}, ErrControllerStopped
 	}
 	if err := ctx.Err(); err != nil {
 		e.abandonFlight(created)
-		return nil, fmt.Errorf("enqueue: %w", err)
+		return launchOutcome{}, fmt.Errorf("enqueue: %w", err)
 	}
 	if !e.markEnqueued(created) {
-		return nil, e.flightGoneError(info)
+		return launchOutcome{}, e.flightGoneError(info)
 	}
 	if err := e.opts.Coordinator.Enqueue(setupCtx, job); err != nil {
 		if setupCtx.Err() != nil || errors.Is(err, domain.ErrEnqueueRejected) {
 			e.abandonFlight(created)
 		}
-		return nil, fmt.Errorf("enqueue: %w", err)
+		return launchOutcome{}, fmt.Errorf("enqueue: %w", err)
 	}
-	e.observe(ctx, domain.Event{Type: domain.EventJobEnqueued, MediaKey: mediaKey, JobID: job.ID, StreamType: streamType, Rendition: renditionName, Index: index, StartIndex: startIdx, EndIndex: endIdx})
-
-	return e.waitForSegment(ctx, info, statusCh, created, nil, created.runID, requested, nil)
+	e.observe(ctx, domain.Event{Type: domain.EventJobEnqueued, MediaKey: request.mediaKey, JobID: job.ID, StreamType: request.streamType, Rendition: request.rendition, Index: request.index, StartIndex: created.start, EndIndex: created.end})
+	return launchOutcome{}, nil
 }
 
 func (e *Engine) flightGoneError(info domain.SegmentData) error {
@@ -347,41 +433,50 @@ func (e *Engine) resolveRendition(meta *domain.Metadata, streamType domain.Strea
 }
 
 func (e *Engine) buildJob(runID string, startBy time.Time, sourceURL, mediaKey string, streamType domain.StreamType, renditionName string, index, startIdx, endIdx int, allSegments []domain.Segment, video *domain.VideoRendition, audio *domain.AudioRendition, meta *domain.Metadata) domain.Job {
-	segments := append([]domain.Segment(nil), allSegments[startIdx:endIdx+1]...)
+	copiedVideo := streamType == domain.StreamVideo && video != nil && video.Method == domain.DirectStream
+	request := segmentRequest{sourceURL: sourceURL, mediaKey: mediaKey, streamType: streamType, rendition: renditionName, index: index, priority: domain.PriorityPlayback}
+	plan := &flightPlan{segments: allSegments, video: video, audio: audio, videoStreamIndex: meta.Video.Index, neighbours: copiedVideo || streamType == domain.StreamAudio}
+	return e.assembleJob(&flight{runID: runID, startBy: startBy, start: startIdx, end: endIdx}, request, plan)
+}
+
+func (e *Engine) assembleJob(f *flight, request segmentRequest, plan *flightPlan) domain.Job {
+	startIdx, endIdx := f.start, f.end
+	segments := append([]domain.Segment(nil), plan.segments[startIdx:endIdx+1]...)
 	expected := make([]int, len(segments))
 	for i, segment := range segments {
 		expected[i] = segment.Index
 	}
-	copiedVideo := streamType == domain.StreamVideo && video != nil && video.Method == domain.DirectStream
 	var overlap, trailing *domain.Segment
-	if startIdx > 0 && (copiedVideo || streamType == domain.StreamAudio) {
-		value := allSegments[startIdx-1]
+	if startIdx > 0 && plan.neighbours {
+		value := plan.segments[startIdx-1]
 		overlap = &value
 	}
-	if (copiedVideo || streamType == domain.StreamAudio) && endIdx+1 < len(allSegments) {
-		value := allSegments[endIdx+1]
+	if plan.neighbours && endIdx+1 < len(plan.segments) {
+		value := plan.segments[endIdx+1]
 		trailing = &value
 	}
 	job := domain.Job{
-		ID:               deterministicJobID(mediaKey, renditionName, streamType, startIdx, endIdx),
-		RunID:            runID,
-		MediaKey:         mediaKey,
-		Profile:          e.pipelineVersion,
-		SourceURL:        sourceURL,
-		Rendition:        renditionName,
-		StreamType:       streamType,
+		ID:               deterministicJobID(request.mediaKey, request.rendition, request.streamType, startIdx, endIdx),
+		RunID:            f.runID,
+		MediaKey:         request.mediaKey,
+		Profile:          e.routeProfile,
+		SourceURL:        request.sourceURL,
+		Rendition:        request.rendition,
+		StreamType:       request.streamType,
 		StartIndex:       startIdx,
 		EndIndex:         endIdx,
-		RequestedIndex:   index,
+		RequestedIndex:   request.index,
 		EnqueuedAt:       time.Now(),
-		StartBy:          startBy,
+		StartBy:          f.startBy,
 		Segments:         segments,
 		Overlap:          overlap,
 		Trailing:         trailing,
 		ExpectedIndices:  expected,
-		VideoRendition:   video,
-		AudioRendition:   audio,
-		VideoStreamIndex: meta.Video.Index,
+		VideoRendition:   plan.video,
+		AudioRendition:   plan.audio,
+		VideoStreamIndex: plan.videoStreamIndex,
+		Priority:         request.priority,
+		Channel:          plan.channel,
 	}
 	job.Digest = domain.JobDigest(job)
 	return job

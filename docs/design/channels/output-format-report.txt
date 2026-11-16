@@ -1,0 +1,414 @@
+GOSHL CHANNEL PROFILE: RESEARCH AND PROTOTYPE REPORT
+Date: 2026-11-14. Measured against goshl v0.0.28.
+$W = a scratch working directory
+
+======================================================================
+1. VERDICT
+======================================================================
+The channel format is achievable with ONE combined audio+video ffmpeg job per batch of segments.
+Every design choice held up except the frame rate, which needs an owner decision.
+
+| Design choice | Result |
+|---|---|
+| Fixed-duration segments, forced keyframes, across separate jobs | PROVEN. Split jobs give packet timestamps identical to a single long job, 4 sources x 2 frame rates. |
+| Pad to exactly 1280x720 | PROVEN. SPS, PPS, PAT, PMT, SDT byte-identical across 9 sources. Aspect-only gives a different SPS per aspect ratio. |
+| CFR through the fps filter | PROVEN, with two conditions: drop "-enc_time_base demux"; phase-align sources whose timestamps sit half a frame off the grid. |
+| CFR at 25 or 30 | Works, but wrong rate for this library (section 3). DECISION NEEDED. |
+| Muxed A/V in one TS segment | PROVEN with a combined job. The current separate-jobs model does not produce it directly. |
+| -map_metadata -1 | PROVEN. Today's VOD output leaks the source title in every SDT; the flag removes it. |
+| Real players | hls.js and AVFoundation each played ~110 s through 9-10 item changes, no errors, no stalls. |
+| "-fps_mode cfr -r N" instead of the fps filter | DISPROVEN. It discards the -copyts timeline. |
+
+Not done as written:
+- No 4K HEVC MKV exists in the library. Of ~26,000 files under Movies and Shows, one is MKV (1080p H.264);
+  the 2160p-labelled files I probed are H.264. Substitute: a 1080p HEVC Main 10 MKV with E-AC-3 5.1 from
+  downloads; the 4K case is covered by the Skeleton Crew file.
+- No truly VFR source was found. Akira reports avg_frame_rate != r_frame_rate but is constant in the tested
+  window. The realistic irregular case is Matroska with 1 ms timestamps, tested on two files.
+- REPORT.md could not be written (the harness refuses .md report files from subagents); this .txt replaces it.
+
+======================================================================
+2. SOURCES (all read-only, from a private media library)
+======================================================================
+| Key | File | Video | Audio |
+|---|---|---|---|
+| phx | Movies/The Phoenician Scheme (2025)/... WEBRip-1080p.mp4 | H.264 1584x1080, 23.976 | AAC 48 kHz stereo |
+| vq | downloads/VisionQuest.S01E08.Forever.1080p.WEBRip.10Bit.DDP5.1.x265-NeoNoir.mkv | HEVC Main 10 1920x1080, 24, 1 ms timestamps | E-AC-3 5.1 |
+| skc | Shows/Star Wars - Skeleton Crew/Season 1/... S01E02 ... WEBDL-2160p.mp4 | H.264 3840x2160 8-bit PQ/BT.2020, 24 | AAC 48 kHz stereo |
+| aeom | Misc/All.Eyes.Off.Me.2021.720p.WEB-DL.x264.ESub.Hollymoviehd.mp4 | H.264 1330x720, 24 | AAC 44.1 kHz stereo |
+| akira | Movies/Akira (1988)/Akira (1988) Bluray-1080p.mp4 | H.264 1920x1036, avg != r, title tag | AAC 48 kHz |
+| tower | Movies/The Tower (2023)/The Tower (2023) Bluray-2160p.mp4 | H.264 1920x1080, SAR 90:67 (anamorphic) | AAC |
+| emm | Movies/Emmanuelle 6 (1988)/Emmanuelle 6 (1988) SDTV.mp4 | H.264 512x384 (4:3 SD) | MP3 |
+| django | Movies/Django Unchained (2012)/... Bluray-1080p.mp4 | H.264 1920x800, video starts at 0.083 s | AAC |
+| adf | Movies/A Delicious Flight (2015)/A.Delicious.Flight.2015.720p...mp4 | H.264 1280x702, 29.97 | AAC |
+| walter | Shows/My Life with the Walter Boys/Season 2/... S02E01 ... WEBDL-1080p.mkv | H.264 1920x960, 23.976, 1 ms timestamps, starts at 0.021 s | AAC 5.1 |
+
+======================================================================
+3. DECISION NEEDED: CHANNEL FRAME RATE
+======================================================================
+Random sample of the library (336 files probed):
+
+| Source frame rate | Share |
+|---|---|
+| 23.976 | 82% |
+| 24.000 | 9% |
+| 25.000 | 5% |
+| 29.97 | 3% |
+| other | 1% |
+
+Also in the sample: 78% are 16:9, 99% are 1080p-class, 91% have 48 kHz AAC stereo and 9% have 44.1 kHz.
+
+Measured fps-filter behaviour over 13 s of each source (frames in -> out; the single dropped frame in the
+clean cases is the start trim):
+
+| Source | to 25 | to 30 | to 24000/1001 |
+|---|---|---|---|
+| phx (23.976) | 318 -> 331, 14 duplicated | 316 -> 395, 80 duplicated | 317 -> 316, 0 duplicated |
+| vq (24, MKV) | 319 -> 331, 13 duplicated | 316 -> 393, 78 duplicated | 318 -> 317, 0 duplicated |
+| adf (29.97) | 397 -> 331, 67 dropped | 396 -> 396 | 398 -> 318, 80 dropped |
+
+A 25 fps channel repeats a frame about once a second on 91% of the library; 30 fps repeats one frame in five.
+A 24000/1001 channel passes 82% untouched and drops one frame every 41.7 s on 24.000 sources.
+
+RECOMMENDATION: 24000/1001 with 48-frame segments (2.002 s). The plan still depends only on duration:
+boundary i is at i x 2.002 s. All timing results below were reproduced at BOTH 25 fps / 2.000 s and
+24000/1001 / 2.002 s, so either choice is supported; nothing else in this report changes with the choice.
+
+Consequence of 24000/1001: a frame is 3753.75 ticks at 90 kHz, so TS timestamps step by 3753 or 3754.
+The pattern was identical across jobs.
+
+======================================================================
+4. RECOMMENDED EXACT FFMPEG ARGUMENTS (CHANNEL PROFILE)
+======================================================================
+One job produces segments first..last of one item. It also produces one DISCARDED segment before (overlap,
+when first > 0) and one DISCARDED partial segment after (trailing, when last is not the item's last), as
+goshl's audio jobs do today.
+
+Notation:
+  S     = start of the overlap segment, or of "first" when there is no overlap
+  E     = end of "last"
+  cuts  = starts of first..last (minus the very first when there is no overlap), plus the trailing start
+  G     = floor(S x 48000 / 1024) x 1024   (AAC frame grid, in samples)
+  IWxIH = the picture fitted into 1280x720, rounded to even, computed in Go from width, height and SAR
+  X, Y  = pad offsets = (1280-IW)/2, (720-IH)/2
+  phase = per-item video timestamp phase (only when needed, see 5.3)
+
+ffmpeg -nostats -hide_banner -loglevel warning
+  -ss <S - 0.001>   <input args> -i SRC        # video input, same 1 ms lead as today
+  -ss <G / 48000>   <input args> -i SRC        # audio input, on the AAC grid as today
+  -to <trailing ? min(trailing.End, trailing.Start + 1.0) : E - 0.001>
+  -copyts -start_at_zero -muxdelay 0 -output_ts_offset 10.000000
+  -map 0:<video index> -map 1:<audio index> -sn -dn
+  -map_metadata -1 -map_chapters -1
+  -metadata service_provider=goshl -metadata service_name=channel
+  -c:v libx264 -preset superfast
+  -vf "[setpts=PTS-<phase>/TB,]fps=24000/1001:start_time=<S>[,tpad=stop_mode=clone:stop_duration=<stop - videoEnd + 1.0>],scale=<IW>:<IH>:out_color_matrix=bt709:out_range=tv,pad=1280:720:<X>:<Y>:color=black,setsar=1,format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,sidedata=mode=delete"
+  -profile:v high -level:v 3.1 -pix_fmt yuv420p
+  -b:v 2500k -maxrate 2500k -bufsize 5000k
+  -g 48 -bf 0 -sc_threshold 0 -a53cc 0
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv
+  -fps_mode passthrough
+  -force_key_frames <S - 0.001>,<each cut - 0.001>
+  -c:a aac -ac 2 -ar 48000 -b:a 160k
+  -af "aresample=48000,aresample=48000:first_pts=<G>,apad"
+  -fflags +bitexact -flags:v +bitexact -flags:a +bitexact
+  -f segment -segment_time_delta 0.010000
+  -segment_format mpegts -segment_format_options mpegts_flags=+initial_discontinuity
+  -segment_list_type csv -segment_list pipe:1
+  -segment_start_number <overlap index or first>
+  -segment_times <each cut - S>
+  <dir>/segment-%05d.ts
+
+HDR sources: replace "scale=<IW>:<IH>:out_color_matrix=bt709:out_range=tv" with the existing tone-map chain
+at the fitted size:
+  zscale=w=<IW>:h=<IH>:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv
+When IWxIH is already 1280x720 the pad step is omitted.
+For a 25 fps channel: fps=25, -g 50, 2.000 s segments.
+
+A real command that ran (Skeleton Crew, segments 295-298 at 23.976, overlap 294, trailing 299):
+  ffmpeg -nostats -hide_banner -loglevel warning -ss 588.587000 -i SRC -ss 588.586667 -i SRC -to 599.598000
+  -copyts -start_at_zero -muxdelay 0 -output_ts_offset 10.000000 -map 0:v:0 -map 1:a:0 -sn -dn
+  -map_metadata -1 -map_metadata:s -1 -map_chapters -1 -metadata service_provider=goshl -metadata service_name=channel
+  -c:v libx264 -preset superfast
+  -vf 'fps=24000/1001:start_time=588.588000,zscale=w=1280:h=720:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,setsar=1,format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,sidedata=mode=delete'
+  -profile:v high -level:v 3.1 -pix_fmt yuv420p -b:v 2500k -maxrate 2500k -bufsize 5000k -g 48 -bf 0
+  -sc_threshold 0 -a53cc 0 -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv
+  -fps_mode passthrough -force_key_frames 588.587000,590.589000,592.591000,594.593000,596.595000,598.597000
+  -c:a aac -ac 2 -ar 48000 -b:a 160k -af 'aresample=48000,aresample=48000:first_pts=28252160,apad'
+  -fflags +bitexact -flags:v +bitexact -flags:a +bitexact -f segment -segment_time_delta 0.010000
+  -segment_format mpegts -segment_format_options mpegts_flags=+initial_discontinuity -segment_list_type csv
+  -segment_list list.csv -segment_start_number 294 -segment_times 2.002000,4.004000,6.006000,8.008000,10.010000
+  segment-%05d.ts
+(More in $W/evidence/cmd_*.txt, including a last-of-item job with tpad.)
+
+Differences from today's transcode job, and why:
+
+| Argument | Why | Evidence |
+|---|---|---|
+| Two inputs of the same file | Keeps today's video seek and AAC-grid audio seek unchanged in one process | 5.1 |
+| fps=...:start_time=S | Frames land on a grid that does not depend on where the job starts; start_time fills it when the first source frame is late | Django without start_time: first video PTS 10.08 instead of 10.00, and segment 0 swallowed segment 1 (98 frames) |
+| No -enc_time_base demux | Matroska's 1/1000 timebase rounds every frame | 5.3 |
+| -fps_mode passthrough kept | The encoder must not re-time the filter's output | 5.3 |
+| setpts=PTS-<phase>/TB when needed | Sources half a frame off the grid flip between slots | 5.3 |
+| Overlap and trailing for the video too | Every kept segment is cut by the same mid-job mechanism, for both streams | 5.1 |
+| -sc_threshold 0, -segment_time_delta 0.01 | Only forced keyframes exist; a cut cannot be triggered one frame early | Reasoning only, see risk 6 |
+| -bf 0 | Audio starts 0-20 ms after video in every segment | 5.4 |
+| -map_metadata -1, -map_chapters -1, -metadata service_*, +bitexact, -a53cc 0, sidedata=mode=delete | Remove title, language, encoder idents, captions, HDR side data | 5.5 |
+| pad=1280:720 | Identical SPS/PPS for every item | 5.2 |
+
+-segment_times are relative to the first VIDEO packet. Measuring them from the audio priming packet (21 ms
+earlier) shifted every cut by one segment (segment start error 180000 ticks).
+
+======================================================================
+5. EVIDENCE
+======================================================================
+
+5.1 FIXED-DURATION SEGMENTS ACROSS SEPARATE JOBS
+------------------------------------------------
+Per source and rate: one reference job of 12 segments starting a third of the way in; the same 12 segments
+as three jobs of 4; edge jobs for segments 0-3, 4-5 and the last six segments in two jobs.
+All 64 jobs exited 0 with no warnings.
+
+| Source | Rate | Video frames (12 seg) | Duplicate PTS video/audio | Video steps (90 kHz) | Audio steps | Segment start error | Timestamps identical to single job | PSNR split vs single (min/avg) |
+|---|---|---|---|---|---|---|---|---|
+| phx | 25 | 600 | 0 / 0 | 3600 | 1920 | 0 | yes | 44.1 / 48.2 dB |
+| phx | 23.976 | 576 | 0 / 0 | 3753, 3754 | 1920 | 0 | yes | 42.4 / 48.4 dB |
+| vq | 25 | 600 | 0 / 0 | 3600 | 1920 | 0 | yes | 38.6 / 48.9 dB |
+| vq | 23.976 | 576 | 0 / 0 | 3753, 3754 | 1920 | 0 | yes | 39.5 / 49.0 dB |
+| aeom | 25 | 600 | 0 / 0 | 3600 | 1920 | 0 | yes | 42.4 / 50.2 dB |
+| aeom | 23.976 | 576 | 0 / 0 | 3753, 3754 | 1920 | 0 | yes | 42.7 / 49.9 dB |
+| skc (docker, tone mapped) | 25 | 600 | 0 / 0 | 3600 | 1920 | 0 | yes | 49.2 / 51.6 dB |
+| skc (docker, tone mapped) | 23.976 | 576 | 0 / 0 | 3753, 3754 | 1920 | 0 | yes | 37.8 / 51.2 dB |
+
+- Segment start error = first video PTS of segment i minus 90000 x (10 + i x D). It was 0 for every segment
+  in every set, including the edge sets.
+- Every segment starts with a keyframe and holds exactly 50 (or 48) frames, except each item's last.
+- A frame shifted by one position at a join would show as a low per-frame PSNR; the minimum is 37.8 dB.
+- Across every job join: video step exactly one frame, audio step exactly 1920 ticks.
+
+Audio content at the joins against the source audio (25 fps sets, +-2048 samples around each join):
+
+| Source | Lag vs source, per job | SNR at the two joins (split) | SNR mid-job (split) | Same join positions in the single job |
+|---|---|---|---|---|
+| phx | 0 samples in all jobs (also 0 in 11 single-segment jobs) | 33.7, 31.0 dB | 38.5, 34.0, 28.9 dB | 33.1, 32.2 dB |
+| skc | 0 samples | 32.4, 29.9 dB | 32.5, 23.0, 46.8 dB | 32.8, 28.6 dB |
+| vq | constant, same in split and single | not measurable (my reference decode is offset 16 samples) | | |
+| aeom (44.1 kHz) | VARIES per job: 7 to 40 samples | not measurable for the same reason | | |
+
+Joins are as clean as the middle of a job for sources with regular audio timestamps.
+
+The 44.1 kHz source is NOT sample-exact at job joins. Eleven single-segment jobs landed 7, 8, 24 or 40
+samples (at 48 kHz) from a continuous decode: a spread of 0.7 ms. Cause: the source's audio packets have
+durations of 1009, 1010, 1053 and 1054 samples instead of 1024, so the timestamp at a seek point disagrees
+with a sample count from the start. The audio filter chain is the one goshl uses today, so VOD audio should
+behave the same on this file (not run separately). Three alternative chains (min_comp, earlier seek plus
+atrim, asetnsamples) gave the same lags. Packet timestamps stay exact; only the content shifts.
+
+Item start and end (edge sets):
+- first video PTS 10.0000; first audio PTS 9.9787 (the AAC priming frame, as in today's audio segments)
+- audio ends within 1 ms of the plan duration
+- video ends 0-32 ms after the plan duration (the last frame is kept whole)
+- last segments seen: 19, 16, 40, 35, 41, 55, 48, 52 frames (short, or up to D + 0.5 s with mergeTail)
+
+5.2 PADDING VS ASPECT-ONLY SCALING
+----------------------------------
+Video is "h264 High L31 yuv420p tv/bt709/bt709/bt709" and audio "aac LC 48000 Hz stereo" in all 18 outputs.
+
+| Source | Input | Padded output | SPS md5 | Aspect-only output | SPS md5 |
+|---|---|---|---|---|---|
+| phx | 1584x1080 | 1280x720 | af289c20 | 1056x720 | d4834844 |
+| vq | 1920x1080 | 1280x720 | af289c20 | 1280x720 | af289c20 |
+| aeom | 1330x720 | 1280x720 | af289c20 | 1280x692 | a94095cc |
+| tower | 1920x1080 SAR 90:67 | 1280x720 | af289c20 | 1280x536 | b53956ab |
+| emm | 512x384 | 1280x720 (960x720 picture) | af289c20 | 512x384 | 31b98eee |
+| django | 1920x800 | 1280x720 | af289c20 | 1280x534 | 4d90f9be |
+| akira | 1920x1036 | 1280x720 | af289c20 | 1280x690 | 4c074bce |
+| adf | 1280x702 | 1280x720 | af289c20 | 1280x702 | 64affb82 |
+| skc (docker) | 3840x2160 PQ | 1280x720 | af289c20 | 1280x720 | af289c20 |
+
+- PPS identical (13a11a5f) in all 18 outputs.
+- PAT (782837b9), PMT (dde1bc8d) and SDT (342770ee) byte-identical across the 9 padded items.
+  PIDs 0x100 (video) and 0x101 (audio) everywhere.
+- Geometry checked visually ($W/evidence/pad_grid.png) and with cropdetect on the anamorphic source:
+  picture 1280x536 at y=92.
+- Padding implies upscaling SD sources to fit the box. Aspect-only must not upscale, so its size varies more.
+- Both players played the aspect-only channel through every size change (5.6). Padding is a robustness
+  choice, not a requirement of these two players. Recommended because it makes the format literally identical.
+
+5.3 CFR CONVERSION
+------------------
+Two jobs of five segments per combination, recommended arguments:
+
+| Sources | Target | Video steps | Duplicate PTS | Segment start error | Frames per segment |
+|---|---|---|---|---|---|
+| phx, akira, walter, vq, adf | 25 | 3600 | 0 | 0 | 50 |
+| phx, akira, walter, vq, adf | 30 | 3000 | 0 | 0 | 60 |
+| phx, akira, walter, vq, adf | 24000/1001 | 3753, 3754 | 0 | 0 | 48 |
+
+Variants:
+
+| Variant | Result |
+|---|---|
+| fps filter + -fps_mode passthrough (recommended) | Exact |
+| same + -enc_time_base demux (goshl's current pair) | Exact for MP4. For MKV (walter): 30 fps steps 2970/3060, 23.976 steps 3690/3780 |
+| no fps filter, -fps_mode cfr -r N | Video restarts at 10.0 s while audio stays at 208 s; kept segments contain no audio |
+| no fps filter, current flags (today's VOD) | Source timing passes through: walter steps 3690/3780, segment starts 21 ms (1890 ticks) late |
+| fps filter with default -fps_mode | Also exact in one test; keep passthrough explicit |
+
+Interaction with goshl's "-fps_mode passthrough -enc_time_base demux": passthrough is compatible and stays.
+-enc_time_base demux must go for the channel profile: it re-quantises the filter's exact 1/fps timestamps
+to the container timebase.
+
+Phase hazard: walter's video starts at 0.021 s (half a 23.976 frame) with 1 ms jitter. Converting it to
+24000/1001 dropped 93 and duplicated 93 of 318 frames. "setpts=PTS-0.021/TB" before fps brought that to 0
+dropped/duplicated with the plan still exact (also verified at 25). goshl must choose the shift per item
+from probe data.
+
+5.4 MUXED A/V AND THE JOB MODEL
+-------------------------------
+The current model does not fit as is: video and audio are separate jobs, pools, caches and files, and the
+transcoded-video job has no overlap or trailing segment. A combined job fits with small changes and produced
+every table above.
+
+First audio PTS minus first video PTS, over all mid-item segments:
+
+| Setting | Range |
+|---|---|
+| 25 fps, -bf 0 | 0 to 16 ms |
+| 23.976, -bf 0 | 0 to 20 ms |
+| 25 fps, -bf 2 | -80 to -64 ms (the cut follows video DTS) |
+| first segment of an item | -21.3 ms (priming frame) |
+
+The range exists because 2 s is 93.75 AAC frames. It is deterministic: the segment muxer cuts on the video
+keyframe; audio packets with DTS at or after the keyframe's DTS go to the new segment. Segments hold 93 or
+94 audio frames.
+
+Alternative that keeps today's jobs: remux a video segment and an audio segment with -c copy. A demux and
+remux of one segment reproduced every packet timestamp. It needs three artefacts and three processes per
+segment; not recommended.
+
+5.5 METADATA
+------------
+Today's VOD commands reproduced by hand on Akira, whose container title is
+"Dragon Ball Z: La battaglia degli Dei - Extended Edition by danny11" (encoder tag HandBrake 1.7.3).
+
+| Output | Leaks found |
+|---|---|
+| VOD transcoded video | SDT service_name = the source title, in every SDT (4 in a 2 s segment). x264 version and full option string in an SEI on the job's first frame |
+| VOD transcoded audio | Same SDT title. PMT language "eng" from the source. "Lavc63.1.102" ident in the AAC stream |
+| VOD copied video | Same SDT title (14 times in a 5 s segment) |
+| any of the above + -map_metadata -1 | service_name=Service01, service_provider=FFmpeg, no language. Encoder idents remain |
+| channel arguments | service_name=channel, service_provider=goshl, no language, no x264 SEI, no Lavc ident, no title string in any of 9 items |
+
+- -map_metadata -1 alone removed both title and stream language on ffmpeg 9.0.2; -map_metadata:s -1 changed nothing.
+- The +bitexact flags remove the Lavc ident; the channel output, which sets them, carries no x264 SEI.
+- The tone-mapped Skeleton Crew output has no SEI on its first frame (no HDR mastering data survives).
+- For current VOD: adding "-map_metadata -1 -map_chapters -1" in jobTimeline.args() fixes the title leak for
+  all three job kinds. It changes segment bytes, so the cache version must move.
+
+5.6 REAL PLAYERS
+----------------
+A local server on 127.0.0.1 generated a sliding 6-segment live playlist from the clock, with
+EXT-X-MEDIA-SEQUENCE, EXT-X-DISCONTINUITY-SEQUENCE and EXT-X-DISCONTINUITY at each item change.
+- pad25 and pad23976: 8 clips of 6 segments from phx, skc, aeom, vq, alternating item starts (segments 0-5)
+  and real item ends (last six segments, including the short final one).
+- fit25: aspect-only clips from tower, emm, phx, django (four picture sizes).
+
+| Player | Channel | Wall | currentTime | Item changes | Errors | Stalls | Notes |
+|---|---|---|---|---|---|---|---|
+| hls.js 1.5.17, headless Chrome 157 | pad25 | 109 s | 6.7 -> 115.6 | 10 | 0 fatal, 0 non-fatal | 0 | 2741 frames, 6 dropped |
+| hls.js | pad23976 | 109 s | 6.1 -> 115.0 | 10 | 0, 0 | 0 | 2614 frames, 1 dropped |
+| hls.js | fit25 | 109 s | 6.1 -> 115.0 | 10 | 0, 0 | 0 | 10 resize events |
+| AVFoundation (AVPlayer + AVPlayerItemVideoOutput, macOS 27) | pad25 | 106 s | 9.4 -> 114.9 | 9 | none, error log empty | 0 | 2688 frames delivered, largest gap 80 ms |
+| AVFoundation | pad23976 | 106 s | 9.4 -> 115.0 | 9 | none | 0 | 2580 frames, largest gap 83 ms |
+| AVFoundation | fit25 | 106 s | 9.4 -> 114.9 | 9 | none | 0 | 2691 frames, 10 size changes |
+
+- In both players currentTime advanced 0.8-1.2 s in every 1 s sample. No frame gap above 90 ms at any
+  discontinuity in AVFoundation.
+- Playback muted, no window opened, Safari not used, Chrome headless with a temporary profile.
+- Decode check: "ffmpeg -v error -xerror -i <segment> -f null -" and "ffprobe -count_frames" on 234 segments
+  in 29 sets: 0 non-zero exits, 0 error lines.
+
+5.7 BITRATE AND SPEED
+---------------------
+- Segment bitrate (video + audio + TS overhead): average 2.8-3.0 Mbit/s, maximum 3.55 Mbit/s for one 2 s segment.
+- Native ffmpeg, 1080p sources: a job of 4 kept segments (11 s of media with overlap and trailing) took 4.2-5.2 s.
+- 4K PQ in the docker image: 6.3 s for the same job; 19.2 s for 15 kept segments (33 s of media).
+  One run took 16 s for 11 s of media, for which I have no confirmed cause; another container was
+  benchmarking on the same Docker VM when I checked afterwards. docker run overhead is 0.9 s.
+- Scaling inside the first zscale matters: tone mapping at 4K and scaling afterwards took 33 s for a run
+  that takes 7.6 s with the fitted size in the first zscale.
+
+======================================================================
+6. WHAT WOULD CHANGE IN GOSHL (design level, from reading the code)
+======================================================================
+| Area | File / function | Change |
+|---|---|---|
+| Command | internal/ffmpeg/command.go: new Channel(ChannelParams) beside Video and Audio | Builds the combined job. jobTimeline / args() grow a second seek+input, a second -map, only = "-sn -dn", the strip arguments, and no demux timebase (sourceFrameTimingArgs becomes passthrough only). keyframeTimes and segmentCuts include the overlap and trailing cuts. reference = S. Time delta 0.01 |
+| Command | videoFilter, videoTailFilter, transcodeVideoArgs | Channel chain: optional setpts phase, fps with start_time, tpad AFTER fps, fitted scale or tone map, pad, sidedata=mode=delete. Fixed GOP, -bf 0, -sc_threshold 0, -a53cc 0, explicit colour tags |
+| Command | ErrTrailingNotSupported check in Video | Trailing must be allowed for the transcoded channel job |
+| Filters | internal/hwaccel/hwaccel.go: softwareScaleFilter, tonemapFilter | A padded variant taking inner size and offsets. Device-frame chains (scale_vaapi, scale_qsv, scale_cuda) have no fps/pad step: the channel uses the software filter path, as tone mapping already does in pipelineFor, or needs per-accelerator chains |
+| Plan | internal/playlist/segment.go | CalculateSegments(nil, duration, D) already yields fixed boundaries (fixedBoundaries + mergeTail). Decide whether mergeTail (last segment up to D + 0.5 s) is wanted for channels |
+| Rendition | internal/rendition, internal/domain | A fixed channel rendition: 1280x720, frame rate as a fraction, level 31, bitrates, inner size, pad offsets, colour plan, video phase, source ends. domain.Job already carries both VideoRendition and AudioRendition; a channel job fills both |
+| Job | internal/engine/segments.go: GetSegment, buildJob, resolveRendition | A third (muxed) stream type, with overlap and trailing, which buildJob gives only to copied video and audio today |
+| Contract | internal/domain/timeline.go JobContractVersion, domain.JobDigest, internal/engine/identity.go | New fields in the digest, contract version bump, channel parameters in the cache identity |
+| Pool | internal/transcode/pool.go: validateDelivery, segmentEnds, job dispatch | Accept overlap/trailing on a transcoded-video job, call the Channel builder, check ends with the video tolerance, decide which pool runs it (CPU-bound like video) |
+| Worker | internal/transcode/worker.go | None expected: "dropped" already covers overlap and trailing |
+| Probe | internal/probe | A video timestamp phase per item (first video PTS, or keyframe times modulo the frame duration) for the setpts shift |
+| API | api.go, options.go | Expose the channel plan (index, duration in frames) and a channel segment getter; frames builds the live playlist itself. CODECS would be avc1.64001f,mp4a.40.2 |
+| VOD | jobTimeline.args() | Add -map_metadata -1 -map_chapters -1 for all current jobs, with a cache version bump |
+
+SegmentsPerJob defaults to 4, which with overlap and trailing on video means 11 s encoded for 8 s kept.
+Channel playback is sequential, so a larger batch cuts the overhead (15 segments: 33 s for 30 s).
+
+======================================================================
+7. RISKS AND OPEN POINTS
+======================================================================
+1. Frame rate choice (section 3). 25 or 30 fps makes most of this library judder.
+2. Hardware encoders are untested. Everything here is libx264. Identical SPS/PPS, -bf 0, fixed GOP and
+   forced IDR must be re-checked per encoder (VideoToolbox, NVENC, QSV, VAAPI). The byte-identical SPS also
+   depends on every node running the same encoder build.
+3. 4K tone-mapped sources are close to real time in docker on this machine (about 1.3-1.7x, once below 1x).
+   A slow job stalls the live edge, so upcoming segments probably need producing ahead of the clock.
+4. Audio joins are not sample-exact for sources with irregular audio timestamps (0.7 ms spread on the
+   44.1 kHz file; the chain is today's VOD chain). A larger batch makes it rarer. No filter-level fix found.
+5. Timestamp phase. Without the per-item shift, an MKV starting half a frame late loses and repeats about
+   29% of frames. Where source and channel rates differ slightly (24.000 vs 23.976) the phase drifts across
+   the half-frame point periodically; that case is untested.
+6. Scene-cut keyframes near a boundary. With today's 0.05 s delta and frames 40-42 ms apart, a scene-cut
+   IDR one frame before a boundary would cut early. Not reproduced; -sc_threshold 0 plus a 0.01 delta
+   removes it for channels. May be worth a look for current VOD transcodes.
+7. Sources not tested: no audio track (the muxed job needs a generated silent track to keep the format
+   identical); audio that ends early or starts late; interlaced video; multiple audio tracks; HLG and
+   10-bit PQ (only 8-bit PQ was run); HTTP sources (two inputs mean two connections per job).
+8. Players not tested: Safari, iOS/tvOS, ExoPlayer, smart TVs. Their tolerance of size changes is unknown,
+   which is the argument for padding.
+9. Loudness differs between items and is not normalised; a per-job loudnorm would not be consistent
+   across joins.
+10. Item ends. Video overruns the plan by up to one frame and the last segment is short (or up to D + 0.5 s
+    with mergeTail). frames must take EXTINF from the plan in frames, and EXT-X-TARGETDURATION must cover
+    the merged tail.
+11. Encoder settings are a first guess. 2.5 Mbit/s capped VBR, superfast and 160 kbit/s audio exercised the
+    pipeline; they are not tuned for quality. 5.1 downmix uses ffmpeg's default matrix.
+12. Padding burns letterbox bars into the picture and upscales SD.
+
+======================================================================
+8. STATE AND FILES
+======================================================================
+- The server is stopped: process gone, port refuses connections.
+- Bulky outputs (1.7 GB of segments, the Chrome profile, the Swift binary) were deleted because the disk is
+  nearly full. The scripts regenerate them.
+- A goshl-ffmpeg container running bench.sh was in docker ps; it is not mine and was left alone.
+
+Files in $W:
+  chan.py                      job builder (the argument template above), plan, per-segment analysis
+  src.py                       source table
+  exp1.py, exp1_main.json      join experiment and results
+  audchk.py, lagtest.py        audio join quality and per-job lag
+  exp2.py, exp2.json           padding vs aspect-only
+  exp3.py, exp3_matrix.json, exp3_variants.json, exp3_phase.json   CFR matrix, timing variants, phase fix
+  final.py                     decode check, bitrate, item edges, speed
+  server.py, web/player.html, cdp.mjs, hls_result.json, hlsreport.py   live playlist server and hls.js run
+  avtest.swift, av_result.json, avreport.py                        AVFoundation run
+  evidence/                    exact command lines of representative jobs, pad_grid.png
+  sample_probe.txt             library frame-rate sample

@@ -213,6 +213,11 @@ func TestOptionsMapOntoEngineConfig(t *testing.T) {
 		HWAccelDecodeMode:      DecodeDevice,
 		AllowHardwareFallback:  true,
 		OmitSubtitleRenditions: true,
+		ChannelPoolSize:        15,
+		ChannelSegmentsPerJob:  16,
+		EncoderSlots:           7,
+		LiveMaxSessions:        9,
+		LiveMaxTranscodes:      3,
 	}
 	given := reflect.ValueOf(opts)
 	mapped := reflect.ValueOf(opts.config())

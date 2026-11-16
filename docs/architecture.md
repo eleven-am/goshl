@@ -25,15 +25,39 @@ flowchart LR
 | Segment plan | Keyframes and `TargetDuration` produce segments of at most `max(2 x TargetDuration, 12 s)`. A long gap is split. A short tail merges into the previous segment. |
 | Renditions | The source resolution and bitrate give a video ladder. Each source audio track gives an audio rendition. Each video rung is copied (`DirectStream`) or transcoded. |
 | Jobs | A request for one segment becomes a batch of up to `SegmentsPerJob` segments, trimmed at segments already stored. The batch is a `Job` with a deterministic ID and a digest. |
-| Workers | Video and audio pools subscribe to the coordinator by stream type and pipeline profile. A worker verifies the job, runs ffmpeg and validates the output against the planned segment times. |
+| Workers | Video, audio and, when enabled, channel pools subscribe to the coordinator by stream type and route profile. A worker verifies the job, runs ffmpeg and validates the output against the planned segment times. |
 | Storage | The worker writes segments through `Storage` and publishes readiness through `NotifySegment`. |
 | Playlists | Master, variant and subtitle playlists are rendered from metadata and the plan. `PathGenerator` supplies the embedded URLs. |
 
 Segments are transcoded on demand. Playback starts after the first requested segment. Sprites, previews, thumbnails and subtitles are generated on first request and stored.
 
+## Lanes
+
+Each pool owns a stream type: `StreamVideo`, `StreamAudio` and `StreamChannel`. A busy lane never blocks another. Inside a lane the coordinator delivers by `Job.Priority`. Video transcode jobs also take a slot from a shared encoder budget, which live sessions draw from too.
+
+## Live sessions
+
+Live sessions bypass storage and the coordinator.
+
+```mermaid
+flowchart LR
+    Host[Host: LiveSource.Open] --> Probe[ffprobe on first bytes]
+    Probe --> Plan[Copy or transcode plan]
+    Plan --> F[One ffmpeg per session]
+    Host --> F
+    F --> Dir[(Temp directory)]
+    Dir --> Win[Sliding window playlist]
+```
+
+One session owns one ffmpeg process, one reader and one temp directory. The host's reader feeds ffmpeg through a pipe. A reconnect or `SwitchSource` starts a new ffmpeg at the next sequence number, with a discontinuity. See [operations.md](operations.md#live).
+
+## Channels
+
+A channel item is a plan: a fixed list of 2.002 s segments computed from the probed duration. `ChannelPrefetch` turns missing grid batches into jobs on the channel lane. Workers store each segment in `Storage` under the source's media key and a reserved `channel-` rendition. The host builds its own live playlist over them. See [operations.md](operations.md#channels).
+
 ## Identity
 
-Every stored object lives under a media key. The key hashes the schema, source URL, source revision and pipeline profile. Replicas with equal options and the same ffmpeg build compute equal keys and share the cache. See [operations.md](operations.md#cache-identity-and-schema).
+Every stored object lives under a media key. The key hashes the schema, source URL, source revision and pipeline profile. Replicas with equal options and the same ffmpeg build compute equal keys and share the cache. The job contract version is not part of the key. It feeds the route profile instead, so a contract change re-routes jobs without emptying the cache. See [operations.md](operations.md#cache-identity-and-schema).
 
 ## Coordination across replicas
 

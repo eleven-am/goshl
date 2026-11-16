@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/live/livetest"
+	"github.com/eleven-am/goshl/internal/testmedia"
 )
 
 func TestStartAndStop(t *testing.T) {
@@ -343,5 +345,59 @@ func TestMediaKeysMatchGoldenValues(t *testing.T) {
 		if err != nil || key != want {
 			t.Errorf("MediaKey = %s, %v, want %s", key, err, want)
 		}
+	}
+}
+
+func TestControllerLiveSharesStopsAndRejectsAfterStop(t *testing.T) {
+	var events []EventType
+	controller := NewController(Options{
+		Storage: &stubStorage{}, Coordinator: &stubCoordinator{}, PathGen: stubPathGen{},
+		Observer: ObserverFunc(func(_ context.Context, event Event) {
+			if strings.HasPrefix(string(event.Type), "live.") {
+				if event.Label != "channel one" || event.MediaKey != "" {
+					t.Errorf("live event carries more than the label: %+v", event)
+				}
+				events = append(events, event.Type)
+			}
+		}),
+	})
+	src, control := livetest.FileSource(testmedia.Live(t, testmedia.LiveH264MP2), "channel one")
+	control.Burst = 12 * time.Second
+	session, err := controller.Live(context.Background(), "key", src, LiveOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := controller.Live(context.Background(), "key", src, LiveOptions{})
+	if err != nil || again != session {
+		t.Fatalf("second Live: %v same=%v", err, again == session)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	playlist, err := session.Playlist(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(playlist, stubPathGen{}.Segment("key", LiveRendition, StreamVideo, 0)) || strings.Contains(playlist, "ENDLIST") {
+		t.Fatalf("playlist:\n%s", playlist)
+	}
+	if _, err := session.Segment(ctx, "0"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := controller.LiveProbe(ctx, src, 5*time.Second)
+	if err != nil || info.VideoAction != LiveCopy || info.AudioAction != LiveTranscode {
+		t.Fatalf("LiveProbe = %+v, %v", info, err)
+	}
+	controller.Stop()
+	if state := session.State(); state.Status != LiveStopped {
+		t.Fatalf("state after Stop = %+v", state)
+	}
+	if _, err := controller.Live(context.Background(), "key", src, LiveOptions{}); !errors.Is(err, ErrControllerStopped) {
+		t.Fatalf("Live after Stop = %v", err)
+	}
+	if _, err := controller.LiveProbe(context.Background(), src, time.Second); !errors.Is(err, ErrControllerStopped) {
+		t.Fatalf("LiveProbe after Stop = %v", err)
+	}
+	if len(events) < 3 || events[0] != EventLiveStarted || events[len(events)-1] != EventLiveStopped {
+		t.Fatalf("events = %v", events)
 	}
 }

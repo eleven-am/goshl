@@ -22,6 +22,8 @@ type Job struct {
 	VideoRendition   *VideoRendition
 	AudioRendition   *AudioRendition
 	VideoStreamIndex int
+	Priority         JobPriority
+	Channel          *ChannelSpec
 	Digest           string
 }
 

@@ -59,6 +59,16 @@ type Config struct {
 	AllowHardwareFallback bool
 
 	OmitSubtitleRenditions bool
+
+	ChannelPoolSize int
+
+	ChannelSegmentsPerJob int
+
+	EncoderSlots int
+
+	LiveMaxSessions int
+
+	LiveMaxTranscodes int
 }
 
 func (o *Config) setDefaults() {
@@ -88,6 +98,16 @@ func (o *Config) setDefaults() {
 	}
 	if o.HWAccelDecodeMode == "" {
 		o.HWAccelDecodeMode = domain.DecodeSafe
+	}
+	o.setChannelDefaults()
+	if o.LiveMaxSessions == 0 {
+		o.LiveMaxSessions = 16
+	}
+	if o.LiveMaxTranscodes == 0 {
+		o.LiveMaxTranscodes = 2
+	}
+	if o.EncoderSlots == 0 {
+		o.EncoderSlots = o.VideoPoolSize + o.LiveMaxTranscodes
 	}
 	if o.DefaultPreviewConfig.MaxFrames == 0 {
 		o.DefaultPreviewConfig.MaxFrames = 40
@@ -119,7 +139,7 @@ func (o *Config) validateError() error {
 	if o.SegmentTimeout < 0 || o.JobTimeout < 0 || o.ProbeTimeout < 0 || o.GenerationTimeout < 0 || o.TargetDuration < 0 || math.IsNaN(o.TargetDuration) || math.IsInf(o.TargetDuration, 0) {
 		return fmt.Errorf("%w: durations must be positive", ErrInvalidOptions)
 	}
-	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 {
+	if o.SegmentsPerJob < 0 || o.VideoPoolSize < 0 || o.AudioPoolSize < 0 || o.EncoderSlots < 0 || o.LiveMaxSessions < 0 || o.LiveMaxTranscodes < 0 {
 		return fmt.Errorf("%w: pool and batch sizes must be positive", ErrInvalidOptions)
 	}
 	if err := validatePreviewConfig(o.DefaultPreviewConfig, true); err != nil {
@@ -146,6 +166,12 @@ func (o *Config) validateResolvedError() error {
 	}
 	if o.SegmentsPerJob > maxSegmentsPerJob || o.VideoPoolSize > maxPoolSize || o.AudioPoolSize > maxPoolSize {
 		return fmt.Errorf("%w: SegmentsPerJob is limited to %d and pool sizes to %d", ErrInvalidOptions, maxSegmentsPerJob, maxPoolSize)
+	}
+	if err := o.validateChannelConfig(); err != nil {
+		return err
+	}
+	if o.EncoderSlots < 1 || o.LiveMaxTranscodes > o.EncoderSlots || o.LiveMaxSessions < 1 {
+		return fmt.Errorf("%w: EncoderSlots must be at least 1 and LiveMaxTranscodes must not exceed it", ErrInvalidOptions)
 	}
 	if err := validatePreviewConfig(o.DefaultPreviewConfig, false); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidOptions, err)

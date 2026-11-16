@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/eleven-am/goshl/internal/domain"
@@ -48,6 +49,7 @@ func (e *Engine) Invalidate(ctx context.Context, sourceURL string) error {
 		return err
 	}
 	e.metadata.clearFailure(mediaKey)
+	e.channel.clearFailures(mediaKey)
 	if err := invalidator.DeleteMedia(ctx, mediaKey); err != nil {
 		return err
 	}
@@ -85,8 +87,16 @@ func localSourcePath(sourceURL string) (string, bool) {
 	return input.LocalPath, true
 }
 
+func routeProfile(pipeline string) string {
+	return routeIdentity(pipeline, domain.JobContractVersion)
+}
+
+func routeIdentity(pipeline string, jobContractVersion int) string {
+	return hashIdentity("goshl-route", pipeline, strconv.Itoa(jobContractVersion))
+}
+
 func pipelineVersion(opts Config, config *domain.HWAccelConfig) string {
-	return pipelineIdentity(opts, config, domain.OutputTimelineOffset, domain.JobContractVersion)
+	return pipelineIdentity(opts, config, domain.OutputTimelineOffset, domain.OutputContractVersion)
 }
 
 func pipelineIdentity(opts Config, config *domain.HWAccelConfig, timelineOffset time.Duration, jobContractVersion int) string {

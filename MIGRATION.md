@@ -7,6 +7,31 @@ Upgrade one section at a time. Each section lists what you must do.
 | v0.0.25 | v0.0.26 | v3 to v5 | 5 | Coordinator change, cold cache, ffmpeg 6.1 |
 | v0.0.26 | v0.0.27 | v5 to v6 | 5 | Cold cache, HDR rule change |
 | v0.0.27 | v0.0.28 | v6 | 5 | None |
+| v0.0.28 | v0.0.29 | v6 | 6 | Coordinator change, no cold cache |
+
+## v0.0.28 to v0.0.29
+
+### Coordinator
+
+- [ ] Carry `Job.Priority` and `Job.Channel` (`*ChannelSpec`) unchanged. The digest covers both. A coordinator that drops them makes workers reject channel jobs with a `digest mismatch`.
+- [ ] Deliver the highest `Priority` first inside one stream type and profile, the oldest first within a priority, and a redelivery ahead of its own priority. Do not buffer the `Subscribe` channel.
+- [ ] Route the new stream type `StreamChannel` like any other. Treat it as an opaque key.
+- [ ] Deploy the coordinator change before goshl. Workers on v0.0.29 use a new route profile and never take v0.0.28 jobs. Drain queued jobs first.
+
+### Cache
+
+- [ ] Nothing to do. The schema stays `goshl-cache-v6`. Media keys and VOD job IDs are unchanged, and v0.0.28 and v0.0.29 read each other's VOD cache.
+- [ ] Expect VOD segments already cached to keep the source title until regenerated. Segments from v0.0.29 carry no source metadata. Call `Invalidate` to regenerate a source.
+
+### Options
+
+- [ ] No change required. `ChannelPoolSize` defaults to 0, which leaves channels off. `EncoderSlots`, `LiveMaxSessions` and `LiveMaxTranscodes` default to values that never make VOD wait. Live is available without configuration.
+- [ ] Set `EncoderSlots` to your real encoder session limit only if you want VOD and live to compete for it.
+
+### Rollout
+
+- [ ] Handle `ErrChannelDisabled` and the `ErrLive*` errors if you use the new APIs.
+- [ ] Run the same ffmpeg image on every replica that serves channels.
 
 ## v0.0.25 to v0.0.26
 

@@ -9,9 +9,11 @@ import (
 
 	"github.com/eleven-am/goshl/internal/coordination"
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/encoderslots"
 	"github.com/eleven-am/goshl/internal/ffmpeg"
 	"github.com/eleven-am/goshl/internal/ffmpegversion"
 	"github.com/eleven-am/goshl/internal/hwaccel"
+	"github.com/eleven-am/goshl/internal/live"
 	"github.com/eleven-am/goshl/internal/misc"
 	"github.com/eleven-am/goshl/internal/playlist"
 	"github.com/eleven-am/goshl/internal/probe"
@@ -24,6 +26,9 @@ type Engine struct {
 	playlist        *playlist.Generator
 	videoPool       *transcode.Pool
 	audioPool       *transcode.Pool
+	channelPool     *transcode.Pool
+	channel         channelState
+	routeProfile    string
 	prober          *probe.Prober
 	metadata        metadataState
 	miscGen         *misc.Generator
@@ -32,6 +37,7 @@ type Engine struct {
 	flights         *flightRegistry
 	lifecycle       *coordination.Lifecycle
 	tonemap         tonemapCapability
+	live            *live.Manager
 }
 
 type tonemapCapability struct {
@@ -100,6 +106,9 @@ func New(ctx context.Context, opts Config) (*Engine, error) {
 	}
 	cmdBuilder := ffmpeg.NewCommandBuilder(hwConfig)
 	pipeline := pipelineVersion(opts, hwConfig)
+	route := routeProfile(pipeline)
+
+	slots := encoderslots.New(opts.EncoderSlots, min(opts.LiveMaxTranscodes, opts.EncoderSlots))
 
 	notifyingStorage := segment.NewNotifyingStorage(opts.Storage, opts.Coordinator, opts.Observer)
 
@@ -110,7 +119,7 @@ func New(ctx context.Context, opts Config) (*Engine, error) {
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
-		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: route, Slots: slots},
 	)
 
 	audioPool := transcode.NewPool(
@@ -120,7 +129,7 @@ func New(ctx context.Context, opts Config) (*Engine, error) {
 		opts.Storage,
 		cmdBuilder,
 		notifyingStorage,
-		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: pipeline},
+		transcode.PoolConfig{JobTimeout: opts.JobTimeout, Observer: opts.Observer, Profile: route},
 	)
 
 	miscGen := misc.NewGeneratorWithCoordinator(opts.Storage, opts.Coordinator, hwConfig, opts.Observer)
@@ -138,9 +147,18 @@ func New(ctx context.Context, opts Config) (*Engine, error) {
 		miscGen:         miscGen,
 		hwConfig:        hwConfig,
 		pipelineVersion: pipeline,
+		routeProfile:    route,
+		channelPool:     newChannelPool(opts, cmdBuilder, notifyingStorage, route),
 		flights:         newFlightRegistry(),
 		lifecycle:       lifecycle,
 	}
+	engine.live = live.NewManager(live.Config{
+		PathGen:     opts.PathGen,
+		Builder:     cmdBuilder,
+		Observe:     engine.observeLive,
+		Slots:       slots,
+		MaxSessions: opts.LiveMaxSessions,
+	})
 	engine.observe(ctx, domain.Event{Type: domain.EventHardwareSelected, Accelerator: hwConfig.Accelerator})
 	if hwConfig.Error != "" {
 		engine.observe(ctx, domain.Event{Type: domain.EventHardwareFallback, Accelerator: hwConfig.Accelerator, Error: hwConfig.Error})
@@ -180,9 +198,15 @@ func (e *Engine) Start(ctx context.Context) error {
 		e.videoPool.Stop()
 		return fmt.Errorf("start audio pool: %w", err)
 	}
+	if err := e.startChannelPool(ctx); err != nil {
+		e.videoPool.Stop()
+		e.audioPool.Stop()
+		return err
+	}
 	if e.lifecycle.Stopped() {
 		e.videoPool.Stop()
 		e.audioPool.Stop()
+		e.stopChannelPool()
 		return ErrControllerStopped
 	}
 	return nil
@@ -192,8 +216,10 @@ const stopWaitBound = 10 * time.Second
 
 func (e *Engine) Stop() {
 	e.lifecycle.Close()
+	e.live.Stop()
 	e.videoPool.Stop()
 	e.audioPool.Stop()
+	e.stopChannelPool()
 	e.lifecycle.Wait(stopWaitBound)
 	e.finishAllFlights()
 }

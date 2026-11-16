@@ -2,6 +2,8 @@
 
 goshl is a Go library that serves video files as HLS streams. It probes a source, builds master and variant playlists, and transcodes segments with ffmpeg only when a client asks for them. Finished segments are cached, so playback starts before a long file is fully transcoded. A coordinator lets several replicas share one queue, one cache and one set of locks.
 
+Two more modes: live sessions turn a raw MPEG-TS stream into HLS ([operations.md](docs/operations.md#live)), and channels serve linear TV in one fixed format ([operations.md](docs/operations.md#channels)).
+
 ## Install
 
 ```bash
@@ -69,7 +71,7 @@ func main() {
 
 ## Documentation
 
-- [docs/api.md](docs/api.md): every exported type, function, method, event and error.
+- [docs/api.md](docs/api.md): every exported type, function, method, event and error, including `Live` and `Channel*`.
 - [docs/configuration.md](docs/configuration.md): `Options` fields, defaults and bounds.
 - [docs/operations.md](docs/operations.md): ffmpeg, hardware, HDR, caching, coordinator contract, trust model, observability.
 - [docs/architecture.md](docs/architecture.md): pipeline and multi-replica coordination.

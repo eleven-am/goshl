@@ -85,3 +85,39 @@ func TestOptionsRejectNegativeProbeTimeout(t *testing.T) {
 		t.Fatalf("expected invalid options, got %v", err)
 	}
 }
+
+func TestLiveAndChannelDefaults(t *testing.T) {
+	opts := Config{}
+	opts.setDefaults()
+	if opts.LiveMaxSessions != 16 || opts.LiveMaxTranscodes != 2 {
+		t.Errorf("live defaults = %d sessions, %d transcodes", opts.LiveMaxSessions, opts.LiveMaxTranscodes)
+	}
+	if opts.EncoderSlots != opts.VideoPoolSize+opts.LiveMaxTranscodes {
+		t.Errorf("EncoderSlots = %d, want VideoPoolSize + LiveMaxTranscodes", opts.EncoderSlots)
+	}
+	if opts.ChannelPoolSize != 0 {
+		t.Errorf("channels must be off by default, got pool size %d", opts.ChannelPoolSize)
+	}
+}
+
+func TestOptionsRejectUnusableLiveBudgets(t *testing.T) {
+	cases := map[string]Config{
+		"negative slots":         {EncoderSlots: -1},
+		"negative sessions":      {LiveMaxSessions: -1},
+		"negative transcodes":    {LiveMaxTranscodes: -1},
+		"transcodes over slots":  {EncoderSlots: 2, LiveMaxTranscodes: 3},
+		"negative channel pool":  {ChannelPoolSize: -1},
+		"channel batch too long": {ChannelSegmentsPerJob: maxSegmentsPerJob + 1},
+	}
+	for name, opts := range cases {
+		opts.Storage, opts.Coordinator, opts.PathGen = &stubStorage{}, &stubCoordinator{}, stubPathGen{}
+		err := opts.validateError()
+		if err == nil {
+			opts.setDefaults()
+			err = opts.validateResolvedError()
+		}
+		if !errors.Is(err, ErrInvalidOptions) {
+			t.Errorf("%s: got %v, want ErrInvalidOptions", name, err)
+		}
+	}
+}

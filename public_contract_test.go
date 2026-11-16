@@ -66,5 +66,30 @@ func TestPublicContractCompilesForExternalConsumers(t *testing.T) {
 	_ = goshl.SegmentStateReady
 	_ = goshl.StreamSubtitle
 	_ = (*goshl.Controller).ProbeMetadata
+	_ = (*goshl.Controller).ChannelPlan
+	_ = (*goshl.Controller).ChannelSegment
+	_ = (*goshl.Controller).ChannelPrefetch
+	_ = (*goshl.Controller).Live
+	_ = (*goshl.Controller).LiveProbe
+	_ = (*goshl.LiveSession).WaitReady
+	_ = (*goshl.LiveSession).Playlist
+	_ = (*goshl.LiveSession).Segment
+	_ = (*goshl.LiveSession).SwitchSource
+	_ = (*goshl.LiveSession).State
+	_ = (*goshl.LiveSession).Stop
+	_ = (*goshl.LiveSession).Done
+	_ = (*goshl.LiveSession).Label
+	_ = (*goshl.LiveSession).Info
+	_ = (goshl.ChannelProfile).Normalised
+	_ = goshl.ChannelPlan.SegmentData
+	_ = goshl.Event{Label: "channel"}.Label
+	_ = goshl.LiveOptions{ReadySegments: 3}
+	_ = goshl.LiveSource{Label: "source"}
+	_ = goshl.LiveProbeInfo{VideoAction: goshl.LiveCopy, AudioAction: goshl.LiveTranscode}
+	_ = []goshl.EventType{goshl.EventLiveStarted, goshl.EventLiveReady, goshl.EventLiveReconnecting, goshl.EventLiveSwitched, goshl.EventLiveFailed, goshl.EventLiveStopped}
+	_ = []error{goshl.ErrLiveSourceUnavailable, goshl.ErrLiveUnsupportedCodec, goshl.ErrLiveNoData, goshl.ErrLiveCapacity, goshl.ErrLiveStopped, goshl.ErrLiveSegmentNotFound, goshl.ErrLiveInvalidOptions, goshl.ErrInvalidChannelProfile, goshl.ErrChannelDisabled}
+	_ = []goshl.LiveStatus{goshl.LiveStarting, goshl.LiveRunning, goshl.LiveFailed, goshl.LiveStopped}
+	_ = goshl.Options{ChannelPoolSize: 1, ChannelSegmentsPerJob: 1, EncoderSlots: 1, LiveMaxSessions: 1, LiveMaxTranscodes: 1}
+	_ = []interface{}{goshl.StreamChannel, goshl.PriorityBackground, goshl.PriorityPlayback, goshl.PriorityChannel, goshl.ChannelCodecs, goshl.LiveRendition, goshl.JobPriority(0), goshl.Job{Priority: goshl.PriorityChannel, Channel: &goshl.ChannelSpec{SourceFrameRate: 24}}}
 	t.Log(job.StartBy)
 }

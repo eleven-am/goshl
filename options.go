@@ -53,6 +53,16 @@ type Options struct {
 	AllowHardwareFallback bool
 
 	OmitSubtitleRenditions bool
+
+	ChannelPoolSize int
+
+	ChannelSegmentsPerJob int
+
+	EncoderSlots int
+
+	LiveMaxSessions int
+
+	LiveMaxTranscodes int
 }
 
 func (o Options) config() engine.Config {
@@ -79,5 +89,10 @@ func (o Options) config() engine.Config {
 		HWAccelDecodeMode:      o.HWAccelDecodeMode,
 		AllowHardwareFallback:  o.AllowHardwareFallback,
 		OmitSubtitleRenditions: o.OmitSubtitleRenditions,
+		ChannelPoolSize:        o.ChannelPoolSize,
+		ChannelSegmentsPerJob:  o.ChannelSegmentsPerJob,
+		EncoderSlots:           o.EncoderSlots,
+		LiveMaxSessions:        o.LiveMaxSessions,
+		LiveMaxTranscodes:      o.LiveMaxTranscodes,
 	}
 }

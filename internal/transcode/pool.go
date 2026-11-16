@@ -12,6 +12,7 @@ import (
 
 	"github.com/cenkalti/backoff/v5"
 	"github.com/eleven-am/goshl/internal/domain"
+	"github.com/eleven-am/goshl/internal/encoderslots"
 	"github.com/eleven-am/goshl/internal/ffmpeg"
 )
 
@@ -30,6 +31,7 @@ type Pool struct {
 	jobTimeout  time.Duration
 	observer    domain.Observer
 	profile     string
+	slots       *encoderslots.Budget
 	newBackoff  func() backoff.BackOff
 
 	runMu   sync.Mutex
@@ -58,6 +60,7 @@ type PoolConfig struct {
 	JobTimeout time.Duration
 	Observer   domain.Observer
 	Profile    string
+	Slots      *encoderslots.Budget
 }
 
 type leaseSettlement struct {
@@ -119,6 +122,7 @@ func NewPool(
 		jobTimeout:  config.JobTimeout,
 		observer:    config.Observer,
 		profile:     config.Profile,
+		slots:       config.Slots,
 		running:     make(map[string]context.CancelCauseFunc),
 		newBackoff:  defaultResubscribeBackoff,
 	}
@@ -320,10 +324,12 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	isVideo := p.streamType == domain.StreamVideo
+	isVideo := p.streamType != domain.StreamAudio
 
 	var args []string
-	if isVideo {
+	if p.streamType == domain.StreamChannel {
+		args, err = p.cmdBuilder.Channel(p.channelParams(job, segments, tmpDir))
+	} else if isVideo {
 		params := ffmpeg.VideoParams{
 			InputURL:    job.SourceURL,
 			StreamIndex: job.VideoStreamIndex,
@@ -372,6 +378,14 @@ func (p *Pool) processJob(ctx context.Context, delivery domain.JobDelivery) {
 	if err != nil {
 		fail(err)
 		return
+	}
+
+	if p.streamType == domain.StreamVideo && job.VideoRendition != nil && job.VideoRendition.Method == domain.Transcode {
+		if err := p.slots.Acquire(jobCtx); err != nil {
+			fail(err)
+			return
+		}
+		defer p.slots.Release()
 	}
 
 	w := NewWorker(WorkerSpec{
@@ -511,6 +525,12 @@ func (p *Pool) validateJob(job domain.Job) error {
 	if p.streamType == domain.StreamVideo && job.VideoRendition == nil || p.streamType == domain.StreamAudio && job.AudioRendition == nil {
 		return fmt.Errorf("invalid job contract: rendition parameters are missing")
 	}
+	if p.streamType == domain.StreamChannel {
+		return validateChannelJob(job)
+	}
+	if job.Channel != nil {
+		return fmt.Errorf("invalid job contract: channel parameters on a %s job", p.streamType)
+	}
 	if job.VideoRendition != nil && job.VideoRendition.Name != job.Rendition || job.AudioRendition != nil && job.AudioRendition.Name != job.Rendition {
 		return fmt.Errorf("invalid job contract: rendition identity is inconsistent")
 	}
@@ -588,7 +608,7 @@ func (p *Pool) jobContext(ctx context.Context) (context.Context, context.CancelF
 
 func (p *Pool) segmentsExist(ctx context.Context, job domain.Job) bool {
 	for _, index := range job.ExpectedIndices {
-		info := domain.SegmentData{MediaKey: job.MediaKey, Index: index, Rendition: job.Rendition, IsVideo: job.StreamType == domain.StreamVideo}
+		info := domain.SegmentData{MediaKey: job.MediaKey, Index: index, Rendition: job.Rendition, IsVideo: job.StreamType != domain.StreamAudio}
 		exists, err := p.storage.SegmentExists(ctx, info)
 		if err != nil || !exists {
 			return false
@@ -675,4 +695,58 @@ func (p *Pool) observe(ctx context.Context, event domain.Event) {
 		event.Time = time.Now()
 	}
 	p.observer.Observe(ctx, event)
+}
+
+func validateChannelJob(job domain.Job) error {
+	spec := job.Channel
+	if spec == nil || job.VideoRendition == nil || job.AudioRendition == nil {
+		return fmt.Errorf("invalid job contract: channel parameters are missing")
+	}
+	if job.VideoRendition.Name != job.Rendition || job.AudioRendition.Name != job.Rendition {
+		return fmt.Errorf("invalid job contract: rendition identity is inconsistent")
+	}
+	if spec.SourceFrameRate < 0 || math.IsNaN(spec.SourceFrameRate) || math.IsInf(spec.SourceFrameRate, 0) {
+		return fmt.Errorf("invalid job contract: channel source frame rate %v is unusable", spec.SourceFrameRate)
+	}
+	if spec.FormatVersion != domain.ChannelFormatVersion {
+		return fmt.Errorf("invalid job contract: channel format version %d is not %d", spec.FormatVersion, domain.ChannelFormatVersion)
+	}
+	if spec.SegmentsPerJob <= 0 || job.StartIndex%spec.SegmentsPerJob != 0 || len(job.Segments) > spec.SegmentsPerJob {
+		return fmt.Errorf("invalid job contract: channel batch is off the grid")
+	}
+	if job.VideoRendition.Method != domain.Transcode || job.AudioRendition.Method != domain.Transcode {
+		return fmt.Errorf("invalid job contract: channel renditions must be transcoded")
+	}
+	if job.Overlap == nil && job.StartIndex > 0 {
+		return fmt.Errorf("invalid job contract: overlap is missing")
+	}
+	if job.Overlap != nil && !domain.Adjacent(*job.Overlap, job.Segments[0]) {
+		return fmt.Errorf("invalid job contract: overlap is inconsistent")
+	}
+	if job.Trailing != nil && !domain.Adjacent(job.Segments[len(job.Segments)-1], *job.Trailing) {
+		return fmt.Errorf("invalid job contract: trailing is inconsistent")
+	}
+	if job.VideoStreamIndex < 0 {
+		return fmt.Errorf("invalid job contract: video stream index is missing")
+	}
+	if job.Digest == "" || job.Digest != domain.JobDigest(job) {
+		return fmt.Errorf("invalid job contract: digest mismatch, the coordinator dropped or altered a job field")
+	}
+	return nil
+}
+
+func (p *Pool) channelParams(job domain.Job, segments []domain.Segment, outputDir string) ffmpeg.ChannelParams {
+	video := *job.VideoRendition
+	video.FrameRate = job.Channel.SourceFrameRate
+	return ffmpeg.ChannelParams{
+		InputURL:         job.SourceURL,
+		VideoStreamIndex: job.VideoStreamIndex,
+		Video:            video,
+		Audio:            *job.AudioRendition,
+		Spec:             *job.Channel,
+		Segments:         segments,
+		Overlap:          job.Overlap,
+		Trailing:         job.Trailing,
+		OutputDir:        outputDir,
+	}
 }

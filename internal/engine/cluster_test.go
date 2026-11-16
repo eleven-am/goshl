@@ -426,7 +426,7 @@ func TestDurableJobFailureWakesEveryReplica(t *testing.T) {
 	coordinator := newClusterCoordinator()
 	requesterA := newClusterController(store, coordinator)
 	requesterB := newClusterController(store, coordinator)
-	deliveries, err := coordinator.Subscribe(context.Background(), domain.StreamVideo, requesterA.pipelineVersion)
+	deliveries, err := coordinator.Subscribe(context.Background(), domain.StreamVideo, requesterA.routeProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestStaleSegmentFailureDoesNotPoisonReplacementRun(t *testing.T) {
 	store := &stubStorage{metaData: metadata, metaExists: true, segments: make(map[int][]byte)}
 	coordinator := newClusterCoordinator()
 	requester := newClusterController(store, coordinator)
-	deliveries, err := coordinator.Subscribe(context.Background(), domain.StreamVideo, requester.pipelineVersion)
+	deliveries, err := coordinator.Subscribe(context.Background(), domain.StreamVideo, requester.routeProfile)
 	if err != nil {
 		t.Fatal(err)
 	}

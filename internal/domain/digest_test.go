@@ -123,3 +123,28 @@ func TestJobDigestIgnoresItsOwnField(t *testing.T) {
 		t.Fatal("the digest must be computed with the Digest field cleared")
 	}
 }
+
+func TestJobDigestCoversPriorityAndChannel(t *testing.T) {
+	job := Job{ID: "job", RunID: "run", StreamType: StreamChannel, Priority: PriorityChannel, Channel: &ChannelSpec{FormatVersion: 1, SegmentsPerJob: 10}}
+	sealed := JobDigest(job)
+	lowered := job
+	lowered.Priority = PriorityPlayback
+	if JobDigest(lowered) == sealed {
+		t.Fatal("changing the priority must change the digest")
+	}
+	dropped := job
+	dropped.Priority = 0
+	if JobDigest(dropped) == sealed {
+		t.Fatal("dropping the priority must change the digest")
+	}
+	stripped := job
+	stripped.Channel = nil
+	if JobDigest(stripped) == sealed {
+		t.Fatal("dropping the channel parameters must change the digest")
+	}
+	regrouped := job
+	regrouped.Channel = &ChannelSpec{FormatVersion: 1, SegmentsPerJob: 4}
+	if JobDigest(regrouped) == sealed {
+		t.Fatal("changing a channel parameter must change the digest")
+	}
+}

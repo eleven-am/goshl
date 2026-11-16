@@ -370,7 +370,7 @@ func TestCancelledJobIsReportedAsCancelled(t *testing.T) {
 	coordinator := newFaultCoordinator()
 	controller := pathController(t, coordinator, raceStore(t), time.Minute, time.Hour, nil)
 	defer controller.Stop()
-	jobs, err := coordinator.clusterCoordinator.Subscribe(context.Background(), domain.StreamVideo, controller.pipelineVersion)
+	jobs, err := coordinator.clusterCoordinator.Subscribe(context.Background(), domain.StreamVideo, controller.routeProfile)
 	if err != nil {
 		t.Fatal(err)
 	}

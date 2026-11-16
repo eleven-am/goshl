@@ -1,6 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.29] - 2026-11-16
+
+Cache `goshl-cache-v6` unchanged; job contract 6. See MIGRATION.md.
+
+- feat(live): `Controller.Live` and `LiveProbe` serve a raw MPEG-TS reader as sliding-window HLS; H.264 and AAC are copied, HEVC, MPEG-2 and other audio are transcoded; reconnects and `SwitchSource` keep timestamps rising with `EXT-X-DISCONTINUITY`; idle sessions stop; events carry only the `Label`
+- feat(channels): `ChannelPlan`, `ChannelSegment` and `ChannelPrefetch` produce linear TV segments in one fixed format (24000/1001 fps, 1280x720 padded, muxed AAC, 2.002 s segments) in their own `StreamChannel` lane
+- feat(contract): job contract 6 adds `Job.Priority` and `Job.Channel`; the digest covers both; coordinators must round-trip them and deliver higher priority first
+- feat(cache): jobs route on a route profile that includes the job contract version; cache identity hashes the output contract version (5), so the VOD cache stays warm
+- feat(slots): `Options.EncoderSlots` is a shared budget for VOD video transcodes and live transcodes; `LiveMaxSessions` and `LiveMaxTranscodes` cap live
+- feat(options): `ChannelPoolSize`, `ChannelSegmentsPerJob`, `EncoderSlots`, `LiveMaxSessions`, `LiveMaxTranscodes`; all default to off or to values that change nothing for VOD
+- feat(events): `EventLive*` and `Event.Label`
+- fix(vod): VOD segments no longer carry the source title or other metadata (`-map_metadata -1 -map_chapters -1`)
 
 ## [0.0.28] - 2026-11-13
 

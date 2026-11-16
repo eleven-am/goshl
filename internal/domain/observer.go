@@ -30,6 +30,12 @@ const (
 	EventHardwareFallback     EventType = "hardware.fallback"
 	EventLockReleaseFailed    EventType = "lock.release.failed"
 	EventRenditionDropped     EventType = "rendition.dropped"
+	EventLiveStarted          EventType = "live.started"
+	EventLiveReady            EventType = "live.ready"
+	EventLiveReconnecting     EventType = "live.reconnecting"
+	EventLiveSwitched         EventType = "live.switched"
+	EventLiveFailed           EventType = "live.failed"
+	EventLiveStopped          EventType = "live.stopped"
 )
 
 type Event struct {
@@ -46,6 +52,7 @@ type Event struct {
 	Bytes       int64
 	Accelerator Accelerator
 	Error       string
+	Label       string
 }
 
 type Observer interface {

@@ -24,8 +24,8 @@ playlist, err := controller.MasterPlaylist(ctx, "/media/film.mkv")
 |---|---|
 | `NewControllerWithContext(ctx, Options) (*Controller, error)` | Validates options, checks ffmpeg versions, selects hardware. Errors wrap `ErrInvalidOptions`. |
 | `NewController(Options) *Controller` | Same, panics on error. |
-| `(*Controller).Start(ctx) error` | Starts the video and audio worker pools. Returns `ErrControllerStopped` if `Stop` already ran. |
-| `(*Controller).Stop()` | Idempotent. Cancels detached work, waits up to 10 seconds, releases locks of flights never enqueued. A stopped controller cannot restart. Locks of enqueued jobs expire by TTL. |
+| `(*Controller).Start(ctx) error` | Starts the video and audio worker pools, and the channel pool when `ChannelPoolSize` is above 0. Returns `ErrControllerStopped` if `Stop` already ran. |
+| `(*Controller).Stop()` | Idempotent. Stops every live session, cancels detached work, waits up to 10 seconds, releases locks of flights never enqueued. A stopped controller cannot restart. Locks of enqueued jobs expire by TTL. |
 | `(*Controller).HWAccelConfig() HWAccelConfig` | Copy of the selected hardware configuration. |
 
 ```go
@@ -83,11 +83,135 @@ for id, r := range results {
 
 Only text subtitle codecs are served: SubRip, ASS/SSA, `mov_text`/`tx3g`, WebVTT/`wvtt`, MicroDVD, SAMI and similar, plus `eia_608` from standalone caption inputs. Bitmap tracks and unlisted codecs return an error wrapping `ErrRenditionNotFound`, as does an unknown track ID.
 
+## Live sessions
+
+`Live` turns a raw MPEG-TS byte stream into a sliding-window HLS playlist. Live sessions need no `Storage` and no `Coordinator`. Segments sit in a temp directory of the process that owns the session.
+
+```go
+src := goshl.LiveSource{
+	Label: "channel-42",
+	Open: func(ctx context.Context) (io.ReadCloser, error) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		return res.Body, nil
+	},
+}
+session, err := controller.Live(ctx, "ch42", src, goshl.LiveOptions{})
+if err != nil {
+	return err
+}
+if err := session.WaitReady(ctx); err != nil {
+	return err
+}
+playlist, err := session.Playlist(ctx)
+```
+
+| Method | Purpose |
+|---|---|
+| `(*Controller).Live(ctx, key, LiveSource, LiveOptions) (*LiveSession, error)` | Returns at once. A live session for `key` is shared: a second call returns the same `*LiveSession` and ignores its `src` and `opts`. A failed or stopped session is removed, so the next call starts a fresh one. Fails synchronously with `ErrLiveInvalidOptions`, `ErrControllerStopped` or `ErrLiveCapacity`. It can also return the context error, or a generic error when the session directory cannot be created. |
+| `(*Controller).LiveProbe(ctx, LiveSource, budget) (LiveProbeInfo, error)` | Opens the source, reads until ffprobe has enough or `budget` passes (0 means 10 s), closes it. Returns the decision a session would make. Takes no slot and starts no session. |
+
+`LiveSession` methods:
+
+| Method | Purpose |
+|---|---|
+| `WaitReady(ctx) error` | Returns once `ReadySegments` segments exist. Returns the failure of a failed session and `ErrLiveStopped` for a stopped one. |
+| `Playlist(ctx) (string, error)` | Waits for readiness, then renders the window. Never contains `EXT-X-ENDLIST`. |
+| `Segment(ctx, name) ([]byte, error)` | One segment. `name` is the sequence number: `17`, `17.ts` and `seg-17.ts` are equal. A sequence outside the window plus 4 returns `ErrLiveSegmentNotFound`. |
+| `SwitchSource(ctx, LiveSource) error` | Replaces the source without ending the session. The new source is opened and probed while the old one plays. On error the session is unchanged. On success the next segment carries `EXT-X-DISCONTINUITY` and sequence numbers keep rising. `ctx` bounds the wait only. |
+| `State() LiveState` | Current status and, when failed, the error. |
+| `Info() LiveProbeInfo` | The codec decision of the current source. |
+| `Label() string` | The `LiveSource.Label` of the current source. It changes after a successful `SwitchSource`, and later events carry the current label. |
+| `Key() string` | The key the session was started with. |
+| `Epochs() int` | The number of source epochs: 1 once the first source is adopted, plus one per reconnect and per source switch. Each new epoch is a discontinuity in the playlist. |
+| `Done() <-chan struct{}` | Closed when the session ends. |
+| `Stop()` | Kills ffmpeg, closes the reader, deletes the files, frees the slot. |
+
+Each touch of `WaitReady`, `Playlist`, `Segment`, a successful `SwitchSource` or a repeated `Live` call resets the idle timer. A failed `SwitchSource` does not.
+
+Segment URIs in the playlist come from `PathGenerator.Segment(key, goshl.LiveRendition, goshl.StreamVideo, sequence)`. `LiveRendition` is `"live"`.
+
+### Live types
+
+| Type | Definition |
+|---|---|
+| `LiveSource` | `Open func(ctx) (io.ReadCloser, error)`, `Label string`. |
+| `LiveOptions` | See the table below. |
+| `LiveState` | `Status LiveStatus`, `Err error`. |
+| `LiveStatus` | `LiveStarting`, `LiveRunning`, `LiveFailed`, `LiveStopped`. |
+| `LiveProbeInfo` | `Video LiveVideoInfo`, `Audios []LiveAudioInfo`, `SelectedAudio int`, `VideoAction`, `AudioAction LiveAction`, `Programs int`, `ProbedBytes int`. |
+| `LiveVideoInfo` | `PID`, `Codec`, `Profile`, `PixelFormat`, `Width`, `Height`, `DisplayW`, `FrameRate`, `Interlaced`, `Transfer`, `Primaries`, `Matrix`. |
+| `LiveAudioInfo` | `PID`, `Codec`, `Language`, `Channels`, `SampleRate`. |
+| `LiveAction` | `LiveCopy`, `LiveTranscode`, `LiveNone`. |
+
+`LiveOptions` is per session. A zero field takes its default.
+
+| Field | Default | Bounds | Meaning |
+|---|---|---|---|
+| `SegmentDuration` | 4s | 1s to 30s | Target segment length. Copied video cuts at source keyframes, so segments run longer. |
+| `WindowSegments` | 6 | 3 to 100 | Segments listed in the playlist. |
+| `IdleTimeout` | 60s | at least 1s | Stops the session when nothing touches it for this long. |
+| `MaxHeight` | 720 | at least 144 | Height cap when video is transcoded. |
+| `PreferredLanguage` | `""` | | Audio language, matched case-insensitively against the TS language tag. |
+| `ReadySegments` | 3 | 1 to `WindowSegments` | Segments `WaitReady` waits for. |
+
+`LiveState.Status` is `LiveStarting` until `ReadySegments` segments exist, then `LiveRunning`. It stays `LiveRunning` during reconnects. `LiveFailed` carries the error. `LiveStopped` has a nil error.
+
+## Channels
+
+Channels are linear TV built from VOD sources in one fixed output format. The host owns the schedule and the playlist. goshl plans segments, produces them ahead of the playhead and stores them in `Storage`. Requires `Options.ChannelPoolSize` above 0 and a coordinator that implements job contract 6. See [operations.md](operations.md#channels).
+
+```go
+profile := goshl.ChannelProfile{}
+plan, err := controller.ChannelPlan(ctx, src, profile, 0)
+if err != nil {
+	return err
+}
+if err := controller.ChannelPrefetch(ctx, src, profile, 0, 0, 15); err != nil {
+	return err
+}
+data, err := controller.ChannelSegment(ctx, src, profile, 0, 0)
+```
+
+| Method | Purpose |
+|---|---|
+| `ChannelPlan(ctx, sourceURL, ChannelProfile, audioTrack) (ChannelPlan, error)` | The segment list of one item. A pure function of the probed duration and the profile. Enqueues nothing and reads no segment. |
+| `ChannelSegment(ctx, sourceURL, ChannelProfile, audioTrack, index) ([]byte, error)` | One segment. A stored segment returns at once. A miss runs the batch that holds it and waits up to `SegmentTimeout`. |
+| `ChannelPrefetch(ctx, sourceURL, ChannelProfile, audioTrack, from, count) error` | Enqueues the missing batches for `count` segments from `from` and returns. Never waits for a transcode. Idempotent: overlapping calls enqueue each batch once. `count` of 0 or less returns nil. `from` outside the plan returns `ErrSegmentOutOfRange`. A range past the end is clamped. |
+
+Checks run in this order: `ErrControllerStopped`, `ErrChannelDisabled`, `ErrInvalidChannelProfile`, audio track. `audioTrack` is the 0-based position in `Metadata.Audios`. A source without audio accepts only 0 and carries silence. A track out of range, or a source without video, returns `ErrRenditionNotFound`. `Segment` and `VariantPlaylist` reject rendition names that start with `channel-`.
+
+A failed channel run is remembered for 10 seconds per source and rendition, up to 1024 entries. `ChannelPrefetch` returns that failure during that time. `ChannelSegment` ignores it. `Invalidate` clears it.
+
+### Channel types
+
+| Type | Definition |
+|---|---|
+| `ChannelProfile` | `Height`, `FrameRateNum`, `FrameRateDen`, `SegmentFrames`, `VideoBitrate`, `AudioBitrate`. `Normalised() (ChannelProfile, error)` fills defaults and validates. |
+| `ChannelPlan` | `MediaKey`, `Rendition`, `Codecs`, `FrameRateNum`, `FrameRateDen`, `Frames`, `Duration`, `Segments []Segment`. `SegmentData(index) SegmentData` is the storage key of a segment. |
+| `ChannelSpec` | The channel part of a `Job`. See [operations.md](operations.md#coordinator-contract). |
+| `JobPriority` | `PriorityBackground` (0), `PriorityPlayback` (100), `PriorityChannel` (200). |
+
+`ChannelCodecs` is `avc1.64001f,mp4a.40.2`. `StreamChannel` is `"channel"`.
+
+| `ChannelProfile` field | Default | Bounds |
+|---|---|---|
+| `Height` | 720 | 240 to 720, even. Canvas width is `Height` x 16/9, rounded up to even. |
+| `FrameRateNum`, `FrameRateDen` | 24000, 1001 | 1 to 60 fps. Reduced to lowest terms. A zero denominator with a set numerator means 1. |
+| `SegmentFrames` | 48 | A segment lasts 1 to 10 seconds. |
+| `VideoBitrate` | 2500000 | 200000 to 20000000. |
+| `AudioBitrate` | 160000 | 32000 to 512000. |
+
+A zero field takes its default. `ChannelProfile{}` and the explicit defaults share one cache.
+
 ## Types
 
 ### Options
 
-See [configuration.md](configuration.md). `Options` has the fields `Storage`, `Coordinator`, `PathGen`, `HWAccel`, `HWAccelMode`, `SegmentTimeout`, `TargetDuration`, `SegmentsPerJob`, `VideoPoolSize`, `AudioPoolSize`, `DefaultPreviewConfig`, `DefaultThumbnailConfig`, `JobTimeout`, `ProbeTimeout`, `GenerationTimeout`, `SpriteStorage`, `CacheVersion`, `SourceRevision`, `Observer`, `HWAccelDecodeMode`, `AllowHardwareFallback` and `OmitSubtitleRenditions`.
+See [configuration.md](configuration.md). `Options` has the fields `Storage`, `Coordinator`, `PathGen`, `HWAccel`, `HWAccelMode`, `SegmentTimeout`, `TargetDuration`, `SegmentsPerJob`, `VideoPoolSize`, `AudioPoolSize`, `DefaultPreviewConfig`, `DefaultThumbnailConfig`, `JobTimeout`, `ProbeTimeout`, `GenerationTimeout`, `SpriteStorage`, `CacheVersion`, `SourceRevision`, `Observer`, `HWAccelDecodeMode`, `AllowHardwareFallback`, `OmitSubtitleRenditions`, `ChannelPoolSize`, `ChannelSegmentsPerJob`, `EncoderSlots`, `LiveMaxSessions` and `LiveMaxTranscodes`.
 
 ### Interfaces you implement
 
@@ -206,7 +330,7 @@ Options{Observer: goshl.ObserverFunc(func(ctx context.Context, e goshl.Event) {
 | `PreviewConfig` | `MaxFrames int` (1 to 1000), `Frameduration int` (ms, 1 to 60000), `Width int` (1 to 4096). |
 | `ThumbnailConfig` | `Position float64` (0 to 1, 0 is the default), `Width int` (1 to 8192). |
 | `SubtitleResult` | `Data []byte`, `Err error` for one track of `SubtitlesVTT`. |
-| `StreamType` | `StreamVideo`, `StreamAudio`, `StreamSubtitle`. |
+| `StreamType` | `StreamVideo`, `StreamAudio`, `StreamSubtitle`, `StreamChannel`. |
 | `Segment` | `Index int`, `Start`, `End`, `Duration float64` in seconds. |
 | `SegmentData` | `MediaKey string`, `Index int`, `Rendition string`, `IsVideo bool`. |
 | `SegmentState` | `SegmentStateReady`, `SegmentStateError`. |
@@ -224,7 +348,7 @@ Options{Observer: goshl.ObserverFunc(func(ctx context.Context, e goshl.Event) {
 
 | Type | Definition |
 |---|---|
-| `Job` | One unit of work. See [operations.md](operations.md#coordinator-contract). |
+| `Job` | One unit of work. Contract 6 adds `Priority JobPriority` and `Channel *ChannelSpec`. See [operations.md](operations.md#coordinator-contract). |
 | `JobDelivery` | `Job Job`, `Receipt string`. |
 | `JobState` | `JobStateCompleted`, `JobStateFailed`, `JobStateCancelled`. All are terminal. |
 | `JobStatus` | `JobID`, `RunID string`, `State JobState`, `Error string`. |
@@ -235,7 +359,7 @@ Options{Observer: goshl.ObserverFunc(func(ctx context.Context, e goshl.Event) {
 
 ## Events
 
-`Event` fields: `Type`, `Time`, `MediaKey`, `JobID`, `StreamType`, `Rendition`, `Index`, `StartIndex`, `EndIndex`, `Duration`, `Bytes`, `Accelerator`, `Error`. `EventType` is a string. Identities are opaque hashes.
+`Event` fields: `Type`, `Time`, `MediaKey`, `JobID`, `StreamType`, `Rendition`, `Index`, `StartIndex`, `EndIndex`, `Duration`, `Bytes`, `Accelerator`, `Error`, `Label`. `EventType` is a string. Identities are opaque hashes.
 
 | Constant | Value | Emitted when |
 |---|---|---|
@@ -261,6 +385,14 @@ Options{Observer: goshl.ObserverFunc(func(ctx context.Context, e goshl.Event) {
 | `EventHardwareFallback` | `hardware.fallback` | A preferred accelerator was skipped. |
 | `EventLockReleaseFailed` | `lock.release.failed` | Releasing a batch lock failed. |
 | `EventRenditionDropped` | `rendition.dropped` | A video rung was left out. Emitted per rung on each `MasterPlaylist` call. |
+| `EventLiveStarted` | `live.started` | A live session was created. |
+| `EventLiveReady` | `live.ready` | A live session has `ReadySegments` segments. |
+| `EventLiveReconnecting` | `live.reconnecting` | The reader failed and goshl is reopening it. `Error` is a class word. |
+| `EventLiveSwitched` | `live.switched` | Every `SwitchSource` that takes effect. |
+| `EventLiveFailed` | `live.failed` | A live session failed. `Error` is a class word. |
+| `EventLiveStopped` | `live.stopped` | A live session ended. `Error` is `stopped` or `idle`. |
+
+Live events set only `Type`, `Time`, `Label` and, on reconnecting, failed and stopped, `Error`. `Error` is one of `source_unavailable`, `unsupported_codec`, `no_data`, `capacity`, `idle`, `stopped` or `internal`. It never holds the reader's error text. `Label` is the `LiveSource.Label`; keys and URLs are not emitted.
 
 ## Errors
 
@@ -280,15 +412,28 @@ Options{Observer: goshl.ObserverFunc(func(ctx context.Context, e goshl.Event) {
 | `ErrLockHeld` | Return it from `AcquireJob` or `AcquireLock` when the lock is taken. |
 | `ErrTonemapUnavailable` | An HDR source needs tone mapping and ffmpeg lacks `zscale` or `tonemap`. |
 | `ErrUnsupportedSource` | The source is empty, malformed, or uses a scheme other than file, http or https. |
+| `ErrChannelDisabled` | A channel method was called while `ChannelPoolSize` is 0. |
+| `ErrInvalidChannelProfile` | A `ChannelProfile` field is out of range. |
+| `ErrLiveInvalidOptions` | `Live` got an empty key, a nil `Open`, or `LiveOptions` out of range. |
+| `ErrLiveCapacity` | `Live` hit `LiveMaxSessions`, or a transcode needs a live slot and none is free. From `SwitchSource` it leaves the old source playing. Never retried. |
+| `ErrLiveSourceUnavailable` | `Open` failed or returned nil, five reconnects failed, or a source sent valid MPEG-TS and ended inside the probe. Wraps the reader's own error. |
+| `ErrLiveNoData` | The source sent nothing, or sent data that is not MPEG-TS. |
+| `ErrLiveUnsupportedCodec` | The video is not H.264, HEVC or MPEG-2, or the stream has no video. Never retried, whether it comes from the probe or from building the ffmpeg command. |
+| `ErrLiveStopped` | The session was stopped. |
+| `ErrLiveSegmentNotFound` | The segment name is unknown or outside the window. |
 
 ## Constants
 
 | Group | Constants |
 |---|---|
-| Stream types | `StreamVideo`, `StreamAudio`, `StreamSubtitle` |
+| Stream types | `StreamVideo`, `StreamAudio`, `StreamSubtitle`, `StreamChannel` |
 | Accelerators | `AccelNone`, `AccelCUDA`, `AccelVideoToolbox`, `AccelVAAPI`, `AccelQSV` |
 | Segment states | `SegmentStateReady`, `SegmentStateError` |
 | Job states | `JobStateCompleted`, `JobStateFailed`, `JobStateCancelled` |
 | Decode modes | `DecodeSafe`, `DecodeDevice` |
 | Playback methods | `DirectStream`, `Transcode` |
+| Job priorities | `PriorityBackground`, `PriorityPlayback`, `PriorityChannel` |
+| Live status | `LiveStarting`, `LiveRunning`, `LiveFailed`, `LiveStopped` |
+| Live actions | `LiveCopy`, `LiveTranscode`, `LiveNone` |
+| Live and channel | `LiveRendition`, `ChannelCodecs` |
 | Events | See the Events table. |

@@ -111,8 +111,8 @@ func TestPipelineVersionChangesWithTimelineOffset(t *testing.T) {
 	if base == shifted {
 		t.Fatalf("a different output timeline offset must change the pipeline version")
 	}
-	if pipelineVersion(Config{TargetDuration: 6}, config) != pipelineIdentity(Config{TargetDuration: 6}, config, domain.OutputTimelineOffset, domain.JobContractVersion) {
-		t.Fatalf("the pipeline version must be derived from the domain timeline offset and job contract version")
+	if pipelineVersion(Config{TargetDuration: 6}, config) != pipelineIdentity(Config{TargetDuration: 6}, config, domain.OutputTimelineOffset, domain.OutputContractVersion) {
+		t.Fatalf("the pipeline version must be derived from the domain timeline offset and output contract version")
 	}
 }
 
@@ -122,5 +122,18 @@ func TestPipelineVersionChangesWithJobContractVersion(t *testing.T) {
 	bumped := pipelineIdentity(Config{TargetDuration: 6}, config, 10*time.Second, 2)
 	if base == bumped {
 		t.Fatalf("a different job contract version must change the pipeline version")
+	}
+}
+
+func TestRouteProfileDependsOnJobContractVersion(t *testing.T) {
+	pipeline := pipelineVersion(Config{TargetDuration: 6}, &domain.HWAccelConfig{})
+	if routeProfile(pipeline) != routeIdentity(pipeline, domain.JobContractVersion) {
+		t.Fatalf("the route profile must be derived from the job contract version")
+	}
+	if routeIdentity(pipeline, domain.JobContractVersion) == routeIdentity(pipeline, domain.JobContractVersion-1) {
+		t.Fatalf("a job contract bump must change the route profile")
+	}
+	if routeProfile(pipeline) == pipeline {
+		t.Fatalf("the route profile must differ from the cache pipeline identity")
 	}
 }

@@ -32,6 +32,7 @@ const (
 	StreamVideo    StreamType = "video"
 	StreamAudio    StreamType = "audio"
 	StreamSubtitle StreamType = "subtitle"
+	StreamChannel  StreamType = "channel"
 )
 
 type PathGenerator interface {

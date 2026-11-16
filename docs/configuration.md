@@ -37,6 +37,11 @@ A zero value takes the default. A negative value is an error.
 | `DefaultPreviewConfig.Width` | `int` | 480 | 1 to 4096 | Preview width in pixels. |
 | `DefaultThumbnailConfig.Position` | `float64` | 0.1 | greater than 0, up to 1 | Thumbnail position as a fraction of the duration. |
 | `DefaultThumbnailConfig.Width` | `int` | 480 | 1 to 8192 | Thumbnail width in pixels. |
+| `ChannelPoolSize` | `int` | 0 | 0 to 1024 | Channel workers. 0 disables the channel API and creates no third subscription. |
+| `ChannelSegmentsPerJob` | `int` | 10 | 1 to 1000 | Segments per channel batch. Part of the channel rendition name, so changing it starts a new channel cache. |
+| `EncoderSlots` | `int` | `VideoPoolSize` + `LiveMaxTranscodes` | at least 1 | Hardware or CPU encoder sessions shared by VOD video transcodes and live transcodes. |
+| `LiveMaxSessions` | `int` | 16 | at least 1 | Live sessions at once. `Live` returns `ErrLiveCapacity` past this. |
+| `LiveMaxTranscodes` | `int` | 2 | 1 to `EncoderSlots` | Live sessions that may transcode video at once. Copy sessions take none. |
 | `OmitSubtitleRenditions` | `bool` | `false` | | Leaves subtitle groups out of the master playlist. |
 | `CacheVersion` | `string` | `""` | | Host-side cache salt. Changing it starts a new cache namespace. |
 | `SourceRevision` | `SourceRevisionResolver` | nil | | Returns the revision of a source for the media key. |
@@ -49,11 +54,29 @@ A zero value takes the default. A negative value is an error.
 1. Reject nil `Storage`, `Coordinator` or `PathGen`.
 2. Reject negative durations, non-finite `TargetDuration`, negative sizes, out-of-range preview or thumbnail values, and an unknown `HWAccelDecodeMode`.
 3. Fill zero fields with defaults. `ProbeTimeout` copies the resolved `JobTimeout`.
-4. Re-check the resolved values: positive durations and sizes, `TargetDuration` 1 to 60, `SegmentsPerJob` at most 1000, pool sizes at most 1024, preview and thumbnail ranges.
+4. Re-check the resolved values: positive durations and sizes, `TargetDuration` 1 to 60, `SegmentsPerJob` at most 1000, pool sizes at most 1024, the channel and slot values above, preview and thumbnail ranges.
 5. Check the ffmpeg and ffprobe versions.
 6. Select the hardware configuration.
 
 Every failure in steps 1 to 5 wraps `ErrInvalidOptions`. Preview and thumbnail failures also wrap `ErrInvalidPreviewConfig` or `ErrInvalidThumbnailConfig`. Both are reachable with `errors.Is`.
+
+## Encoder slots
+
+`EncoderSlots` caps concurrent video transcodes across VOD and live. A VOD job that transcodes video takes one slot for its whole run and waits for one when none is free. Direct-stream video, audio and channel jobs take none. A live session that transcodes takes one slot and one unit of `LiveMaxTranscodes`. It never waits: with none free it fails with `ErrLiveCapacity`.
+
+With the defaults, live holds at most `LiveMaxTranscodes` slots, so VOD always keeps `VideoPoolSize`. Set `EncoderSlots` to the real encoder limit, for example the NVENC session cap, to make VOD and live compete for it.
+
+```go
+Options{VideoPoolSize: 2, EncoderSlots: 3, LiveMaxTranscodes: 1}
+```
+
+## Live and channels
+
+Live options are per session. See [api.md](api.md#live-sessions). Channels stay off until `ChannelPoolSize` is set.
+
+```go
+Options{ChannelPoolSize: 2, ChannelSegmentsPerJob: 10}
+```
 
 ## Preview and thumbnail values
 
