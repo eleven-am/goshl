@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.30] - 2026-11-17
+
+Cache `goshl-cache-v6` unchanged; job contract 6 unchanged.
+
+- feat(live): `LiveOptions.TranscodeInterlaced` transcodes interlaced H.264 to progressive H.264 (`bwdif`) instead of copying it; default off
+
 ## [0.0.29] - 2026-11-16
 
 Cache `goshl-cache-v6` unchanged; job contract 6. See MIGRATION.md.

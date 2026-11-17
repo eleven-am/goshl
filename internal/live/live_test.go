@@ -897,3 +897,36 @@ func (s *secretReader) Read(buffer []byte) (int, error) {
 func (s *secretReader) Close() error { return s.inner.Close() }
 
 var errSecret = errors.New("Get \"http://secret-host.example/stream?token=SECRETTOKEN\": connection reset")
+
+func TestTranscodeInterlacedDeinterlacesH264(t *testing.T) {
+	cases := []struct {
+		name   string
+		option bool
+		action live.Action
+		field  string
+	}{
+		{"option on", true, live.ActionTranscode, "progressive"},
+		{"option off", false, live.ActionCopy, "tt"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t, nil)
+			src, _ := source(t, "h264i_aac")
+			opts := fastOptions()
+			opts.TranscodeInterlaced = tc.option
+			session, err := r.manager.Live(context.Background(), "h264i", src, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ready(t, session)
+			if info := session.Info(); info.VideoAction != tc.action || !info.Video.Interlaced {
+				t.Fatalf("plan = %+v", info)
+			}
+			list := playlist(t, session)
+			facts := inspect(t, session, list.sequences[0])
+			if facts.video != "h264" || facts.fieldOrder != tc.field {
+				t.Fatalf("segment facts = %+v", facts)
+			}
+		})
+	}
+}

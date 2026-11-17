@@ -157,6 +157,7 @@ Segment URIs in the playlist come from `PathGenerator.Segment(key, goshl.LiveRen
 | `MaxHeight` | 720 | at least 144 | Height cap when video is transcoded. |
 | `PreferredLanguage` | `""` | | Audio language, matched case-insensitively against the TS language tag. |
 | `ReadySegments` | 3 | 1 to `WindowSegments` | Segments `WaitReady` waits for. |
+| `TranscodeInterlaced` | `false` | | Transcodes interlaced H.264 to progressive H.264 (`bwdif`, capped at `MaxHeight`) instead of copying it. Takes an encoder slot and one unit of `LiveMaxTranscodes`. Browsers cannot decode interlaced H.264 through MSE. |
 
 `LiveState.Status` is `LiveStarting` until `ReadySegments` segments exist, then `LiveRunning`. It stays `LiveRunning` during reconnects. `LiveFailed` carries the error. `LiveStopped` has a nil error.
 

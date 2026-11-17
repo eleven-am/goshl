@@ -19,7 +19,7 @@ func decide(info *ProbeInfo, opts Options) (ffmpeg.LiveParams, error) {
 	video := info.Video
 	params := ffmpeg.LiveParams{VideoPID: video.PID, Interlaced: video.Interlaced, SegmentSeconds: opts.SegmentDuration.Seconds()}
 	switch {
-	case video.Codec == "h264" && copyPixelFormats[video.PixelFormat]:
+	case video.Codec == "h264" && copyPixelFormats[video.PixelFormat] && (!video.Interlaced || !opts.TranscodeInterlaced):
 		params.CopyVideo = true
 		info.VideoAction = ActionCopy
 	case video.Codec == "h264" || transcodedVideo[video.Codec]:

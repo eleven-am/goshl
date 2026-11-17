@@ -147,6 +147,42 @@ func TestDecideInterlacedFlagPropagates(t *testing.T) {
 	}
 }
 
+func TestDecideInterlacedH264(t *testing.T) {
+	cases := []struct {
+		name        string
+		interlaced  bool
+		option      bool
+		wantTransco bool
+	}{
+		{"interlaced option on", true, true, true},
+		{"interlaced option off", true, false, false},
+		{"progressive option on", false, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := h264Info("yuv420p")
+			info.Video.Width, info.Video.Height, info.Video.DisplayW = 1920, 1080, 1920
+			info.Video.Interlaced = tc.interlaced
+			opts := Options{TranscodeInterlaced: tc.option}
+			opts.setDefaults()
+			params, err := decide(&info, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if params.CopyVideo == tc.wantTransco {
+				t.Fatalf("CopyVideo = %v, want %v", params.CopyVideo, !tc.wantTransco)
+			}
+			if tc.wantTransco {
+				if info.VideoAction != ActionTranscode || !params.Interlaced || params.Rendition.Height != 720 {
+					t.Fatalf("params %+v info %+v", params, info)
+				}
+			} else if info.VideoAction != ActionCopy {
+				t.Fatalf("info = %+v", info)
+			}
+		})
+	}
+}
+
 func TestDecideRejectsUnsupportedVideo(t *testing.T) {
 	info := h264Info("yuv420p")
 	info.Video.Codec = "vp9"

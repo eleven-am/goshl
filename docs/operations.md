@@ -235,8 +235,8 @@ The host supplies `LiveSource.Open`, which returns an `io.ReadCloser`. goshl nev
 
 | Input | Output |
 |---|---|
-| H.264, `yuv420p` or `yuvj420p` | Copied. Interlaced H.264 is copied untouched. |
-| H.264 in another pixel format (4:2:2, 10-bit) | Transcoded to H.264. |
+| H.264, `yuv420p` or `yuvj420p` | Copied. Interlaced H.264 is copied untouched, unless `TranscodeInterlaced` is set: then it is transcoded and deinterlaced like the next row. |
+| H.264 in another pixel format (4:2:2, 10-bit) | Transcoded to H.264. Interlaced input is deinterlaced with `bwdif`. |
 | HEVC or MPEG-2 | Transcoded to H.264, progressive, at most `MaxHeight`, tagged BT.709. Interlaced input is deinterlaced with `bwdif`. |
 | Anything else, or no video | `ErrLiveUnsupportedCodec`. |
 | AAC | Copied, any channel count and sample rate. |

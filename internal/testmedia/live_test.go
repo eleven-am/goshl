@@ -41,6 +41,7 @@ func TestLiveFixtures(t *testing.T) {
 		{LiveH264MP2, "h264", "mp2", false, 2},
 		{LiveMPEG2MP2, "mpeg2video", "mp2", true, 2},
 		{LiveHEVCAC3, "hevc", "ac3", false, 6},
+		{LiveH264IAAC, "h264", "aac", true, 2},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.kind), func(t *testing.T) {

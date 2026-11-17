@@ -23,12 +23,13 @@ type Source struct {
 }
 
 type Options struct {
-	SegmentDuration   time.Duration
-	WindowSegments    int
-	IdleTimeout       time.Duration
-	MaxHeight         int
-	PreferredLanguage string
-	ReadySegments     int
+	SegmentDuration     time.Duration
+	WindowSegments      int
+	IdleTimeout         time.Duration
+	MaxHeight           int
+	PreferredLanguage   string
+	ReadySegments       int
+	TranscodeInterlaced bool
 }
 
 func (o *Options) setDefaults() {

@@ -16,6 +16,7 @@ const (
 	LiveH264MP2   LiveKind = "h264_mp2"
 	LiveMPEG2MP2  LiveKind = "mpeg2i_mp2"
 	LiveHEVCAC3   LiveKind = "hevc_ac3"
+	LiveH264IAAC  LiveKind = "h264i_aac"
 	liveSeconds            = "12"
 	liveCacheName          = "goshl-testmedia-live-v1"
 )
@@ -78,6 +79,15 @@ func liveArgs(kind LiveKind) ([]string, bool) {
 			"-vf", "interlace=scan=tff,setfield=tff,setsar=64/45",
 			"-c:v", "mpeg2video", "-flags", "+ilme+ildct", "-b:v", "3000k", "-g", "12", "-bf", "2", "-pix_fmt", "yuv420p",
 			"-c:a", "mp2", "-b:a", "192k", "-ac", "2", "-metadata:s:a:0", "language=fra",
+		}, true
+	case LiveH264IAAC:
+		return []string{
+			"-f", "lavfi", "-i", "testsrc2=size=720x576:rate=50",
+			"-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000",
+			"-t", liveSeconds,
+			"-vf", "interlace=scan=tff,setfield=tff,setsar=64/45",
+			"-c:v", "libx264", "-preset", "veryfast", "-flags", "+ilme+ildct", "-pix_fmt", "yuv420p", "-g", "25",
+			"-c:a", "aac", "-b:a", "128k", "-ac", "2",
 		}, true
 	case LiveHEVCAC3:
 		return []string{
